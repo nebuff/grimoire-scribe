@@ -37,4 +37,5 @@ void bg_detach_rest(void);
 // The work itself, one function per kind other than the PDF mirror (run in the child; 0 = done).
 int bg_compact_pages(const char *id, float dpi);
 int bg_template(const char *id, const char *src, float dpi);
-int bg_import_folder(const char *path, float dpi);
+// id_hint: the notebook an import makes, when its source can carry no mark of its own (a PDF).
+int bg_import_folder(const char *path, const char *id_hint, float dpi);

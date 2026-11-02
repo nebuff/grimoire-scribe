@@ -4746,6 +4746,19 @@ pub fn library_free(a: &mut App) {
     a.lib = None;
 }
 
+/// The Library's list of notebooks and folders, read again and drawn: a background import can make
+/// a notebook while the screen is open, and it belongs in the list when it does, not at the next
+/// start.
+pub fn library_refresh(a: &mut App, draw: bool) {
+    if a.lib.is_none() {
+        return;
+    }
+    reload(a);
+    if draw {
+        redraw(a, RefreshMode::Ui);
+    }
+}
+
 pub fn library_enter(a: &mut App) {
     // A turn, or the redraw after waking, re-lays out the same screen: the open sheet stays open
     // (every sheet lays itself out when drawn).

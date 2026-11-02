@@ -18,7 +18,8 @@ pub enum BgKind {
     CompactPages = 1, // BG_COMPACT_PAGES
     /// id: the notebook, path: the source image; normalizes it into the notebook (src/bgwork_template.c)
     Template = 2, // BG_TEMPLATE
-    /// path: a folder of page images; makes a notebook of them (src/bgwork_template.c)
+    /// id: the notebook it makes, path: a folder of page images or a PDF file; makes a notebook of
+    /// them (src/bgwork_template.c)
     ImportFolder = 3, // BG_IMPORT_FOLDER
     /// id: notebook, path: graph.ini; layout is computed and saved by the child.
     GraphLayout = 4,
@@ -121,6 +122,12 @@ pub fn bg_promote(kind:BgKind,id:&str) {
 pub fn bg_pending(kind:BgKind,id:&str)->bool {
     with(|s|(s.pid>0&&s.running.kind==kind&&s.running.id.as_str()==id)
         ||s.q.iter().any(|j|j.kind==kind&&j.id.as_str()==id))
+}
+/// A folder of pages or a PDF in import/ is still becoming a notebook: running now, or queued. A
+/// book's pages are drawn one by one, so this lasts a while and the Library says so while it does.
+pub fn bg_importing()->bool {
+    with(|s|(s.pid>0&&s.running.kind==BgKind::ImportFolder)
+        ||s.q.iter().any(|j|j.kind==BgKind::ImportFolder))
 }
 
 /// Reaps a finished child and starts the next job. Returns 1 / -1 when a notify job just
@@ -284,7 +291,7 @@ fn run_job(j: &Job) -> i32 {
         BgKind::PagePreviews => store_build_page_previews(j.id.as_str(),j.dir.as_str(),j.dpi),
         BgKind::CompactPages => bg_compact_pages(j.id.as_str(), j.dpi),
         BgKind::Template => bg_template(j.id.as_str(), j.dir.as_str(), j.dpi),
-        BgKind::ImportFolder => bg_import_folder(j.dir.as_str(), j.dpi),
+        BgKind::ImportFolder => bg_import_folder(j.id.as_str(), j.dir.as_str(), j.dpi),
     }
 }
 

@@ -195,10 +195,15 @@ your notebooks and settings from `quire/` to `grimoire/` and removes the old Qui
   closed (upright, 3:4, 1860 x 2480 is best, light lines on white work best on e-ink). In a
   notebook, Paper > **More layouts...** shows them; New notebook has the same button. Each notebook
   keeps its own copy of a template it uses.
-- **Pages you already have**: put a folder of page pictures (PNG or JPG, one per page, such as a
-  PDF exported as pictures with `pdftoppm -gray -png -r 200 file.pdf page`) in
-  `grimoire/import/<Name>/` and start Grimoire: it becomes the notebook <Name>, and the folder
-  moves to `grimoire/import/done/`.
+- **Pages you already have**: put a PDF file in `grimoire/import/` and start Grimoire: its pages
+  become the notebook of its name (`Book.pdf` makes Book), a page a page picture, and the file
+  moves to `grimoire/import/done/`. Write on them as on a template: closing the notebook writes it
+  back as `PDFs/Book.pdf` with the ink on the pages. A scan or a photographed page is read as the
+  picture it holds; a page set in fonts or drawn with lines (a book exported from any app) is drawn,
+  text, rules, pictures and all, so both kinds come in. Not drawn: shadings, patterns and inline
+  images, and `grimoire.log` names a page that could not be read.
+  A folder of page pictures (PNG or JPG, one per page) works the same way in
+  `grimoire/import/<Name>/`.
 - **Erased ink leaves the files**: when a notebook closes, ink erased entirely is taken out of its
   page files in the background. A stroke erased only in part stays whole in the file.
 

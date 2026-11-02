@@ -74,6 +74,7 @@ pub mod nav;
 pub mod notebookpicker;
 pub mod page;
 pub mod paper;
+pub mod pdfread; // pdfread.h: the page pictures of a PDF, for grimoire/import
 pub mod store;
 pub mod templates; // templates.h's surface (bodies in bgwork_template.rs)
 pub mod tplsheet;
@@ -174,6 +175,7 @@ pub mod prelude {
     pub use crate::pair::*;
     pub use crate::panel::*;
     pub use crate::paper::*;
+    pub use crate::pdfread::*;
     pub use crate::pensync::*;
     pub use crate::penbutton::*;
     pub use crate::power::*;

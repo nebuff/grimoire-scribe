@@ -1721,7 +1721,7 @@ TEST(import_makes_a_notebook) {
     bgpicture_free(&p3);
     const char *id = "20261020-120000-abcd";
     mark(src, id);
-    CHECK(bg_import_folder(src, DPI) == 0);
+    CHECK(bg_import_folder(src, "", DPI) == 0);
     NotebookInfo nb;
     CHECK(store_load_info(id, &nb) == 0);
     CHECK(!strcmp(nb.name, "Score") && !nb.folder[0] && nb.npages == 4 && nb.paper == PAPER_BLANK);
@@ -1779,7 +1779,7 @@ TEST(import_same_picture_twice) {
     import_folder_of("Twins", files, values, 2, src, sizeof src);
     const char *id = "20261020-120001-beef";
     mark(src, id);
-    CHECK(bg_import_folder(src, DPI) == 0);
+    CHECK(bg_import_folder(src, "", DPI) == 0);
     NotebookInfo nb;
     CHECK(store_load_info(id, &nb) == 0 && nb.npages == 2 && index_entries(&nb) == 1);
     Page *a = NULL, *b = NULL;
@@ -1799,7 +1799,7 @@ TEST(import_long_name) {
     import_folder_of(name, files, values, 1, src, sizeof src);
     const char *id = "20261020-120003-cafe";
     mark(src, id);
-    CHECK(bg_import_folder(src, DPI) == 0);
+    CHECK(bg_import_folder(src, "", DPI) == 0);
     NotebookInfo nb;
     CHECK(store_load_info(id, &nb) == 0 && strlen(nb.name) == 94 && !strncmp(nb.name, name, 94));
 }
@@ -1816,7 +1816,7 @@ TEST(import_failure_leaves_nothing) {
     CHECK(store_list(&before, &nbefore) == 0);
     free(before);
     log_capture();
-    CHECK(bg_import_folder(src, DPI) != 0);
+    CHECK(bg_import_folder(src, "", DPI) != 0);
     // Refused from its headers, before any page was made ("N page(s), for WxH pages" starts that).
     char *log = log_captured();
     CHECK(log && strstr(log, "page 2 of 3: not a PNG") && !strstr(log, "page(s), for"));
@@ -1950,7 +1950,7 @@ TEST(import_made_before_moved) {
     import_folder_of("Twice", files, values, 2, src, sizeof src);
     const char *id = "20261020-120005-f00d";
     mark(src, id);
-    CHECK(bg_import_folder(src, DPI) == 0 && notebooks_named("Twice") == 1);
+    CHECK(bg_import_folder(src, "", DPI) == 0 && notebooks_named("Twice") == 1);
     // Put the folder back as the cut-off run left it.
     char done[700], back[900];
     snprintf(done, sizeof done, "%s/import/done", root);
@@ -1975,7 +1975,7 @@ TEST(import_leftover_whole) {
     import_folder_of("Kept", files, values, 1, src, sizeof src);
     const char *id = "20261020-120006-beef", *lost = "20261020-120007-cafe";
     mark(src, id);
-    CHECK(bg_import_folder(src, DPI) == 0);
+    CHECK(bg_import_folder(src, "", DPI) == 0);
     char from[700], to[700];
     snprintf(from, sizeof from, "%s/notebooks/%s", root, id);
     snprintf(to, sizeof to, "%s/notebooks/.import-%s", root, lost);

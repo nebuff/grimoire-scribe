@@ -170,6 +170,54 @@ fn list_names(dir: &str, pictures: bool, max: usize, out: &mut Vec<String>) -> i
     0
 }
 
+// A PDF dropped in import/ itself: its pages are the notebook's, in order (pdfread.rs).
+fn pdf_name(n: &str) -> bool {
+    let l = n.len();
+    !n.starts_with('.') && l > 4 && n[l - 4..].eq_ignore_ascii_case(".pdf")
+}
+
+// The PDF files of dir, in natural order, at most max.
+fn list_pdfs(dir: &str, max: usize, out: &mut Vec<String>) -> i32 {
+    out.clear();
+    let Ok(rd) = std::fs::read_dir(dir) else { return -1 };
+    for e in rd {
+        if out.len() >= max {
+            break;
+        }
+        let Ok(e) = e else { break };
+        let name = e.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !pdf_name(name) {
+            continue;
+        }
+        let mut path = String::new();
+        csnprintf!(&mut path, PATH_BUF, "%s/%s", dir, name);
+        if is_dir(&path) {
+            continue;
+        }
+        out.push(name.to_string());
+    }
+    if !out.is_empty() {
+        out.sort_by(|a, b| natural_cmp(a, b).cmp(&0));
+    }
+    0
+}
+
+// What a PDF's file is, for the attempts table: its size and time (its pages are never all read to
+// know whether it changed).
+fn file_stamp_hash(path: &str) -> u64 {
+    let mut v: [i64; 2] = [-1, -1];
+    if let Ok(st) = std::fs::metadata(path) {
+        v[0] = st.len() as i64;
+        v[1] = st.mtime();
+    }
+    // (the path's NUL too)
+    let mut h = fnv(fnv(FNV0, path.as_bytes()), &[0]);
+    h = fnv(h, &v[0].to_ne_bytes());
+    h = fnv(h, &v[1].to_ne_bytes());
+    h
+}
+
 // A name cut to fit its field at the start of a character, never inside one.
 fn copy_name<const N: usize>(dst: &mut FixedStr<N>, src: &str) {
     dst.set_cut(src);
@@ -383,10 +431,10 @@ its previews of these files in the .cache folder."),
         // its two paragraphs. "done" is the name of a folder: keep it as it is.
         let parts = [
             tr("Importing pages into Grimoire"),
-            tr("To write on pages you already have, such as a PDF saved as pictures, put a folder of PNG or JPG \
-files here, one picture a page, and start Grimoire. The folder's name becomes the notebook's name, \
-and the pages follow the file names in order (page-2 comes before page-10). Gray pictures import \
-faster and take less room than colour ones."),
+            tr("To write on pages you already have, put a PDF file here, or a folder of PNG or JPG files, one \
+picture a page, and start Grimoire. Book.pdf becomes the notebook Book, its pages the PDF's pages; \
+a folder's name becomes the notebook's name, and its pages follow the file names in order \
+(page-2 comes before page-10). Gray pictures import faster and take less room than colour ones."),
             tr("Grimoire imports each folder in the background and then moves it into the done folder. Copy folders \
 in over USB while Grimoire is closed."),
         ];
@@ -1325,7 +1373,11 @@ pub fn import_scan(dpi: f32) -> i32 {
         names.clear();
     }
     let folders = names.iter().filter(|n| n.as_str() != "done").count();
-    if folders == 0 && !import_leftovers(false) {
+    let mut pdfs: Vec<String> = Vec::new();
+    if list_pdfs(&dir, IMPORT_QUEUE_MAX, &mut pdfs) != 0 {
+        pdfs.clear();
+    }
+    if folders == 0 && pdfs.is_empty() && !import_leftovers(false) {
         // nothing to do (and no lock file made for it)
         return 0;
     }
@@ -1395,6 +1447,38 @@ pub fn import_scan(dpi: f32) -> i32 {
                 continue;
             }
         }
+        bg_queue(BgKind::ImportFolder, Some(&id), Some(&src), dpi, true);
+        with(|s| s.pending.push(FixedStr::from_str(&id)));
+        queued += 1;
+    }
+    // A PDF dropped straight into import/: its pages are its notebook's. It carries no mark (a file
+    // cannot hold one), so the id made for it here goes to the job with it.
+    for name in &pdfs {
+        if with(|s| s.pending.len()) >= IMPORT_QUEUE_MAX {
+            break; // (the next start takes it)
+        }
+        let mut src = String::new();
+        csnprintf!(&mut src, PATH_BUF, "%s/%s", &dir, name);
+        if src.len() >= JOB_PATH_MAX {
+            // it would be cut on its way to the job
+            toolong += 1;
+            continue;
+        }
+        let nh = folder_name_hash(&src);
+        let stamp = file_stamp_hash(&src);
+        let mut at: Option<usize> = None;
+        for k in 0..natt {
+            if att[k].name == nh {
+                at = Some(k);
+                seen[k] = true;
+            }
+        }
+        if at.is_some_and(|at| att[at].tries >= IMPORT_TRIES && att[at].pictures == stamp) {
+            waiting += 1;
+            continue;
+        }
+        let mut id = String::new();
+        store_make_id(&mut id);
         bg_queue(BgKind::ImportFolder, Some(&id), Some(&src), dpi, true);
         with(|s| s.pending.push(FixedStr::from_str(&id)));
         queued += 1;
@@ -1530,8 +1614,13 @@ fn check_pages(id: &str, src: &str, names: &[String]) -> i32 {
 // The notebook itself, built in notebooks/.import-<id>/ (which the Library never lists) and renamed
 // into place only once whole; anything going wrong removes it. IMPORT_DONE (its folder moved to
 // import/done), IMPORT_RETRY or IMPORT_REFUSED.
-fn build_notebook(id: &str, src: &str, final_: &str, names: &[String]) -> i32 {
-    let n = names.len();
+fn build_notebook(id: &str, src: &str, final_: &str, names: &[String], pdf: Option<&mut PdfReader>) -> i32 {
+    let is_pdf = pdf.is_some();
+    let n = match &pdf {
+        Some(pr) => pr.npages() as usize,
+        None => names.len(),
+    };
+    let mut pdf = pdf;
     let mut work = String::new();
     let mut bgdir = String::new();
     csnprintf!(&mut work, 700, "%s/notebooks/.import-%s", &store_root(), id);
@@ -1553,41 +1642,53 @@ fn build_notebook(id: &str, src: &str, final_: &str, names: &[String]) -> i32 {
             break 'out IMPORT_RETRY;
         }
         qlog!("import: %s: %d page(s), for %dx%d pages", id, n, pw, ph);
-        for (i, name) in names.iter().enumerate() {
-            let mut path = String::new();
-            csnprintf!(&mut path, PATH_BUF, "%s/%s", src, name);
-            let data = read_source(&path, BG_SOURCE_MAX_BYTES);
+        for i in 0..n {
             let mut p = BgPicture::default();
             let mut fit = BgPicture::default();
-            let mut why: &'static str = "the file does not read";
+            let mut why = String::from("the file does not read");
             let mut fail = IMPORT_RETRY;
-            if let Some(d) = &data {
-                let dec = bgimage_decode(d, &mut p, &mut why);
-                fail = if dec == 0 {
+            if let Some(pr) = pdf.as_mut() {
+                let rc = pdf_page_picture(pr, i as i32, pw * 2, ph * 2, &mut p, &mut why);
+                fail = if rc == 0 {
                     0
-                } else if dec == -2 {
+                } else if rc == PDF_ERR_MEM || rc == PDF_ERR_READ {
                     IMPORT_RETRY
                 } else {
                     IMPORT_REFUSED
                 };
+            } else {
+                let mut path = String::new();
+                csnprintf!(&mut path, PATH_BUF, "%s/%s", src, &names[i]);
+                let data = read_source(&path, BG_SOURCE_MAX_BYTES);
+                if let Some(d) = &data {
+                    let mut why2: &'static str = "the file does not read";
+                    let dec = bgimage_decode(d, &mut p, &mut why2);
+                    why = why2.to_string();
+                    fail = if dec == 0 {
+                        0
+                    } else if dec == -2 {
+                        IMPORT_RETRY
+                    } else {
+                        IMPORT_REFUSED
+                    };
+                }
             }
-            drop(data);
             if fail == 0 && bgimage_normalize(&p, pw, ph, &mut fit) != 0 {
-                why = "out of memory";
+                why = String::from("out of memory");
                 fail = IMPORT_RETRY;
             }
             bgpicture_free(&mut p);
             let mut pic = 0u32;
             let mut added = false;
             if fail == 0 && bgindex_claim(&mut ix, &bgdir, bgimage_key(&fit), &mut pic, &mut added) != 0 {
-                why = "out of memory";
+                why = String::from("out of memory");
                 fail = IMPORT_RETRY;
             }
             if fail == 0 && added {
                 let mut file = String::new();
                 bgimage_file(&bgdir, pic, &mut file, 900);
                 if bgimage_write_png(&file, &fit) != 0 {
-                    why = "a picture could not be written";
+                    why = String::from("a picture could not be written");
                     fail = IMPORT_RETRY;
                 }
             }
@@ -1610,13 +1711,13 @@ fn build_notebook(id: &str, src: &str, final_: &str, names: &[String]) -> i32 {
                 papers.push(paper_image(PAPER_ROLE_DOCUMENT, pic));
                 let pg = page_new(pw, ph, papers[i]);
                 if store_write_page_in(&work, pids[i], &pg) != 0 {
-                    why = "a page could not be written";
+                    why = String::from("a page could not be written");
                     fail = IMPORT_RETRY;
                 }
                 page_free(pg);
             }
             if fail != 0 {
-                qlog!("import: %s: page %d of %d: %s; nothing imported", id, i + 1, n, why);
+                qlog!("import: %s: page %d of %d: %s; nothing imported", id, i + 1, n, why.as_str());
                 break 'out fail;
             }
             if (i + 1) % 10 == 0 && i + 1 < n {
@@ -1625,7 +1726,14 @@ fn build_notebook(id: &str, src: &str, final_: &str, names: &[String]) -> i32 {
         }
         // The notebook around them: its pages are document pages, and pages added to it are blank.
         nb.id.set(id);
-        let name = src.rfind('/').map_or(src, |s| &src[s + 1..]);
+        let mut shown = src.rfind('/').map_or(src, |s| &src[s + 1..]).to_string();
+        if is_pdf {
+            // (Book.pdf makes the notebook Book)
+            if shown.len() > 4 && shown[shown.len() - 4..].eq_ignore_ascii_case(".pdf") {
+                shown.truncate(shown.len() - 4);
+            }
+        }
+        let name = shown.as_str();
         copy_name(&mut nb.name, name); // (a long one cut between characters)
         nb.paper = PAPER_BLANK;
         nb.created = wall_time();
@@ -1658,10 +1766,74 @@ fn build_notebook(id: &str, src: &str, final_: &str, names: &[String]) -> i32 {
 }
 
 // The import itself, under the lock. A failed one leaves no notebook, and the folder as it was.
-fn import_folder(src: &str) -> i32 {
-    if !is_dir(src) {
-        qlog!("import: the folder is gone (an earlier run imported it)");
+// A PDF in import/ itself: its pages, in order, are the notebook's (paper_is_document pages whose
+// paper is the page's picture). The file then moves to import/done like a folder, so a PDF is read
+// once; the notebook's own PDF (PDFs/<name>.pdf, with the ink on it) is what Grimoire writes back.
+fn import_pdf(src: &str, hint: &str) -> i32 {
+    if hint.is_empty() {
+        qlog!("import: a PDF with no notebook id from its start; it waits for the next start");
+        return IMPORT_RETRY;
+    }
+    let id = hint.to_string();
+    let mut final_ = String::new();
+    if store_notebook_dir(&id, &mut final_, 600) != 0 {
+        return IMPORT_RETRY;
+    }
+    let stamp = file_stamp_hash(src);
+    if is_dir(&final_) {
+        // made by a run cut off before its file moved
+        qlog!("import: %s: made by an earlier run; its file moves now", &id);
+        finish_source(src, &id);
+        attempts_note(src, stamp, ATTEMPT_DONE);
         return IMPORT_DONE;
+    }
+    attempts_note(src, stamp, ATTEMPT_TRY); // (counted first: a try cut off counts too)
+    let mut reader: Option<Box<PdfReader>> = None;
+    let mut np = 0;
+    let mut why = String::new();
+    let rc = pdf_open(src, &mut reader, &mut np, &mut why);
+    let mut out = IMPORT_REFUSED;
+    if rc != PDF_OK {
+        qlog!("import: %s: %s; nothing imported", &id, &why);
+        out = if rc == PDF_ERR_READ || rc == PDF_ERR_MEM { IMPORT_RETRY } else { IMPORT_REFUSED };
+    } else if np < 1 || np as usize > STORE_MAX_PAGES {
+        qlog!("import: %s: %d pages; nothing imported", &id, np);
+    } else {
+        qlog!("import: %s: a PDF of %d page(s)", &id, np);
+        let names: Vec<String> = Vec::new();
+        out = build_notebook(&id, src, &final_, &names, reader.as_deref_mut());
+    }
+    pdf_close(&mut reader);
+    attempts_note(
+        src,
+        stamp,
+        if out == IMPORT_DONE {
+            ATTEMPT_DONE
+        } else if out == IMPORT_REFUSED {
+            ATTEMPT_REFUSED
+        } else {
+            ATTEMPT_TRY
+        },
+    );
+    out
+}
+
+// The import itself, under the lock. A failed one leaves no notebook, and its source as it was.
+fn import_path(src: &str, hint: &str) -> i32 {
+    match std::fs::metadata(src) {
+        Err(_) => {
+            qlog!("import: the source is gone (an earlier run imported it)");
+            return IMPORT_DONE;
+        }
+        Ok(st) => {
+            if !st.is_dir() {
+                if !pdf_name(src) {
+                    qlog!("import: a file that is not a PDF; left as it is");
+                    return IMPORT_REFUSED;
+                }
+                return import_pdf(src, hint);
+            }
+        }
     }
     let mut id = String::new();
     let mut final_ = String::new();
@@ -1670,7 +1842,15 @@ fn import_folder(src: &str) -> i32 {
         if done {
             return IMPORT_DONE;
         }
-        store_make_id(&mut id);
+        if !hint.is_empty() {
+            // the id the start made for it: its mark records it for a later try
+            id.clear();
+            id.push_str(hint);
+            let text = cformat!("%s\n", &id);
+            write_mark(src, &text);
+        } else {
+            store_make_id(&mut id);
+        }
     }
     if store_notebook_dir(&id, &mut final_, 600) != 0 {
         return IMPORT_RETRY;
@@ -1691,7 +1871,7 @@ fn import_folder(src: &str) -> i32 {
     attempts_note(src, pictures, ATTEMPT_TRY); // (counted first: a try cut off counts too)
     let mut rc = check_pages(&id, src, &names);
     if rc == 0 {
-        rc = build_notebook(&id, src, &final_, &names);
+        rc = build_notebook(&id, src, &final_, &names, None);
     }
     if rc == IMPORT_DONE {
         attempts_note(src, pictures, ATTEMPT_DONE);
@@ -1705,7 +1885,7 @@ fn import_folder(src: &str) -> i32 {
 }
 
 /// bgjob.h: the work of a BG_IMPORT_FOLDER job, in the child; 0 = done.
-pub fn bg_import_folder(path: &str, dpi: f32) -> i32 {
+pub fn bg_import_folder(id_hint: &str, path: &str, dpi: f32) -> i32 {
     let _ = dpi;
     let lock = match import_lock(true) {
         Ok(fd) => fd,
@@ -1715,7 +1895,7 @@ pub fn bg_import_folder(path: &str, dpi: f32) -> i32 {
         }
     };
     let cap = cap_memory();
-    let rc = import_folder(path);
+    let rc = import_path(path, id_hint);
     uncap_memory(&cap);
     // SAFETY: close takes the descriptor import_lock opened, which is not used again.
     unsafe { libc::close(lock) };

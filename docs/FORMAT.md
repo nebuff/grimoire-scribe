@@ -555,6 +555,22 @@ count), each page a document page; the notebook's own paper is Blank. It is made
   folders no longer there. A start takes at most 8 folders; a folder of more than 2000 pictures is
   not imported, nor one without pictures, nor one whose path is 600 bytes or longer.
 
+A PDF dropped in `import/` itself becomes a notebook of its pages the same way (`import/Book.pdf`
+makes the notebook `Book`): each page is a document page whose paper is the page's picture, turned
+by its `/Rotate` and fitted to the page. A page that is a whole-page picture (a scan, a
+photographed page) is read as that picture, the biggest image the page draws through its forms'
+resources, at the size it holds. A page set in fonts, or drawn with lines, is drawn: its content
+stream walked, its paths filled and stroked with their fill rules, its text set through the page's
+own TrueType font program (Grimoire's own face where the program is CFF, Type 1 or missing, the
+PDF's widths keeping the words where they belong, and a composite font's CIDs taken as glyph ids),
+its images placed through their matrices, and its forms drawn in turn. Not drawn: transparency
+groups, shadings, patterns and inline images. The file moves to
+`import/done/` like a folder and is left as it was; the notebook's own PDF (`PDFs/<name>.pdf`, with
+the ink on it) is what Grimoire writes back. A page that cannot be drawn and holds no picture is
+refused, `grimoire.log` naming the page and why, and no notebook is made. A file cannot hold `.grimoire-import`, so the start
+that queues a PDF makes its notebook id and hands it to the job; the import holds it like a
+folder's mark, and its `.attempts` line hashes the file's size and time instead of its pictures'.
+
 Grimoire makes `import/` at startup, with a `README.txt`, if it is missing.
 
 ### Annotated pages: `root/import/.annotate/` and `source.ini` (1.1 on)

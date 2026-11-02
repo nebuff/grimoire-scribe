@@ -638,7 +638,7 @@ pub fn app_init(a: &mut App, w: i32, h: i32, dpi: f32) -> i32 {
     // The owner's pictures (templates.h): the templates and import folders, and the folders of page
     // pictures copied into import/ since the last run, made into notebooks in the background.
     templates_init();
-    import_scan(dpi);
+    let importing = import_scan(dpi);
     let caps = input_caps();
     if a.settings.rotation_lock != 0 {
         app_set_rotation(a, a.settings.rotation_lock - 1);
@@ -672,6 +672,13 @@ pub fn app_init(a: &mut App, w: i32, h: i32, dpi: f32) -> i32 {
         // TRANSLATORS: %s is the app's name, Grimoire.
         csnprintf!(&mut msg, 256, tr("No pen found. %s is made for the Kindle Scribe; writing needs its pen."), APP_NAME);
         app_toast(a, &msg, 10000);
+    }
+    // A folder of pages, or a PDF, in grimoire/import is now becoming a notebook in the background:
+    // its pages are drawn one by one, which is minutes for a book on the Scribe. The Library says
+    // so from here on (import_toast_tick keeps saying it until the job is done), so a Library that
+    // stays as it was is not taken for an import that failed.
+    if importing > 0 {
+        import_toast(a, 8000);
     }
     0
 }
@@ -1059,6 +1066,35 @@ fn toast_follow(a: &mut App) {
     let old = a.toast_rect;
     with(|s| s.self_dirty = rect_union(s.self_dirty, rect_union(old, r)));
     a.toast_rect = r;
+}
+
+// The toast that says an import from grimoire/import is running (its own text is the import
+// folder's title, which every language has).
+fn import_toast_text() -> String {
+    cformat!("%s...", tr("Importing pages into Grimoire"))
+}
+
+fn import_toast(a: &mut App, ms: i32) {
+    let text = import_toast_text();
+    app_toast(a, &text, ms);
+}
+
+// While an import runs the toast stays up (extended rather than flashed again), and comes back
+// after another toast has had its time (one that says an earlier import is done, say). It is told
+// apart from those by its text. Only on the Library: the import belongs to the notebook list.
+fn import_toast_tick(a: &mut App) {
+    if a.asleep || a.scr != ScreenId::Library || !bg_importing() {
+        return;
+    }
+    let text = import_toast_text();
+    if a.toast_visible && a.toast.as_str() == text.as_str() {
+        a.toast_until = now_ms().wrapping_add(4000);
+        return;
+    }
+    if a.toast_until.wrapping_sub(now_ms()) as i32 > 0 {
+        return; // a toast is up
+    }
+    app_toast(a, &text, 4000);
 }
 
 pub fn app_toast(a: &mut App, msg: &str, ms: i32) {
@@ -1546,8 +1582,13 @@ fn poll_jobs(a: &mut App) -> i32 {
     }
     let mut pages = 0;
     let got = import_finished(r > 0, &mut pages);
-    if got > 0 && a.scr == ScreenId::Library && !a.asleep {
-        app_redraw_mode(a, RefreshMode::Ui); // (waking redraws it too)
+    if got > 0 {
+        // The notebook is made: the Library's list is read again even when that is not the screen
+        // showing (an import can finish while another screen is up, or while Grimoire sleeps), so
+        // the notebook is there the next time the Library is drawn, and drawn at once when it is
+        // already up. A start is not needed for it to appear.
+        qlog!("import: the Library's list is read again");
+        crate::library::library_refresh(a, a.scr == ScreenId::Library && !a.asleep);
     }
     if got > 0 {
         let mut msg = String::new();
@@ -1620,6 +1661,7 @@ fn app_tick_screens(a: &mut App, now: u32) {
         app_toast(a, if bg > 0 { msg.as_str() } else { tr("Could not save the PDF") }, 2500,
         );
     }
+    import_toast_tick(a);
     if store_take_corrupt_count() > 0 {
         let mut msg = String::new();
         // TRANSLATORS: a page that could not be read; %s is the log file that says which.

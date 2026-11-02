@@ -1,7 +1,7 @@
 // bgwork_template.c: templates and imports (templates.h), and the background work behind them:
 // BG_TEMPLATE (a template's picture made for a notebook, or the previews of the templates folder)
-// and BG_IMPORT_FOLDER (a folder of page pictures made into a notebook), run in a forked child by
-// bgjob.c.
+// and BG_IMPORT_FOLDER (a folder of page pictures, or a PDF, made into a notebook), run in a forked
+// child by bgjob.c.
 //
 // grimoire.log goes into public bug reports: the names of the owner's files and folders are never
 // logged here, only notebook ids and counts.
@@ -24,6 +24,7 @@
 #include "bgimage.h"
 #include "bgjob.h"
 #include "i18n.h"
+#include "pdfread.h"
 
 #define TEMPLATE_MAX_BYTES (16u << 20) // a template file bigger than this is not taken
 #define TEMPLATE_HASH_NOW (4u << 20)   // the most read on the UI thread for a template's key
@@ -72,6 +73,12 @@ int natural_cmp(const char *a, const char *b) {
 
 static int cmp_names(const void *a, const void *b) { return natural_cmp(*(char *const *)a, *(char *const *)b); }
 
+// A PDF dropped in import/ itself: its pages are the notebook's, in order (pdfread.h).
+static bool pdf_name(const char *n) {
+    size_t l = strlen(n);
+    return n[0] != '.' && l > 4 && !strcasecmp(n + l - 4, ".pdf");
+}
+
 // A picture file by its name: .png, .jpg, .jpeg or .pgm in any case, and never a dot-file.
 static bool picture_name(const char *n) {
     const char *dot = strrchr(n, '.');
@@ -106,6 +113,33 @@ static int list_names(const char *dir, bool pictures, int max, char ***out, int 
         if (is_dir(path) == pictures) continue;
         if (*n == cap) {
             int nc = cap ? cap * 2 : 16;
+            char **nv = realloc(*out, (size_t)nc * sizeof *nv);
+            if (!nv) break;
+            *out = nv;
+            cap = nc;
+        }
+        if (!((*out)[*n] = strdup(e->d_name))) break;
+        (*n)++;
+    }
+    closedir(d);
+    if (*n) qsort(*out, (size_t)*n, sizeof **out, cmp_names);
+    return 0;
+}
+
+// The PDF files of dir, in natural order, at most max. *out is freed with free_names.
+static int list_pdfs(const char *dir, int max, char ***out, int *n) {
+    *out = NULL;
+    *n = 0;
+    DIR *d = opendir(dir);
+    if (!d) return -1;
+    int cap = 0;
+    for (struct dirent *e; (e = readdir(d)) && *n < max;) {
+        if (!pdf_name(e->d_name)) continue;
+        char path[PATH_BUF];
+        snprintf(path, sizeof path, "%s/%s", dir, e->d_name);
+        if (is_dir(path)) continue;
+        if (*n == cap) {
+            int nc = cap ? cap * 2 : 8;
             char **nv = realloc(*out, (size_t)nc * sizeof *nv);
             if (!nv) break;
             *out = nv;
@@ -288,12 +322,13 @@ void templates_init(void) {
         // its two paragraphs. "done" is the name of a folder: keep it as it is.
         const char *parts[] = {
             _("Importing pages into Grimoire"),
-            _("To write on pages you already have, such as a PDF saved as pictures, put a folder of PNG or JPG "
-              "files here, one picture a page, and start Grimoire. The folder's name becomes the notebook's name, "
-              "and the pages follow the file names in order (page-2 comes before page-10). Gray pictures import "
-              "faster and take less room than colour ones."),
-            _("Grimoire imports each folder in the background and then moves it into the done folder. Copy folders "
-              "in over USB while Grimoire is closed.")};
+            _("To write on pages you already have, put a PDF file here, or a folder of PNG or JPG files, one "
+              "picture a page, and start Grimoire. Book.pdf becomes the notebook Book, its pages the PDF's pages; "
+              "a folder's name becomes the notebook's name, and its pages follow the file names in order "
+              "(page-2 comes before page-10). Gray pictures import faster and take less room than colour ones."),
+            _("Grimoire imports each one in the background and then moves it into the done folder. Copy them in "
+              "over USB while Grimoire is closed. What you write on a PDF's pages is written beside your "
+              "notebooks, in PDFs/, as a new PDF: the file you put here is left as it was.")};
         write_readme(dir, parts, 3, "import");
     }
 }
@@ -844,6 +879,18 @@ static uint64_t pictures_hash(const char *src, char *const *names, int n) {
     return h;
 }
 
+// What a PDF's file is, for the attempts table: its size and time (its pages are never all read to
+// know whether it changed).
+static uint64_t file_stamp_hash(const char *path) {
+    struct stat st;
+    int64_t v[2] = {-1, -1};
+    if (stat(path, &st) == 0) {
+        v[0] = (int64_t)st.st_size;
+        v[1] = (int64_t)st.st_mtime;
+    }
+    return fnv(fnv(FNV0, path, strlen(path) + 1), v, sizeof v);
+}
+
 static uint64_t folder_pictures_hash(const char *src) {
     char **names;
     int n;
@@ -948,7 +995,11 @@ int import_scan(float dpi) {
     int nn, folders = 0;
     if (list_names(dir, false, 1000, &names, &nn) != 0) nn = 0;
     for (int i = 0; i < nn; i++) folders += strcmp(names[i], "done") != 0;
-    if (!folders && !import_leftovers(false)) {  // nothing to do (and no lock file made for it)
+    char **pdfs;
+    int npdfs = 0;
+    if (list_pdfs(dir, IMPORT_QUEUE_MAX, &pdfs, &npdfs) != 0) npdfs = 0;
+    if (!folders && !npdfs && !import_leftovers(false)) {  // nothing to do (and no lock file made for it)
+        free_names(pdfs, npdfs);
         free_names(names, nn);
         return 0;
     }
@@ -957,6 +1008,7 @@ int import_scan(float dpi) {
         if (errno == EWOULDBLOCK)
             qlog("import: an import from an earlier run is still going; the import folders wait for the next start");
         else qlog("import: the import lock cannot be taken (%s); the import folders wait for the next start", strerror(errno));
+        free_names(pdfs, npdfs);
         free_names(names, nn);
         return 0;
     }
@@ -1011,7 +1063,34 @@ int import_scan(float dpi) {
         strlcpy_q(g_pending[g_npending++], id, STORE_ID_LEN);
         queued++;
     }
-    int kept = 0;  // the records of folders no longer here (imported, or taken away) go
+    // A PDF dropped straight into import/: its pages are its notebook's. It carries no mark (a file
+    // cannot hold one), so the id made for it here goes to the job with it.
+    for (int i = 0; i < npdfs; i++) {
+        if (g_npending >= IMPORT_QUEUE_MAX) break;  // (the next start takes it)
+        char src[PATH_BUF], id[STORE_ID_LEN];
+        snprintf(src, sizeof src, "%s/%s", dir, pdfs[i]);
+        if (strlen(src) >= JOB_PATH_MAX) {  // it would be cut on its way to the job
+            toolong++;
+            continue;
+        }
+        uint64_t nh = folder_name_hash(src), stamp = file_stamp_hash(src);
+        int at = -1;
+        for (int k = 0; k < natt; k++)
+            if (att[k].name == nh) {
+                at = k;
+                seen[k] = true;
+            }
+        if (at >= 0 && att[at].tries >= IMPORT_TRIES && att[at].pictures == stamp) {
+            waiting++;
+            continue;
+        }
+        store_make_id(id);
+        bg_queue(BG_IMPORT_FOLDER, id, src, dpi, true);
+        strlcpy_q(g_pending[g_npending++], id, STORE_ID_LEN);
+        queued++;
+    }
+    free_names(pdfs, npdfs);
+    int kept = 0;  // the records of sources no longer here (imported, or taken away) go
     for (int k = 0; k < natt; k++)
         if (seen[k]) att[kept++] = att[k];
     if (kept != natt) attempts_save(att, kept);
@@ -1105,7 +1184,8 @@ static int check_pages(const char *id, const char *src, char *const *names, int 
 // The notebook itself, built in notebooks/.import-<id>/ (which the Library never lists) and renamed
 // into place only once whole; anything going wrong removes it. IMPORT_DONE (its folder moved to
 // import/done), IMPORT_RETRY or IMPORT_REFUSED.
-static int build_notebook(const char *id, const char *src, const char *final, char *const *names, int n) {
+static int build_notebook(const char *id, const char *src, const char *final, char *const *names, int n,
+                          PdfReader *pdf) {
     char work[700], bgdir[800];
     snprintf(work, sizeof work, "%s/notebooks/.import-%s", store_root(), id);
     snprintf(bgdir, sizeof bgdir, "%s/bg", work);
@@ -1127,18 +1207,25 @@ static int build_notebook(const char *id, const char *src, const char *final, ch
     }
     qlog("import: %s: %d page(s), for %dx%d pages", id, n, pw, ph);
     for (int i = 0; i < n; i++) {
-        char path[PATH_BUF];
-        snprintf(path, sizeof path, "%s/%s", src, names[i]);
-        size_t len;
-        uint8_t *data = read_source(path, BG_SOURCE_MAX_BYTES, &len);
         BgPicture p = {0}, fit = {0};
+        char whybuf[PDF_WHY_LEN];
         const char *why = "the file does not read";
         int fail = IMPORT_RETRY;
-        if (data) {
-            int dec = bgimage_decode(data, len, &p, &why);
-            fail = dec == 0 ? 0 : dec == -2 ? IMPORT_RETRY : IMPORT_REFUSED;
+        if (pdf) {
+            why = whybuf;
+            int pr = pdf_page_picture(pdf, i, pw * 2, ph * 2, &p, whybuf);
+            fail = pr == 0 ? 0 : pr == PDF_ERR_MEM || pr == PDF_ERR_READ ? IMPORT_RETRY : IMPORT_REFUSED;
+        } else {
+            char path[PATH_BUF];
+            snprintf(path, sizeof path, "%s/%s", src, names[i]);
+            size_t len;
+            uint8_t *data = read_source(path, BG_SOURCE_MAX_BYTES, &len);
+            if (data) {
+                int dec = bgimage_decode(data, len, &p, &why);
+                fail = dec == 0 ? 0 : dec == -2 ? IMPORT_RETRY : IMPORT_REFUSED;
+            }
+            free(data);
         }
-        free(data);
         if (!fail && bgimage_normalize(&p, pw, ph, &fit) != 0) {
             why = "out of memory";
             fail = IMPORT_RETRY;
@@ -1190,7 +1277,13 @@ static int build_notebook(const char *id, const char *src, const char *final, ch
     // The notebook around them: its pages are document pages, and pages added to it are blank.
     strlcpy_q(nb->id, id, sizeof nb->id);
     const char *slash = strrchr(src, '/');
-    copy_name(nb->name, slash ? slash + 1 : src, sizeof nb->name);  // (a long one cut between characters)
+    char shown[PATH_BUF];
+    strlcpy_q(shown, slash ? slash + 1 : src, sizeof shown);
+    if (pdf) {  // (Book.pdf makes the notebook Book)
+        size_t l = strlen(shown);
+        if (l > 4 && !strcasecmp(shown + l - 4, ".pdf")) shown[l - 4] = 0;
+    }
+    copy_name(nb->name, shown, sizeof nb->name);  // (a long one cut between characters)
     nb->paper = PAPER_BLANK;
     nb->created = nb->modified = wall_time();
     nb->npages = n;
@@ -1223,17 +1316,69 @@ out:
     return rc;
 }
 
-// The import itself, under the lock. A failed one leaves no notebook, and the folder as it was.
-static int import_folder(const char *src) {
-    if (!is_dir(src)) {
-        qlog("import: the folder is gone (an earlier run imported it)");
+// A PDF in import/ itself: its pages, in order, are the notebook's (paper_is_document pages whose
+// paper is the page's picture). The file then moves to import/done like a folder, so a PDF is read
+// once; the notebook's own PDF (PDFs/<name>.pdf, with the ink on it) is what Grimoire writes back.
+static int import_pdf(const char *src, const char *hint) {
+    char id[STORE_ID_LEN], final[600];
+    if (!hint || !*hint) {
+        qlog("import: a PDF with no notebook id from its start; it waits for the next start");
+        return IMPORT_RETRY;
+    }
+    strlcpy_q(id, hint, sizeof id);
+    if (store_notebook_dir(id, final, sizeof final) != 0) return IMPORT_RETRY;
+    uint64_t stamp = file_stamp_hash(src);
+    if (is_dir(final)) {  // made by a run cut off before its file moved
+        qlog("import: %s: made by an earlier run; its file moves now", id);
+        finish_source(src, id);
+        attempts_note(src, stamp, ATTEMPT_DONE);
         return IMPORT_DONE;
+    }
+    attempts_note(src, stamp, ATTEMPT_TRY);  // (counted first: a try cut off counts too)
+    PdfReader *pr = NULL;
+    int np = 0, out = IMPORT_REFUSED;
+    char why[PDF_WHY_LEN];
+    int rc = pdf_open(src, &pr, &np, why);
+    if (rc != PDF_OK) {
+        qlog("import: %s: %s; nothing imported", id, why);
+        out = rc == PDF_ERR_READ || rc == PDF_ERR_MEM ? IMPORT_RETRY : IMPORT_REFUSED;
+    } else if (np < 1 || np > STORE_MAX_PAGES) {
+        qlog("import: %s: %d pages; nothing imported", id, np);
+    } else {
+        qlog("import: %s: a PDF of %d page(s)", id, np);
+        out = build_notebook(id, src, final, NULL, np, pr);
+    }
+    pdf_close(pr);
+    attempts_note(src, stamp, out == IMPORT_DONE ? ATTEMPT_DONE : out == IMPORT_REFUSED ? ATTEMPT_REFUSED : ATTEMPT_TRY);
+    return out;
+}
+
+// The import itself, under the lock. A failed one leaves no notebook, and its source as it was.
+static int import_path(const char *src, const char *hint) {
+    struct stat st;
+    if (stat(src, &st) != 0) {
+        qlog("import: the source is gone (an earlier run imported it)");
+        return IMPORT_DONE;
+    }
+    if (!S_ISDIR(st.st_mode)) {
+        if (!pdf_name(src)) {
+            qlog("import: a file that is not a PDF; left as it is");
+            return IMPORT_REFUSED;
+        }
+        return import_pdf(src, hint);
     }
     char id[STORE_ID_LEN], final[600];
     bool done;
     if (!read_mark(src, id, &done)) {
         if (done) return IMPORT_DONE;
-        store_make_id(id);
+        if (hint && *hint) {  // the id the start made for it: its mark records it for a later try
+            strlcpy_q(id, hint, sizeof id);
+            char text[STORE_ID_LEN + 2];
+            snprintf(text, sizeof text, "%s\n", id);
+            write_mark(src, text);
+        } else {
+            store_make_id(id);
+        }
     }
     if (store_notebook_dir(id, final, sizeof final) != 0) return IMPORT_RETRY;
     if (is_dir(final)) {  // made by a run cut off before its folder moved
@@ -1251,7 +1396,7 @@ static int import_folder(const char *src) {
     uint64_t pictures = pictures_hash(src, names, n);
     attempts_note(src, pictures, ATTEMPT_TRY);  // (counted first: a try cut off counts too)
     int rc = check_pages(id, src, names, n);
-    if (rc == 0) rc = build_notebook(id, src, final, names, n);
+    if (rc == 0) rc = build_notebook(id, src, final, names, n, NULL);
     free_names(names, n);
     if (rc == IMPORT_DONE) {
         attempts_note(src, pictures, ATTEMPT_DONE);
@@ -1262,7 +1407,7 @@ static int import_folder(const char *src) {
     return rc;
 }
 
-int bg_import_folder(const char *path, float dpi) {
+int bg_import_folder(const char *path, const char *id_hint, float dpi) {
     (void)dpi;
     int lock = import_lock(true);
     if (lock < 0) {
@@ -1271,7 +1416,7 @@ int bg_import_folder(const char *path, float dpi) {
     }
     MemCap cap;
     cap_memory(&cap);
-    int rc = import_folder(path);
+    int rc = import_path(path, id_hint);
     uncap_memory(&cap);
     close(lock);
     return rc == IMPORT_DONE ? 0 : -1;

@@ -83,6 +83,7 @@ Every C file has a module of the same name; a header and its .c are one module.
 | main.c | mainloop.rs | `main.rs` would read as a binary to every Rust tool; src/bin/*.rs call it |
 | sim_sdl.c | sim_sdl.rs | the headless runner only (see "Not ported") |
 | templates.h + bgwork_template.c | templates.rs (types) + bgwork_template.rs (functions) | templates.rs re-exports them |
+| pdfread.h + pdfread.c | pdfread.rs | the pages of a PDF, for grimoire/import (added after wave 4, in both trees) |
 | compact.h + bgwork_compact.c | compact.rs + bgwork_compact.rs | the same |
 | app.h | app.rs | re-exports the screens' entry points from library.rs, editor.rs, ... |
 | display.h, input.h, light.h | display.rs, input.rs, light.rs | types + forwarders to the platform |

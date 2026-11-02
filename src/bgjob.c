@@ -48,7 +48,7 @@ static int run_job(const Job *j) {
     case BG_MIRROR_PDF: return run_mirror(j);
     case BG_COMPACT_PAGES: return bg_compact_pages(j->id, j->dpi);
     case BG_TEMPLATE: return bg_template(j->id, j->dir, j->dpi);
-    case BG_IMPORT_FOLDER: return bg_import_folder(j->dir, j->dpi);
+    case BG_IMPORT_FOLDER: return bg_import_folder(j->dir, j->id, j->dpi);
     }
     return -1;
 }

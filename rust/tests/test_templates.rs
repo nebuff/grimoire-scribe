@@ -1992,7 +1992,7 @@ fn import_makes_a_notebook() {
     bgpicture_free(&mut p3);
     let id = "20261020-120000-abcd";
     mark(&src, id);
-    check!(bg_import_folder(&src, DPI) == 0);
+    check!(bg_import_folder("", &src, DPI) == 0);
     let mut nb = NotebookInfo::default();
     check!(store_load_info(id, &mut nb) == 0);
     check!(nb.name == "Score" && nb.folder.is_empty() && nb.npages() == 4 && nb.paper == PAPER_BLANK);
@@ -2061,7 +2061,7 @@ fn import_same_picture_twice() {
     let src = import_folder_of("Twins", &files, &values, 2);
     let id = "20261020-120001-beef";
     mark(&src, id);
-    check!(bg_import_folder(&src, DPI) == 0);
+    check!(bg_import_folder("", &src, DPI) == 0);
     let mut nb = NotebookInfo::default();
     check!(store_load_info(id, &mut nb) == 0 && nb.npages() == 2 && index_entries(&nb) == 1);
     let (mut a, mut b): (Option<Box<Page>>, Option<Box<Page>>) = (None, None);
@@ -2087,7 +2087,7 @@ fn import_long_name() {
     let src = import_folder_of(&name, &files, &values, 1);
     let id = "20261020-120003-cafe";
     mark(&src, id);
-    check!(bg_import_folder(&src, DPI) == 0);
+    check!(bg_import_folder("", &src, DPI) == 0);
     let mut nb = NotebookInfo::default();
     check!(store_load_info(id, &mut nb) == 0 && nb.name.len() == 94 && nb.name.as_bytes() == &name.as_bytes()[..94]);
 }
@@ -2102,7 +2102,7 @@ fn import_failure_leaves_nothing() {
     check!(store_list(&mut before) == 0);
     let nbefore = before.len();
     log_capture();
-    check!(bg_import_folder(&src, DPI) != 0);
+    check!(bg_import_folder("", &src, DPI) != 0);
     // Refused from its headers, before any page was made ("N page(s), for WxH pages" starts that).
     let log = log_captured();
     check!(log.as_ref().is_some_and(|l| l.contains("page 2 of 3: not a PNG") && !l.contains("page(s), for")));
@@ -2235,7 +2235,7 @@ fn import_made_before_moved() {
     let src = import_folder_of("Twice", &files, &values, 2);
     let id = "20261020-120005-f00d";
     mark(&src, id);
-    check!(bg_import_folder(&src, DPI) == 0 && notebooks_named("Twice") == 1);
+    check!(bg_import_folder("", &src, DPI) == 0 && notebooks_named("Twice") == 1);
     // Put the folder back as the cut-off run left it.
     let done = format!("{}/import/done", root());
     let mut back = String::new();
@@ -2264,7 +2264,7 @@ fn import_leftover_whole() {
     let id = "20261020-120006-beef";
     let lost = "20261020-120007-cafe";
     mark(&src, id);
-    check!(bg_import_folder(&src, DPI) == 0);
+    check!(bg_import_folder("", &src, DPI) == 0);
     let from = format!("{}/notebooks/{}", root(), id);
     let to = format!("{}/notebooks/.import-{}", root(), lost);
     check!(std::fs::rename(&from, &to).is_ok() && notebooks_named("Kept") == 0);

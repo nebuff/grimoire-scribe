@@ -7,7 +7,7 @@
 //! function with a SAFETY comment, and free what stb allocates with the matching free.
 #![allow(non_camel_case_types, non_snake_case)]
 
-use libc::{c_char, c_int, c_uchar, c_void, size_t};
+use libc::{c_char, c_int, c_short, c_uchar, c_void, size_t};
 
 // ---- stb_truetype ----
 
@@ -27,6 +27,21 @@ impl Default for stbtt_fontinfo {
     }
 }
 
+/// stbtt_vertex: one point of a glyph's outline, in unscaled font units. `type_` is 1 (a move),
+/// 2 (a line), 3 (a quadratic curve through cx,cy to x,y) or 4 (a cubic: cx,cy then cx1,cy1).
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct stbtt_vertex {
+    pub x: c_short,
+    pub y: c_short,
+    pub cx: c_short,
+    pub cy: c_short,
+    pub cx1: c_short,
+    pub cy1: c_short,
+    pub type_: c_uchar,
+    pub padding: c_uchar,
+}
+
 extern "C" {
     pub fn stbtt_InitFont(info: *mut stbtt_fontinfo, data: *const c_uchar, offset: c_int) -> c_int;
     pub fn stbtt_GetFontOffsetForIndex(data: *const c_uchar, index: c_int) -> c_int;
@@ -36,6 +51,13 @@ extern "C" {
     pub fn stbtt_GetCodepointHMetrics(info: *const stbtt_fontinfo, codepoint: c_int, advance: *mut c_int, lsb: *mut c_int);
     pub fn stbtt_GetCodepointKernAdvance(info: *const stbtt_fontinfo, ch1: c_int, ch2: c_int) -> c_int;
     pub fn stbtt_GetCodepointBox(info: *const stbtt_fontinfo, codepoint: c_int, x0: *mut c_int, y0: *mut c_int, x1: *mut c_int, y1: *mut c_int) -> c_int;
+    /// Font units to pixels so that one em is `pixels` (pdfread.rs reads 1/unitsPerEm from it).
+    pub fn stbtt_ScaleForMappingEmToPixels(info: *const stbtt_fontinfo, pixels: f32) -> f32;
+    pub fn stbtt_GetGlyphHMetrics(info: *const stbtt_fontinfo, glyph_index: c_int, advance: *mut c_int, lsb: *mut c_int);
+    /// A glyph's outline (pdfread.rs draws a PDF page's text with it): the count of vertices, in a
+    /// block stb allocates that stbtt_FreeShape frees, or 0 (and no block) for an empty glyph.
+    pub fn stbtt_GetGlyphShape(info: *const stbtt_fontinfo, glyph_index: c_int, vertices: *mut *mut stbtt_vertex) -> c_int;
+    pub fn stbtt_FreeShape(info: *const stbtt_fontinfo, vertices: *mut stbtt_vertex);
     pub fn stbtt_GetCodepointBitmap(
         info: *const stbtt_fontinfo,
         scale_x: f32,
@@ -61,6 +83,10 @@ extern "C" {
     pub fn stbi_write_png(filename: *const c_char, w: c_int, h: c_int, comp: c_int, data: *const c_void, stride_bytes: c_int) -> c_int;
     /// A process-wide setting (live.c sets it in its viewer child: the fastest filter).
     pub static mut stbi_write_force_png_filter: c_int;
+    /// In stb_image_write's implementation section but not its API header either: the C declares it
+    /// where it uses it (pdfread.c). The bytes it decoded, or a negative error; it never writes past
+    /// `olen`, which is the bound the caller chose.
+    pub fn stbi_zlib_decode_buffer(obuffer: *mut c_char, olen: c_int, ibuffer: *const c_char, ilen: c_int) -> c_int;
 }
 
 // ---- stb_image (csrc/stb_image_impl.c) ----
