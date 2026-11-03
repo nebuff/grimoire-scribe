@@ -73,6 +73,16 @@ KOReader's `start_with` for its next start (KOReader below).
   sleep within 2.5 s, or no wake within 3 s), Grimoire first reads
   `lipc-get-prop -s com.lab126.powerd state`: it never draws over a Kindle in its screensaver,
   and never sends a power button to one.
+- While the sleep screen is up, Grimoire's main loop waits a whole second at a time for input
+  instead of its 30 ms awake tick: nothing ticks and nothing is drawn asleep, so only events and a
+  few long timers are left (the 3 s wake fallback, the launcher's heartbeat). This is the battery
+  the sleep screen would otherwise spend. The Kindle is not suspended for all of that time: it
+  stays awake behind the sleep screen while it waits at its passcode keypad, from
+  `goingToScreenSaver` until powerd suspends, and at every wake, and a 30 ms loop there is 33
+  wakeups a second for as long as it lasts (the Kindle's own sleep screen runs no such loop at
+  all). Input, the power service's announcements and the share server still wake the loop at once,
+  so the wake is never delayed. In the log, a loop that waited a sleep's second leaves no line: the
+  `main: <phase> took N ms` watchdog allows the wait it asked for.
 - Ink is also autosaved 2 s after the pen lifts and at every press of the power button, so a
   crash or a forced reboot loses at most the last stroke. A page that fails to save stays open
   (with a warning, and the autosave tries again every 2 s) instead of being dropped, and a page
