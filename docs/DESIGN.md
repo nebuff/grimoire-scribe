@@ -544,6 +544,12 @@ announcements: goingToScreenSaver draws the sleep screen, outOfScreenSaver is th
 - While asleep, pen and touch, side-button presses and pinch begin/move are dropped
   (`power_asleep_drops`), but button releases and pinch ends pass, so one that began before the
   sleep finishes (a button left down would clear the page by its hold right after the wake).
+- Asleep, the main loop waits a full second at a time in its `poll` instead of the 30 ms awake
+  tick: no screen ticks and nothing is drawn, only events and a few long timers matter (the wake
+  fallback, the launcher's heartbeat). The Kindle stays awake behind its sleep screen while it
+  waits at its passcode keypad, until the power service suspends, and at every wake; a 30 ms wait
+  there is 33 wakeups a second of battery the sleep screen would spend for nothing. Input, the
+  power service and the share server still wake the loop at once.
 - Asleep on the Share screen, `share_sleep` stops watching the server's listening socket: no
   screen ticks while asleep, so a connection waiting there would make `input_poll` return at once
   and the main loop spin until the wake. It waits in the backlog instead, and `share_enter` (the

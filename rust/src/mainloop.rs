@@ -446,13 +446,22 @@ fn run() -> i32 {
         }
         let mut ev = InEvent::default();
         let mut phase = now_ms();
+        // Awake, 30 ms keeps the pen's ink immediate. Asleep, nothing is drawn and no screen ticks
+        // (app_tick returns before them), so the only things left to wait for are events and a few
+        // long timers: the wake fallback and the launcher's heartbeat. The Kindle stays awake behind
+        // its sleep screen for as long as it sits at its passcode keypad (and until the power service
+        // suspends, and again at every wake), and there a 30 ms wait is 33 wakeups a second of
+        // battery a sleep screen must not spend (the Kindle's own sleep screen runs no such loop at
+        // all). A whole second at a time keeps those timers exact enough, and input, the power
+        // service or the share server still wake the loop at once.
+        let wait_ms: i32 = if app.asleep { 1000 } else { 30 };
         // Batch nearby samples, but keep showing ink during a backlog. A costly brush or
         // a continuously readable device must not postpone refreshes and timers until the
         // queue empties. Leave remaining events queued, in order, for the next iteration.
         // (input_drained: the batch ended because nothing more was queued, not at its 64 events or
         // 8 ms: the prefetch and the Links bar's hold timer wait for a quiet moment.)
-        if poll(&mut ev, 30, &mut app) != 0 {
-            phase!("reading input", &mut phase, 30);
+        if poll(&mut ev, wait_ms, &mut app) != 0 {
+            phase!("reading input", &mut phase, wait_ms as u32);
             let batch_at = now_ms();
             let mut count = 0u32;
             let mut slow = Slowest::default();
@@ -471,7 +480,7 @@ fn run() -> i32 {
             batch_done!(&mut phase, &slow);
         } else {
             app.input_drained = true;
-            phase!("reading input", &mut phase, 30);
+            phase!("reading input", &mut phase, wait_ms as u32);
         }
         app_tick(&mut app, now_ms());
         phase!("app_tick", &mut phase, 0);
