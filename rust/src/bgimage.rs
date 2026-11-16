@@ -64,13 +64,20 @@ pub fn bgimage_render(c: &mut Canvas, nb: &str, k: PaperKind, region: Rect) {
     let (cw, ch, cstride) = (c.w, c.h, c.stride as usize);
     if fit_draw(&img.px, img.w, img.h, img.stride as usize, 1, 0, &mut c.px, cstride, 1, cw, ch, r) != 0 {
         canvas_fill(c, r, 255);
+        draw(|d| d.missing = true); // (white without its picture, as a missing one: no cache keeps it)
     }
     work_pump();
 }
-/// Whether a page drew white since the last call because its picture was missing or unreadable:
-/// for the editor to say so (renderers in forked children have nobody to tell).
+/// Whether a page drew white since the last call because its picture was missing or unreadable (or
+/// without its colour, bgimage_render_color): for the editor to say so, and for the notebook PDF's
+/// cache never to keep such a page (pdfcache.rs).
 pub fn bgimage_take_missing() -> bool {
     draw(|d| std::mem::replace(&mut d.missing, false))
+}
+/// Raises bgimage_take_missing's flag: a page was drawn without what its picture should give it (a
+/// colour page drawn gray for want of memory, export.rs).
+pub fn bgimage_note_missing() {
+    draw(|d| d.missing = true)
 }
 /// Forgets the decoded pictures and remembered failures of notebook nb (NULL: of all of them).
 pub fn bgimage_forget(nb: Option<&str>) {
@@ -383,20 +390,6 @@ fn file_exists(path: &str) -> bool {
     unsafe { libc::access(c.as_ptr(), libc::F_OK) == 0 }
 }
 
-/// errno = e, for bgimage_read's callers, which read it (util::errno) after a NULL.
-fn set_errno(e: i32) {
-    // SAFETY: the C library's errno location is valid for the calling thread.
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    unsafe {
-        *libc::__errno_location() = e;
-    }
-    // SAFETY: as above.
-    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
-    unsafe {
-        *libc::__error() = e;
-    }
-}
-
 /// A Vec of n copies of v, or None when the memory is not there (the C's malloc returning NULL).
 fn try_vec<T: Clone>(n: usize, v: T) -> Option<Vec<T>> {
     let mut x = Vec::new();
@@ -412,29 +405,31 @@ pub fn bgpicture_free(p: &mut BgPicture) {
 // ---- reading ----
 
 /// A whole file of at most max bytes, read into a buffer of its size (caller frees), or NULL:
-/// missing or no regular file, or bigger than max (errno EFBIG), or unreadable.
+/// missing or no regular file, or bigger than max (errno EFBIG), or unreadable. The entry at the name itself
+/// must be the regular file (a link there is not followed), and the open never waits (util.rs
+/// open_read_nofollow).
 /// (None leaves errno as the C does: ENOENT, EFBIG, EIO, ENOMEM or what open and read set.)
 pub fn bgimage_read(path: &str, max: usize) -> Option<Vec<u8>> {
-    let Ok(cpath) = CString::new(path) else {
-        set_errno(libc::ENOENT);
-        return None;
+    use std::os::fd::AsRawFd;
+    let (f, md) = match open_read_nofollow(path) {
+        Ok(x) => x,
+        Err(e) => {
+            // (no regular file is the helper's EINVAL, and a path with a NUL has no errno of its own: both read
+            // as a missing file, as they always did; anything else is what the open said)
+            set_errno(match e.raw_os_error() {
+                Some(libc::EINVAL) | None => libc::ENOENT,
+                Some(n) => n,
+            });
+            return None;
+        }
     };
-    // SAFETY: open reads the NUL-terminated path we own.
-    let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDONLY) };
-    if fd < 0 {
-        return None;
-    }
-    // SAFETY: stat is plain data; fstat fills it from our open fd.
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let fd = f.as_raw_fd();
     let mut buf: Option<Vec<u8>> = None;
     let mut err = 0;
-    // SAFETY: fstat writes one stat into our local through a valid pointer.
-    if unsafe { libc::fstat(fd, &mut st) } != 0 || (st.st_mode & libc::S_IFMT) != libc::S_IFREG || st.st_size < 0 {
-        err = libc::ENOENT;
-    } else if st.st_size as u64 > max as u64 {
+    if md.len() > max as u64 {
         err = libc::EFBIG;
     } else {
-        let n = st.st_size as usize;
+        let n = md.len() as usize;
         let mut v: Vec<u8> = Vec::new();
         if v.try_reserve_exact(if n != 0 { n } else { 1 }).is_ok() {
             v.resize(n, 0);
@@ -462,8 +457,7 @@ pub fn bgimage_read(path: &str, max: usize) -> Option<Vec<u8>> {
             err = libc::ENOMEM;
         }
     }
-    // SAFETY: fd is ours and open.
-    unsafe { libc::close(fd) };
+    drop(f); // (closed before errno is set)
     if buf.is_none() {
         set_errno(err);
     }
@@ -784,7 +778,7 @@ pub fn bgimage_decode(data: &[u8], out: &mut BgPicture, why: &mut &'static str) 
 
 // Where a sw x sh picture goes on a dw x dh page: fitted inside it, aspect kept (rounded to whole
 // pixels), centred.
-fn fit_box(sw: i32, sh: i32, dw: i32, dh: i32) -> Rect {
+pub(crate) fn fit_box(sw: i32, sh: i32, dw: i32, dh: i32) -> Rect {
     let (mut fw, mut fh);
     if (dw as i64) * (sh as i64) <= (dh as i64) * (sw as i64) {
         // as wide as the page
@@ -1050,11 +1044,8 @@ fn fread(f: &mut std::fs::File, buf: &mut [u8]) -> (usize, bool) {
 }
 
 pub fn bgimage_content_hash_file(path: &str, hash: &mut u64, len: &mut usize) -> i32 {
-    let Ok(mut f) = std::fs::File::open(path) else { return -1 };
-    let Ok(md) = f.metadata() else { return -1 };
-    if !md.is_file() {
-        return -1;
-    }
+    // (a plain file at the name itself: util.rs open_read_nofollow)
+    let Ok((mut f, md)) = open_read_nofollow(path) else { return -1 };
     let total = md.len() as usize;
     let mut got = 0usize;
     let mut h = mix(seed("grimoire file 1"), total as u64);
@@ -1291,13 +1282,17 @@ fn c_strtou_hex(s: &[u8], max: u64) -> (u64, usize) {
     (if neg { v.wrapping_neg() & max } else { v }, i)
 }
 
+/// bg/index.ini is read up to this size (a line a picture, 24 bytes each).
+const BG_INDEX_MAX: usize = 1 << 20;
+
 /// Reads <bgdir>/index.ini (none: empty). 0, or -1: out of memory, or the file is there but does
-/// not read (then nothing may be saved over it: it would lose the ids it lists).
+/// not read, longer than BG_INDEX_MAX included (then nothing may be saved over it: it would lose the ids
+/// it lists).
 pub fn bgindex_load(bgdir: &str, ix: &mut BgIndex) -> i32 {
     *ix = BgIndex::default();
     let mut path = String::new();
     index_path(bgdir, &mut path, 700);
-    let Some(txt) = read_file(&path) else {
+    let Some(txt) = read_file_max(&path, BG_INDEX_MAX) else {
         return if file_exists(&path) { -1 } else { 0 }; // there but unreadable: not to be saved over
     };
     // (the text is a C string: it ends at a NUL)
@@ -1451,25 +1446,24 @@ fn remember_failure(nb: &str, id: u32) {
     })
 }
 
-// Reads notebook nb's picture id as its luma. A kept picture is a PNG of about a page: a file that
-// is no PNG (Grimoire writes no other), or one bigger than a page picture can be, is not decoded on
-// the UI thread.
-fn load_picture(nb: &str, id: u32, out: &mut Canvas, why: &mut &'static str) -> i32 {
+// Decodes notebook nb's picture id as it is in its file (1 or 3 channels). A kept picture is a PNG of
+// about a page: a file that is no PNG (Grimoire writes no other), or one bigger than a page picture
+// can be, is not decoded on the UI thread.
+fn decode_kept(nb: &str, id: u32, why: &mut &'static str) -> Option<BgPicture> {
     let mut dir = String::new();
     let mut path = String::new();
     *why = "not in this notebook";
     if bgimage_dir(nb, &mut dir, 700) != 0 {
-        return -1;
+        return None;
     }
     bgimage_file(&dir, id, &mut path, 800);
     let Some(data) = bgimage_read(&path, BG_UI_FILE_MAX) else {
         *why = if errno() == libc::EFBIG { "bigger than a page picture can be" } else { "missing" };
-        return -1;
+        return None;
     };
     let (mut w, mut h) = (0, 0);
     let mut cost = 0usize;
     let mut p = BgPicture::default();
-    let mut rc = -1;
     if data.len() < 8 || data[..8] != PNG_SIG {
         *why = "not a PNG";
     } else if check_within(&data, data.len(), BG_UI_DECODE_BUDGET, &mut w, &mut h, &mut cost, why) != 0 {
@@ -1477,23 +1471,115 @@ fn load_picture(nb: &str, id: u32, out: &mut Canvas, why: &mut &'static str) -> 
     } else if w > 6000 || h > 6000 {
         *why = "bigger than any page";
     } else if decode_within(&data, BG_UI_DECODE_BUDGET, &mut p, why) == 0 {
-        rc = bgimage_luma(&p, out);
-        if rc != 0 {
-            *why = "out of memory";
-        }
-        bgpicture_free(&mut p);
+        return Some(p);
     }
+    None
+}
+
+// Reads notebook nb's picture id as its luma.
+fn load_picture(nb: &str, id: u32, out: &mut Canvas, why: &mut &'static str) -> i32 {
+    let Some(mut p) = decode_kept(nb, id, why) else { return -1 };
+    let rc = bgimage_luma(&p, out);
+    if rc != 0 {
+        *why = "out of memory";
+    }
+    bgpicture_free(&mut p);
     rc
 }
 
-// Notebook nb's picture id, decoded, or NULL (missing or unreadable: remembered).
-fn picture(nb: &str, id: u32) -> Option<Rc<Canvas>> {
-    enum Look {
-        Cached(Rc<Canvas>),
-        Failed,
-        Load(usize),
+/// How many channels the PDF of a notebook embeds for image paper k's page: 3 when the picture file is a
+/// colour PNG (read from its header alone, 26 bytes), else 1 (gray, no picture, a file that does not read).
+/// Grimoire keeps a picture gray when no pixel has colour, so a colour type is a colour picture.
+pub fn bgimage_channels(nb: &str, k: PaperKind) -> i32 {
+    if !paper_is_image(k) || nb.is_empty() {
+        return 1;
     }
-    let look = draw(|d| {
+    let mut dir = String::new();
+    let mut path = String::new();
+    if bgimage_dir(nb, &mut dir, 700) != 0 {
+        return 1;
+    }
+    bgimage_file(&dir, paper_image_id(k), &mut path, 800);
+    let mut head = [0u8; 26];
+    let Ok((mut f, _)) = open_read_nofollow(&path) else { return 1 };
+    if f.read_exact(&mut head).is_err() || head[..8] != PNG_SIG {
+        return 1;
+    }
+    // (IHDR's colour type: 0 gray, 2 RGB, 3 palette, 4 gray and alpha, 6 RGBA)
+    if matches!(head[25], 2 | 3 | 6) {
+        3
+    } else {
+        1
+    }
+}
+
+/// The colour picture of image paper k fitted to a w x h page (RGB, rows of w * 3 bytes), for a page
+/// the notebook PDF embeds in colour. None when the picture is gray (its PNG header says so: nothing
+/// is read), and when a colour picture is missing or does not read: the page is then drawn gray, and
+/// bgimage_take_missing's flag goes up (a page drawn without its colour is never kept, pdfcache.rs).
+/// It is decoded once for both: the gray page under the ink draws from the picture cache, and when the
+/// cache does not hold this picture yet its luma is made from this decode and kept there (the slot
+/// freed before the decode, as every load does), so a mirror child decodes a page's picture once.
+pub fn bgimage_render_color(nb: &str, k: PaperKind, w: i32, h: i32) -> Option<BgPicture> {
+    if bgimage_channels(nb, k) != 3 || w < 1 || h < 1 {
+        return None;
+    }
+    let id = paper_image_id(k);
+    let slot = match look(nb, id) {
+        Look::Cached(_) => None,
+        Look::Load(s) => Some(s),
+        Look::Failed => {
+            draw(|d| d.missing = true);
+            return None;
+        }
+    };
+    let mut why = "";
+    let Some(pic) = decode_kept(nb, id, &mut why).filter(|p| p.ch == 3) else {
+        // (not remembered as failed: the gray page's own load tries the picture again, and says why)
+        draw(|d| d.missing = true);
+        return None;
+    };
+    if let Some(s) = slot {
+        let mut luma = Canvas::default();
+        if bgimage_luma(&pic, &mut luma) == 0 {
+            slot_fill(s, nb, id, Rc::new(luma));
+        }
+    }
+    if pic.w == w && pic.h == h {
+        return Some(pic);
+    }
+    let mut fitted = BgPicture::default();
+    let rc = bgimage_normalize(&pic, w, h, &mut fitted);
+    drop(pic);
+    if rc != 0 {
+        draw(|d| d.missing = true);
+        return None;
+    }
+    Some(fitted)
+}
+
+/// Lets go of notebook nb's picture id in the picture cache (a mirror done with a colour page whose next
+/// page is on another picture: the memory goes back at once). A later draw decodes it again.
+pub fn bgimage_drop(nb: &str, id: u32) {
+    draw(|d| {
+        for s in d.slot.iter_mut() {
+            if s.img.is_some() && s.id == id && s.nb.as_bytes() == nb.as_bytes() {
+                s.img = None;
+            }
+        }
+    })
+}
+
+enum Look {
+    Cached(Rc<Canvas>),
+    Failed,
+    Load(usize),
+}
+
+// Notebook nb's picture id in the cache, or remembered as failed, or else the slot it is to be decoded
+// into (a free one, else the least recently used, emptied now: the memory is bounded).
+fn look(nb: &str, id: u32) -> Look {
+    draw(|d| {
         for i in 0..BG_SLOTS {
             if d.slot[i].img.is_some() && d.slot[i].id == id && d.slot[i].nb.as_bytes() == nb.as_bytes() {
                 d.clock = d.clock.wrapping_add(1);
@@ -1518,8 +1604,22 @@ fn picture(nb: &str, id: u32) -> Option<Rc<Canvas>> {
         }
         d.slot[s].img = None; // (freed before the next is decoded: the memory is bounded)
         Look::Load(s)
+    })
+}
+
+fn slot_fill(s: usize, nb: &str, id: u32, img: Rc<Canvas>) {
+    draw(|d| {
+        d.slot[s].nb.set(nb);
+        d.slot[s].id = id;
+        d.slot[s].img = Some(img);
+        d.clock = d.clock.wrapping_add(1);
+        d.slot[s].used = d.clock;
     });
-    let s = match look {
+}
+
+// Notebook nb's picture id, decoded, or NULL (missing or unreadable: remembered).
+fn picture(nb: &str, id: u32) -> Option<Rc<Canvas>> {
+    let s = match look(nb, id) {
         Look::Cached(img) => return Some(img),
         Look::Failed => return None,
         Look::Load(s) => s,
@@ -1532,12 +1632,6 @@ fn picture(nb: &str, id: u32) -> Option<Rc<Canvas>> {
         return None;
     }
     let img = Rc::new(img);
-    draw(|d| {
-        d.slot[s].nb.set(nb);
-        d.slot[s].id = id;
-        d.slot[s].img = Some(img.clone());
-        d.clock = d.clock.wrapping_add(1);
-        d.slot[s].used = d.clock;
-    });
+    slot_fill(s, nb, id, img.clone());
     Some(img)
 }

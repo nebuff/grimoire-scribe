@@ -38,7 +38,7 @@ A desktop simulator (SDL3) and an SDL-free headless script runner exist for deve
 | common.h / util.c | Rect math, mm_to_px, clampf, time, logging, string helpers, dates (in the language in use) | - |
 | i18n.h/.c | the language in use, lookups in the embedded catalogs (po/*.mo) with English fallback, plural rules, the language list (see Languages) | common |
 | canvas.h/.c | 8-bit gray canvas, clip, fill, AA lines/discs, ink deposit, blit, downsample | common |
-| font.h/.c | stb_truetype text from embedded fonts; faces by role (regular, bold, title, caps, fixed) mapped per theme: Classic = Terminess Nerd Font Mono, Gothic = pixel faces Jersey 10 (text, labels; bold = overprinted one design pixel, sparing accents: see Text and the keyboard) and Jacquard 24 titles, drawn one bitmap pixel per design pixel and blown up to whole k x k blocks (no smoothing); FIXED faces (paper labels) are Terminess in both, so pages never change with the theme. DotGothic16 is the Japanese fallback for kana and kanji in both themes | canvas |
+| font.h/.c | stb_truetype text from embedded fonts; faces by role (regular, bold, title, caps, fixed) mapped per theme: Classic = its font (`FONT_FAMILIES`, Rust only, 2.1: Terminess Nerd Font Mono by default, cut down to Terminus's text and the Material Design icons the app draws, `assets/terminess-keep.txt`; or Atkinson Hyperlegible Next, Noto Sans or Literata, settings.ini `font=`: the family's Regular for text, its Bold for bold, titles and caps, each drawn at its own scale), Gothic = pixel faces Jersey 10 (text, labels; bold = overprinted one design pixel, sparing accents: see Text and the keyboard) and Jacquard 24 titles, drawn one bitmap pixel per design pixel and blown up to whole k x k blocks (no smoothing); FIXED faces (paper labels) are Terminess in both, so pages never change with the theme. DotGothic16 is the Japanese fallback for kana and kanji in both themes | canvas |
 | paper.h/.c | page backgrounds (rules, staves); a kind it does not know draws blank ("Newer paper") | canvas |
 | brush.h/.c | tool params, pressure/tilt mapping, deterministic dab renderer, smoother | canvas |
 | page.h/.c | Stroke, Page, hit-test, page render, thumbnail | brush, paper |
@@ -83,8 +83,17 @@ A desktop simulator (SDL3) and an SDL-free headless script runner exist for deve
   pen samples becomes one refresh.
 - Refresh modes: `REFRESH_FAST` (DU, black/white, for live ink, ~188 ms measured, 294 ms cold), `REFRESH_UI`
   (GL16 partial, no flash, for UI and to settle the grays of a finished stroke),
-  `REFRESH_FULL` (GC16 flashing, page turns / screen changes / every 30 UI refreshes).
-  Accumulating different modes keeps the strongest (FULL > UI > FAST).
+  `REFRESH_FULL` (GC16 flashing, screen changes / a page turn at another view than the fitted one /
+  every 30 UI refreshes), and in the Rust build `RefreshMode::Clean` (GC16 flashing over the given
+  rect alone).
+  Accumulating different modes keeps the strongest (FULL > CLEAN > UI > FAST).
+- DU wear (issue #11, display.rs `DuWear`): DU turning a pixel from black to white leaves a faint trace
+  of the black, and the GL16 settle after it does not reach that pixel (a partial update drives only the
+  pixels whose value changed, and DU already wrote its final white). The toolbar drag's release cleans
+  its whole trail with one Clean; the erasers and a dragged selection add the area they turned back to
+  paper, and past a quarter of the screen the editor's tick sends one Clean of where it was at the next
+  pause (as the settle waits: never under a stroke). Writing adds nothing (DU turning paper black leaves
+  no trace that matters), and neither do pinch zoom frames, which settle without a flash by design.
 - Live stroke: each pen sample batch renders new dabs into page_canvas, recomposes the dirty
   rect, FAST refresh. On pen-up: UI refresh of the stroke bbox so pencil grays come back. A
   press on the panel before that settle settles first, so Undo and Clear answer at once.
@@ -108,7 +117,8 @@ A desktop simulator (SDL3) and an SDL-free headless script runner exist for deve
   ms of its end), shared by display_fbink.c and sim_sdl.c, which reports it to scripts
   (`display.last_fast`). A new display.h backend must define `display_live_ink`.
 - Toasts are never stored in `App.screen`: `app_flush` overlays one just for the refresh and puts
-  the pixels under it straight back. `App.toast_floor` keeps them clear of a screen's controls:
+  the pixels under it straight back (while Live view is on it draws the toast again, with alpha, for
+  the browser: Live view, below). `App.toast_floor` keeps them clear of a screen's controls:
   a screen that keeps the bottom for controls sets it as it draws, and toasts sit above it. The
   Library sets it in `redraw` for an open sheet: the keyboard's top, or else the top of the
   control just under the first band of a toast's height that is clear of the sheet's controls,
@@ -136,10 +146,11 @@ A desktop simulator (SDL3) and an SDL-free headless script runner exist for deve
   is never the pen's hand), a stroke or another gesture is in progress (`editor_busy`), or the driver is in
   pen mode (`display_pen_mode_on`: it stays so past a stroke until a grayscale refresh is due, and
   that refresh waits for the pen's last frame, so a refresh of the corner must not be the one that
-  ends it). A finger tap in the 14 mm corner square, or on the box's place with 4 mm around it (shown or
+  ends it). Taking it down is not held back by the pen merely being near: a sheet opened under the pen
+  must not keep the corner over the sheet. A finger tap in the 14 mm corner square, or on the box's place with 4 mm around it (shown or
   not: `status_hit`), turns it on and off: decided at the lift, with the
   finger down in the zone, on no control (`editor_control_at`: the panel, or a link, but
-  not one in the corner), lifted in the square (or within 5 mm of where it landed) and under 800 ms, whatever the fingertip did between (the path is not asked: a hard press drifts); every decision is one `grimoire.log` line; the screen
+  not one of your own in the corner; a document link in the corner is a control: D7a, taps follow document links), lifted in the square (or within 5 mm of where it landed) and under 800 ms, whatever the fingertip did between (the path is not asked: a hard press drifts); every decision is one `grimoire.log` line; the screen
   sees the touch as ever, and the corner only watches (`status_tapped` tells it at the lift, so no link is
   followed). `display_skip_status` leaves its rect out of the screen guard, as `display_skip_overlay` does
   the chip's.
@@ -152,8 +163,9 @@ A desktop simulator (SDL3) and an SDL-free headless script runner exist for deve
   the panel alone (a tool picked, the panel dragged, folded or fitted, a settle) goes through
   `draw_panel_over`, which draws the menus over the part they cover again; `compose` draws the menus over the
   whole panel, not only over the rect it was asked for. The Pages view covers the screen and the panel is
-  not drawn on it, and Live view's browser layer of the panel (`editor_live_panel`) is empty while any of
-  them is up.
+  not drawn on it. Live view's browser layer of the panel (`editor_live_panel`) stays where the panel is
+  while any of the menus is up, holding the screen there with the menu's part over it (Live view, below);
+  it is empty under the Pages view, the Graph and the notebooks' browser.
 - Display safety (main.c, display_fbink.c): the screen guard reads the framebuffer back (8 and
   32 bpp) and repaints what another process drew; after 10 repaints in a row it turns itself off.
   If the first frame and the next 4 refreshes all fail (`display_broken`, retried once a second),
@@ -277,7 +289,45 @@ draws them. White ink and the precise eraser make them.
   lower in every Gothic weight: the font draws it exactly as its i, and two pixels is the depth of
   the face's descenders. ASCII never takes these paths and draws as it always has.
   `font_face_has_glyph(face, cp)` tells whether a face has its own glyph, without the Terminess
-  or DotGothic16 fallback; `font_has_glyph(face, cp)` also counts those fallbacks.
+  or DotGothic16 fallback; `font_has_glyph(face, cp)` also counts those fallbacks. Where the chain
+  ends with no glyph (`pick_face`), a visible character is drawn as a box (`missing_box`, 2.1.0-beta.2):
+  a hollow rectangle in a cell of Terminess at the asked size (the room its missing glyph took before),
+  0.6 of the line tall, its sides a 24th of the size, the same in every face, weight and theme (never
+  overprinted) and measured as drawn, so fitting, "...", centring and the fit checks count it; whitespace
+  takes a space's room and what is meant to be unseen (Unicode's controls, format characters, combining
+  marks and default-ignorables, `UNSEEN`) none. `font_drawable_copy`, through which `ui_name_label`
+  shows names, leaves out only those unseen ones: a name in simplified Chinese shows its boxes, never
+  looks cut short.
+- Classic's fonts (2.1, Rust only). `FONT_FAMILIES` in font.rs is the face table: each family's
+  settings.ini id, its name (never translated), the short name Settings' chip shows, its Regular and
+  Bold files, its scale and its share-page file names. Terminess is first and the default, at scale 1;
+  `font_set_family` maps Classic's faces to another family (Regular for text, Bold for bold, titles and
+  caps; FIXED and FIXED_BOLD stay Terminess, as do the icons), and Gothic's map never changes. A size is
+  a line height (ascent to descent), and each family puts a different share of its line into its
+  letters, so each is drawn bigger than asked by its scale: Atkinson Hyperlegible Next 1.10 and Noto Sans
+  1.065 match Terminess's x-height (0.42 of the line), Literata 1.15 is the largest at which every screen
+  still fits in Spanish (1.23 would match; its serif wants the room). Layouts are Terminess's as they
+  were: make l10n-check runs every screen in each family (Languages). A glyph a family lacks (Greek,
+  Cyrillic, arrows, the Latin Extended-A letters Atkinson lacks) comes from Terminess at the asked size,
+  a bold face's from Terminess Bold (`FaceMap.fallback`), then from DotGothic16, so Japanese is drawn
+  as in every theme; kerning stays inside a face (the families keep their GPOS pairs, which stb reads).
+  The glyph cache keys a glyph by its file, so a change of font loses nothing cached. The files are
+  static Regular and Bold instances of Google Fonts' variable fonts, cut to Latin, Latin-1, Latin
+  Extended-A and General Punctuation (238 KB for the six: `assets/README.md`).
+- Settings > Font (library.rs, `Modal::Font`, 2.1; a page of the new Settings menu since #115): in Classic
+  Settings' Display category has a Font row, "Font: Terminess" (the family's short name, or the family name
+  of one of the owner's own fonts); Gothic has no such row (`Show::ClassicOnly`). The row opens the Font
+  sheet, a Settings page with Back at its top left and the X at its top right: a sample card (the
+  highlighted font's name at the title size, a translated sentence at the text size, digits and accents at
+  the small size, all drawn in it), then a row for each family drawn in itself and a check on the one in
+  use. The sheet's own words stay in the font in use (in Terminess while that is one of the owner's own,
+  2.1.0-beta.2: Your own fonts, which also adds the headings Built in and Your fonts, the rows of
+  grimoire/fonts and their pages). A tap on a font applies it at once (`font_apply_pick`): it saves
+  `font=` (and `font=file:` for one of the owner's own, or takes such a line away when a family is
+  tapped, also the family that shows while that font does not draw), restyles the share pages and redraws
+  with a Full refresh, as a style change does. Back and Esc return to Settings and the X closes all of
+  Settings (`close_settings`), each keeping the font tapped, as Language keeps a language picked.
+  `font_with_family` draws a family's row and sample and puts the font in use back.
 - The keyboard's text is UTF-8 and its keys carry code points (`KB_KEY_*` below 32 for the named
   keys, `KB_KEY_FLICK` + row for the kana pad's own keys). There are four pages of characters,
   letters, symbols, accents and kana (`Keyboard.page`); the first three have `-`, `'` and `.`
@@ -292,16 +342,77 @@ draws them. White ink and the precise eraser make them.
   type on the lift, not on the touch-down, since which kana it is is the swipe: `Keyboard.flick`
   holds the way the pressed key is swiped (0 still on it), the key's label shows that kana while
   the finger moves, and the pen may end well off the key. One modifier key (`KB_KEY_KANA_MOD`, ゛小)
-  rewrites the last character of the text instead of adding one (`change_last`, `kana_cycle`):
+  rewrites the character before the caret (the one typed last) instead of adding one (`change_last`, `kana_cycle`):
   unvoiced, voiced, half-voiced, small, round again (か が か; は ば ぱ は; つ づ っ つ; や ゃ や),
   which covers dakuten, handakuten and the small kana in one key. カ (`KB_KEY_KATA`) switches the
   pad to katakana and back (`Keyboard.kata`; the labels follow), and it types on the lift too.
   Every kana the pad types, both scripts, and 、。？！・ー゛小カ, is drawn in every theme:
   DotGothic16 covers what the pixel and Terminess faces lack. `keyboard_upper()` is the shift case map (Latin-1 and Latin
   Extended-A), `keyboard_key_rect()` locates a key on the page showing (for tests and scripts), and
-  `keyboard_open` keeps valid UTF-8 and drops control characters and broken bytes. A key types a whole character; backspace removes one. In Spanish
+  `keyboard_open` keeps valid UTF-8 and drops control characters and broken bytes. A key types a whole character; backspace removes one,
+  and held it removes one after another (below). In Spanish
   the letters page's middle row ends with ñ after l (`k_row_es`), as Spanish keyboards have it, and
   is then as wide as the row above; the accents page keeps ñ in every language.
+- The shift key has three states, a tap each and round again (`Keyboard.shift`, `KbShift`; 2.0.0-beta.2,
+  the owner, 2026-11-05: "next toggle shift in typing toggles off shift for next char then shift on which
+  makes longer caps strings possible"): off; `Once`, the next letter's capital, then off (a key with no
+  capital, a digit, a symbol or the space bar, leaves it waiting for a letter, as shift always did); `Caps`,
+  every letter a capital through digits, the space bar, delete and the page keys, until the next tap. Both
+  on-states draw the shift key pressed (black, its label white) and the letter keys in capitals (`key_label`);
+  caps on adds a white bar under the label, as wide as it (`caps_bar`), so the two read apart with no word to
+  translate. A tap from off or from caps on changes every letter key's label, so it refreshes the keyboard
+  (as shift always did); the tap from once to caps on refreshes the shift key alone, as does every tap on the
+  symbols page, where no label changes case (`shift_shows_on_keys`), and a letter typed with caps on refreshes
+  only what any letter does. `keyboard_open` starts every keyboard with shift off, so caps
+  on ends when the keyboard closes (Find's Done with no page to go to keeps its keyboard open, and the state
+  with it). A paired keyboard never reaches this state: its keys type nowhere but on the count pad.
+- The caret, the selection and the clipboard (2.1.0-beta.2, issue #36). The text has a caret,
+  `Keyboard.caret`, a byte offset at a character's first byte (or the end), and a selection's other end,
+  `Keyboard.anchor` (the caret's own with nothing selected); `keyboard_open` puts both after the text, so
+  typing a name goes on as it always did. A key types at the caret, in place of a selection
+  (`replace_selection`: a character that would not fit is not typed); delete takes the selection, or the
+  character before the caret; the kana pad's ゛小 the character before the caret. The text line holds three
+  keys at its right end on every page but the count pad's (`line_keys`, each a letter key's width, the
+  line's 120 px tall): the edit key (md-content_copy), ◀ and ▶ (the chevrons), so the text box is the line
+  left of them (`field_rect`). ◀ and ▶ move the caret a whole character, at the touch-down (as a character
+  key types), and with a selection let it go at its start or end; held, they repeat as delete does
+  (`keyboard_repeat` repeats whichever of the three is held, `can_repeat`: until the caret can go no
+  further, so a hold on ◀ at the start never starts, and delete held inside the text stops at its start).
+  A contact on the text itself (`Keyboard.field_drag`) puts the caret at the character boundary nearest to
+  it, at the touch-down, from where the line was last drawn (`caret_at_x`: left of the text, its first
+  shown character; right of it, the end), and its moves select from there to where it is; the lift leaves
+  it. The count pad's line takes none of this: its count has its caret at the end, always. The line shows
+  the text from `Keyboard.scroll`, kept so the caret is in view (`text_scroll`: from where it was, or the
+  caret if that went before it; on until the text to the caret fits; back while all the rest fits), which
+  with the caret at the end is the text's longest tail that fits, what it always showed; only what fits is
+  drawn (`shown_end`), so nothing is cut with "...". The caret after the text is drawn as it always was (5
+  px, 4 px on); between two characters it is 3 px in the space before the second, never over a letter. A
+  selection is white on a black box as tall as the caret, with no caret beside it. The edit key opens the
+  edit page (`EDIT_PAGE`, `Keyboard.prev_page`): Select all across the page, Cut, Copy and Paste, Start
+  and End (the caret to the text's start and end), in the four rows' height above a bottom row of Cancel,
+  the way back (abc, あ from the kana pad, 123 from the number pad), space, delete (as wide as Done, for
+  Spanish "borrar") and Done; the edit key is drawn pressed there and goes back too. Its keys act at the
+  lift, as the page keys do. Cut and Copy take the selection to the keyboard's own clipboard
+  (`keyboard_clipboard`, a thread-local string), never the lasso's (clipboard.rs, ink); it lasts until
+  Grimoire closes, across every keyboard, and nothing writes it to a file. Paste types it at the caret in
+  place of a selection, as much as fits, cut between characters, control characters left out as
+  `keyboard_open` leaves them out; on Go to page's number pad (or its edit page) the digits alone. Copy, and
+  Cut or Paste with nothing to do, change nothing and draw nothing. A move of the caret or the selection is
+  `KbResult::Moved`, with the text line to refresh: drawn and refreshed as a key's typing is
+  (`app_keyboard_pointer_split`, `app_keyboard_press`, `app_keyboard_tick`), but Find's rows are not made
+  again for it, the text being as it was. A key inside the line (◀, ▶) refreshes no rect of its own over the
+  line's (the line's refresh holds its pressed look), so a tap is still one refresh at the touch-down and one
+  of the key at the lift. A paired keyboard's Left, Right, Home and End (Shift held: the selection grows or
+  shrinks) and Ctrl or Cmd with A, C, X and V (not with Alt) do the same on any keyboard open but the count
+  pad (`keyboard_key_input`; `app_text_key` in app.rs, before any shortcut is looked up; a keyboard is read at
+  all only while Settings > Shortcuts is on, as for every key):
+  they reach the keyboard as Esc does, through `app_type_text`, whose touch-down on the text box now carries
+  the input too, so it is taken as a contact on no key and moves no caret. Letters typed on a paired keyboard
+  still type nothing in a field.
+- On the Library, the sheet a keyboard was opened from stays drawn under it, the Wi-Fi page included:
+  `LibraryState.kb_parent` names that sheet, and `draw_modal` draws it before `keyboard_draw` puts the keys
+  over its lower half. The keys take every contact; the page below is not a tap target while they are up.
+  (The editor's pages, Find and the Pages view already keep their page under their keyboards.)
 - Every keyboard host (the Library's sheet, the Pages view's Page name and Go to page) hands its pen
   and finger events to `app_keyboard_pointer` and its tick to `app_keyboard_tick` (app.c), so a key
   costs the same over any screen. A sample that changes nothing (the pen resting on a key sends one
@@ -315,6 +426,33 @@ draws them. White ink and the precise eraser make them.
   sample: on the Kindle each key's refreshes then overlapped the one before and waited in the
   driver's queue for it (docs/INK-PERFORMANCE.md), and the text fell further behind with every key.
   tests/scenarios/j_pages_keyboard.qs holds both keyboards to the same refreshes and draws.
+- Delete held down repeats on every page that has it (letters, accents, symbols, the number pad, the kana pad,
+  the count pad), in every keyboard: the owner's "hold del long enough in keyboards to quick delete", "low ish
+  delay but not too low", "repeat rate high so it feels snappy", "not too high" (2026-11-05). Its touch-down
+  deletes one, as a tap does, and when text is left starts the hold (`Keyboard.repeat_at`, `KB_HOLD_MS` = 400
+  ms ahead); then `keyboard_repeat` deletes one when it is due and the next is due `KB_REPEAT_MS` = 65 ms
+  later (about 15 a second, the same rate all the way: no speeding up to words). It runs at the samples of the
+  contact holding the key (`app_keyboard_pointer_split`, by the sample's time: the pen resting there sends one
+  at every digitizer frame) and at the screen's tick (`app_keyboard_tick`, which every keyboard host calls,
+  the link card's Rename keyboard too): the main loop goes round at least every 30 ms, its input poll's
+  timeout, so a repeat needs no wake of its own, and with no hold the tick tests one field. A repeat draws and
+  refreshes as a key's typing does, the text line alone (the key stays pressed), and returns
+  `KbResult::Changed`, so a screen that follows the text follows it (`findsheet_tick` makes the Find sheet's
+  rows again and the editor refreshes them after the text line, as for a key). It never queues a refresh
+  behind another: while the last fast refresh may still be on the panel (`display_fast_busy`: the quiet
+  thread's books of the newest DU, or 300 ms since the last refresh without them; never in the simulator) a
+  due repeat waits, and then deletes together the repeats that came due meanwhile, `KB_REPEAT_BATCH` = 3 at
+  most (one DU at room temperature), in one refresh; the next is due on the same schedule, those past the
+  batch skipped. So the text shown is at most that one refresh behind the text, and nothing is deleted after
+  the lift. The hold ends at the lift, a move off the key (back on, it does not start again), the text gone
+  (a hold on an empty field, or on the count pad's opening 1, which its touch-down clears, never starts),
+  the keyboard closing, a new contact (a second finger's key ends the first's, a hardware key's touch on the
+  text line too), a hardware keyboard's key on a count pad (`app_keyboard_press`: the digit it types is never
+  the next repeat's), and `keyboard_holds_end`, which `app_sleep` and `app_switch` call for every keyboard at
+  once, since the lift may never reach one then. A hardware keyboard's Backspace is not repeated: text fields
+  take no typed keys (only Esc, their Cancel, and the keys that move the caret, select and copy and paste:
+  above), and on the count pads `hidkeys_event` drops the kernel's autorepeat (value 2) as it does for every
+  key; so a held arrow moves the caret once.
 
 ## Languages
 
@@ -384,9 +522,9 @@ draws them. White ink and the precise eraser make them.
   reported: `font_draw_left_name` (a notebook's, a folder's, Settings' data path) shortens with
   "..." by design. With `GRIMOIRE_CHECK_FIT=1` the simulator and the headless runner list each cut
   (`fit[es]: "..." needs W px, has R`, once per text and room) and exit 3, and make l10n-check
-  runs every screen so, in every language and style (docs/SIM.md). Text no scenario reaches (rare
-  notices, the Share screen without an address, Pen feel's raw labels) is measured in
-  tests/test_i18n.c.
+  runs every screen so, in every language and style, and in English and Spanish in Classic with each
+  font of Settings > Font (2.1; docs/SIM.md). Text no scenario reaches (rare notices, the Share screen
+  without an address, Pen feel's raw labels) is measured in tests/test_i18n.c, in each font too.
 - The share pages: httpd.c writes `<html lang=..>` and escapes every translation as text, as it
   does names (a catalog is third-party input, and none may add markup; share_check serves the pages
   from a catalog full of markup). /api/list.json keeps the English identifiers. The studio's words
@@ -401,10 +539,17 @@ draws them. White ink and the precise eraser make them.
 
 ## On-disk layout (root = /mnt/us/grimoire on Kindle, $GRIMOIRE_ROOT or ./grimoire-data in sim)
 
+Lock files (`import/.lock`, `graph.ini.lock`, `graph-all.ini.lock`, `.cache/pdf/<id>.lock`) sit beside what
+they guard. A root on a file system without advisory locks cannot hold them: `GRIMOIRE_LOCKS` then names a
+folder that can, and each lock is `<that folder>/<hash of its natural path>.lock` (`util::lock_file_path`).
+Unset on the Kindle.
+
 ```
 root/settings.ini              current tool, panel, every tool's params, calibration and the
                                panel it was made on, sleep, style, language, port... (unknown
                                keys kept)
+root/settings.ini.unread       a settings.ini that was there but could not be read, kept aside;
+                               never read
 root/folders.ini               the folder names, one per line
 root/sleep.pgm                 the pinned sleep screen (P5)
 root/notebooks/<id>/notebook.ini   name, folder, paper, created, modified, last_page,
@@ -414,7 +559,10 @@ root/notebooks/<id>/p<pageid>.qpg  binary page (see docs/FORMAT.md)
 root/notebooks/<id>/p<pageid>.qpg.damaged-<time>   a page that could not be read, kept
 root/notebooks/<id>/thumb.pgm      binary PGM thumbnail of page 1 (P5)
 root/trash/<id>/               deleted notebooks are moved here, never unlinked
+root/fonts/, fonts/.cache/     the owner's own fonts and what the check found of them (Your own fonts)
+root/.font-inuse               the crash guard of a font of the owner's own (Your own fonts)
 root/PDFs/<folder>/<name>.pdf  the PDF mirror (an export, not data)
+root/.cache/pdf/<id>/          the notebook PDF's page streams (disposable; docs/FORMAT.md)
 root/.passcode-paused          legacy beta.1 recovery marker (new sessions never create it)
 root/.passcode-left-off        how many starts were told a restart left the passcode off
 root/.koplugin-installed       the build whose KOReader plugin went into koreader/plugins, or
@@ -424,6 +572,26 @@ root/.koplugin-installed       the build whose KOReader plugin went into koreade
 All writes are atomic: write `<file>.tmp`, fsync, rename. Page saves happen about 2 s after the
 last pen-up, at every press of the power button, on page change, on leaving the editor and on
 exit. `store_add_page` never writes over an existing `p<id>.qpg`: it takes the next free id.
+
+Reads of the data folder take plain files only. What is read there through `util::read_file`,
+`util::read_file_max` or `util::open_read_nofollow` (the store's files, the pictures, the template and
+import scans, the marks, the share zip's raw copies) is read only when the entry at the name itself is a
+plain file (a link, a folder or anything else there reads as a file that is not there), and the open never
+waits. Folders on the way to a file may be links (the data root, `notebooks/`, a platform's folders, a
+test's folder): only the last name is held to this. The small text files are read up to a limit
+(`util::read_file_max`: settings.ini, notebook.ini, folders.ini, bg/pages.ini and bg/index.ini 1 MiB; an
+import folder's mark 4 KiB; import/.attempts 64 KiB; a PGM 64,000,064 bytes, its largest picture and a
+header); page files and pictures have none of `read_file`'s own. A settings.ini that is there but was not
+read is moved to `settings.ini.unread` before the next save. An entry at a page's name that is no plain
+file is set aside as a damaged page is. The system's own files (/proc, /sys, the Kindle's locale file) are
+read with `util::read_system_file`, which follows links. The scans of `import/`, `templates/` and
+`photos/` take only real folders and plain files. Temporary files named after the process
+(`<name>.<pid>`, the mirror's `<name>.pdf.<pid>.tmp`) are made afresh (`util::create_fresh_nofollow`):
+what stands at the name is removed, never opened. `mkdir_p` takes an existing entry as the folder, a link
+to one included; code that prunes or empties a folder of Grimoire's checks that folder first
+(`util::no_link_below`, `pdfcache::real_dirs`, the previews' sweep). The mirror's sweep of stale
+temporaries works in the mirror folder the user chose. A few readers still open their files by path
+(docs/BACKLOG.md, "Hardening round (2026-11), storage reads: what waits").
 
 The page size: a new notebook gets the device's (`store_set_device`), and
 `store_notebook_page_size` is what every reader and writer of its pages asks. A notebook.ini
@@ -567,14 +735,14 @@ announcements: goingToScreenSaver draws the sleep screen, outOfScreenSaver is th
   scenario from another scenario's data (d_persist, x_turn_calibrated and y_pagesize_1_ksc use
   b_library's, s_passcode_once r_passcode's, y_pagesize_2_back y_pagesize_1_ksc's, z_language_kept
   y_language's), `# env: K=V` lines set its environment (`GRIMOIRE_PASSCODE` in r_passcode,
-  s_passcode_once, t_passcode_left_off and t_toast_over_sheets, `GRIMOIRE_BG_DELAY_MS` in
+  s_passcode_once, t_passcode_left_off and z_annotate_f_passcode, `GRIMOIRE_BG_DELAY_MS` in
   v_leave_from_editor, `GRIMOIRE_HOST` in y_koreader_hosted and y_koreader_not_hosted,
   `GRIMOIRE_LANG` in y_language and z_language_kept, `GRIMOIRE_SIM_SIZE` in y_pagesize_1_ksc,
   `GRIMOIRE_CHECK_FIT` and `GRIMOIRE_SIM_ADDRS` in y_all_screens), `# settings: key=value` lines
   go into its settings.ini, and a `# pdfs: N` line wants exactly N PDFs in its root's PDFs/ folder.
   The rule unsets the test hooks first, so nothing else of the caller's reaches them, and runs
   every scenario in English (`GRIMOIRE_LANG=en`, which ranks first) unless its `# env:` line names
-  another language. With GRIMOIRE_TEST_PORT set every scenario's share server uses that port.
+  another language. Every scenario's share server gets a port of its own: GRIMOIRE_TEST_PORT (else 8765) plus its job's slot.
   tests/selftest/pass.qs and fail.qs check the runner itself.
 - `make l10n` (for the maintainer, with GNU gettext): xgettext collects every marked string of
   src/*.c, with the TRANSLATORS comment above it, and web/studio.js's (`t`, `tPages`, `N_`) under
@@ -586,7 +754,10 @@ announcements: goingToScreenSaver draws the sleep screen, outOfScreenSaver is th
   styles with the fit check, then tests/l10n/long_root.qs (Settings from a data root longer than
   the sheet is wide) in each language, then tests/l10n/hosted.qs (the top bar as KOReader opens
   it) and tests/l10n/templates.qs (the Templates sheet with templates in it, its `# copy:` line
-  honoured) in each language and style. docs/TRANSLATING.md and docs/SIM.md have the rest.
+  honoured) in each language and style; the styles include Classic in each other font of Settings >
+  Font (`classic-atkinson`, `classic-noto-sans`, `classic-literata`) in English and Spanish, and
+  tests/l10n/fonts.qs shows the Font sheet in every language and every font. docs/TRANSLATING.md and
+  docs/SIM.md have the rest.
 - Dependencies: HDRS holds the Makefile, VERSION and third_party/qrcodegen/qrcodegen.h besides
   src/*.h, so a change of flags rebuilds every program (FBInk's objects follow only their own
   .c files); the test binaries also depend on tests/*.h (beta_format.h among them), and the zip on
@@ -601,7 +772,7 @@ announcements: goingToScreenSaver draws the sleep screen, outOfScreenSaver is th
   headless runner stop at the first undefined behaviour (`-fno-sanitize-recover=undefined`).
 - `make kindle` (zig cc -target arm-linux-musleabihf, static) -> build/kindle/grimoire
 - `make package` -> build/dist/Grimoire.zip. The licenses in its app/licenses: the GPL; the font
-  licenses, which follow FONTS in the Makefile (each embedded font needs an
+  licenses, which follow FONTS and FONTS_CLASSIC in the Makefile (each embedded font needs an
   assets/<family>-OFL-1.1.txt whose family begins the font's file name); every
   third_party/<dir>/LICENSE* or COPYING* as <dir>-LICENSE.txt and CREDITS* as <dir>-CREDITS.txt;
   the stb headers' license, extracted once into stb-LICENSE.txt; musl's COPYRIGHT, from `zig env`'s
@@ -612,7 +783,8 @@ announcements: goingToScreenSaver draws the sleep screen, outOfScreenSaver is th
   FBInk's CREDITS, the only text the tree has for them. The recipe fails when it cannot find zig's
   LICENSE or musl's COPYRIGHT, or one of those notices. A vendored directory with no license file,
   a font without its OFL text, or a missing notice fails package-check, and so does a change to
-  FBINK_SRC until its notice is added.
+  FBINK_SRC until its notice is added. package-check also holds the size guard (2.1, the owner's
+  decision D23, raised for 2.1.0-beta.2): the Kindle binary under 11 MB (11,000,000 bytes) and the zip under 6 MB.
 
 ## Tests
 
@@ -628,7 +800,29 @@ announcements: goingToScreenSaver draws the sleep screen, outOfScreenSaver is th
   a deliberate rendering change, `GRIMOIRE_FONT_CRC=print build/test/test_font` prints a fresh
   table. Terminess (anti-aliased) entries are compared only with clang on arm64, where they were
   recorded. bold_letters_keep_their_gaps and inverted_exclamation_is_not_an_i guard the Gothic
-  bold.
+  bold. The Classic fonts of 2.1 have a table of their own (rust/tests/test_font.rs, K_CRC_FAMILIES:
+  each family's Regular and Bold, the same strings and sizes, recorded when they came in); the first
+  table is Terminess's and never changes with them. families_unchanged also holds that Title and Caps
+  are a family's Bold, FIXED stays Terminess and Gothic ignores the family; families_fall_back_to_terminess
+  that a letter a family lacks is Terminess's own pixels. font.rs's the_face_table holds the table
+  itself (ids, files, scales, kerning).
+- rust/tests/test_terminess_keep.rs holds the Terminess diet: the embedded fonts' cmaps are exactly
+  `assets/terminess-keep.txt` (none of the Nerd Fonts glyphs it leaves out is back), and every icon
+  the sources draw (rust/src, kindle/, web/, po/ and What's new, scanned for characters, escapes
+  (UTF-16 pairs too), hex numbers and the decimals handed to a call that makes a character, in the
+  private use areas) is on the list, in both weights, and draws ink. A new icon fails it until the
+  list has it and `make fonts-subset` made the fonts again (`assets/README.md`). KOReader's battery
+  symbols (U+E778 to U+E783, U+EDA3) are the exception: the Terminess menu patch names them to pass
+  over a font that has them, and koreaders_battery_symbols_are_named_and_never_in_terminess holds
+  that only the patch names them and neither embedded font has one.
+  rust/tests/test_scenarios.rs's a_start_brings_koreaders_terminess_up_to_date holds the start's
+  call to `koreader_fonts_refresh`, test_koreader.rs's fonts_follow_the_binary its cases, and
+  test_httpd.rs's fonts_icons_and_the_cache `/font/licenses.txt` and the fonts' `Link` header.
+  a_start_brings_an_earlier_terminess_patch_up_to_date holds the start's call to
+  `koreader_patch_refresh` (rc.6's patch in KOReader becomes the current one, logged once), and
+  earlier_terminess_patch_follows_the_binary its cases against kindle/koreader/legacy's real files.
+  tests/kopatch_check.lua holds the patch's own choice: Grimoire's copy first, then a font with no
+  glyph at KOReader's battery code points.
 - tests/test_keyboard.c drives the keyboard API: one_character_keys_at_title_size compares each
   key with font_draw_centered at the title or text size, and typed_name_is_stored_whole sends the
   keyboard's text through store_rename, store_set_folder, export_mirror_path and
@@ -637,7 +831,8 @@ announcements: goingToScreenSaver draws the sleep screen, outOfScreenSaver is th
   the QR drawing, and tests/test_probe.c that the probes' tool names match settings.ini.
 - tests/test_i18n.c: lookups, contexts and plurals in the embedded catalogs; every translation
   against its English (the same printf arguments by type, the language's number of plural forms,
-  only glyphs that Jersey 10, Jacquard 24 and Terminess regular and bold all have) and the
+  only glyphs that Jersey 10, Jacquard 24 and Terminess regular and bold all have, and that each Classic
+  font's Regular and Bold has of its own, Japanese's letters aside) and the
   catalog's Plural-Forms against `k_rules`; damaged catalogs refused whole; the choice of language
   (settings.ini, then `GRIMOIRE_LANG`, the Kindle's locale file, `LC_ALL`, `LC_MESSAGES` and
   `LANG`); dates; paper that never changes with the language; the layout helpers (the overflow
@@ -689,7 +884,15 @@ announcements: goingToScreenSaver draws the sleep screen, outOfScreenSaver is th
    new connection from the previous request); renders fork, two at a time, the rest queue
    oldest first and are dropped when their browser hangs up. The pages use the fonts of the
    Kindle's style (served from the binary, cached a year) and the language in use (Languages
-   above);
+   above): in Classic the font in use (Settings > Font; its Regular and Bold
+   as 'Grimoire Text', the browser's serif, sans-serif or monospace after it, and Terminess as 'Grimoire
+   Mono' for the studio's command line). The server takes the style and the font as it starts, and again
+   when either changes while it runs (Live view keeps it up across screens: the style row, the theme
+   shortcut and a tap on a font in the Font sheet call `httpd_restyle`), so the next page a browser loads is in them;
+   a page already open keeps its own until it loads again. The fonts' licenses go with them (Rust only): `/font/licenses.txt`
+   holds the texts (Terminess's OFL, its Material Design icons' notice and the Apache License, the Gothic
+   fonts' and the Classic fonts' OFL), each font's answer names it in a `Link: rel="license"` header, and
+   the pages' style says where it is;
    every page is rendered at its notebook's page size (`store_read_page`), whichever Kindle
    renders it, and `X-Page-Size` says that size. The
    Effects studio (`web/studio.js` + `.css`, embedded at build time) rebuilds a page in the
@@ -729,7 +932,8 @@ announcements: goingToScreenSaver draws the sleep screen, outOfScreenSaver is th
    forgotten when Live view stops). The card closes by itself once a browser pairs.
    While Live view is on, `app_flush` and `app_press_feedback` copy each rect they present into a
    shared frame (`live_push`: a memcpy of the rect, before the toast is drawn, so neither the toast
-   nor the chip is ever streamed) and mark its 64 px tiles, for each viewer slot. A paired
+   nor the chip is ever in the tiles; the toast comes as a layer of its own, below, and the chip not
+   at all) and mark its 64 px tiles, for each viewer slot. A paired
    `GET /live/stream` is handed to a viewer child (two at most; `live_take_viewer`), which owns the
    socket: it takes its marks, compares the tiles with what it sent, sends each stretch of changed
    tiles in a marked run as a gray PNG (a row redrawn whole for one tile sends that tile) and a
@@ -915,12 +1119,59 @@ announcements: goingToScreenSaver draws the sleep screen, outOfScreenSaver is th
    remembered). The frame holds the page under the panel: app_flush pushes the rect a.screen
    presents, then composes the part of it under the panel again without the panel
    (`editor_live_under_panel`: compose with the panel left out, pushed, the pixels put back) and
-   copies the panel into its layer (`live_layer`); the corner, an overlay never in a.screen, is
+   copies the panel into its layer (`live_layer`). The layer is the screen where the panel is, as the
+   Kindle shows it: with a menu, sheet or bar up beside the panel it is the panel, and where one covers a
+   part of the panel or all of it, that part of the menu too, while the tiles there hold the page and the
+   menu without the panel (2.0.0, issue #16: the layer went whenever a menu was up, so the browser lost the
+   toolbar beside the Display sheet until it closed). It is empty where the panel is not drawn (the Pages
+   view, the Graph and the notebooks' browser over the screen) and while Settings is over the notebook, whose
+   screen, the panel's strip beside it included, the frame holds whole (it is drawn again whole, so no part of
+   it is composed without the panel).
+   A present that reaches the panel's rect copies the layer again, so it follows the menu over it. The
+   corner, an overlay never in a.screen, is
    copied as status.rs paints it, and taken away when it goes. The tile viewer sends a layer that
    changed after the batch's tiles, whole (Seq: odd while it is written), and every layer again
    after a hello; a turn takes them away until the turned screen's flush tells them. The page keeps
    the tiles on a canvas of their own and draws raw as the page with the layers that show; the quick
    ink keeps off the panel only while the panel shows. The Kindle's own screen is unchanged.
+
+   The toast is the third layer (2.0.0-beta.2, LIVE_LAYER_TOAST; the owner: "Enable toasts on the live
+   view display. they don't show up now."), drawn over the other two and always shown: there is no
+   switch and no setting. As `app_flush` draws it over a present it draws it again for the layer
+   (`live_toast_sync`, `live_layer_drawn`), so the browser has its place and its look as the panel has
+   them. Its pixels have alpha (gray and alpha, two bytes a pixel, and a PNG of color type 4): the
+   toast is drawn twice, into a canvas all black and one all white, and where the two agree the layer
+   is opaque, where they differ it is as clear as the white showed through (`live_matte`): outside its
+   round (Classic) or pointed (Gothic) ends, and part clear on their anti-aliased edge. So the layer
+   holds the toast alone, never what is under its ends, and the browser composites it over whatever it
+   shows there: the page, or the toolbar and the clock corner as its own switches say (with Show
+   toolbar off the toast's ends show the page, not bits of the hidden toolbar), and never the live
+   chip, which is not in the frame. Over the same picture the browser's result is the Kindle's, to a
+   unit of gray on that edge. The cost while Live view is on: two more draws of the toast per present
+   that reaches it (about 0.1 ms for a one-line toast and 0.45 ms for the widest two-line one on the
+   build Mac), and none while it is off. The layer follows the panel: a present that draws the toast
+   tells it (moved by `toast_follow` or a turn, the new rect; another toast in its place, the new
+   pixels; the same rect and pixels, nothing), one that goes out without it (its time up,
+   `app_toast_dismiss`, a redraw) takes it away, and one away from it leaves it as it is, as it stays
+   on the panel. A turn takes it away until the turned screen's flush, and a screen switch draws it
+   again over the new screen, as on the Kindle. While the state is not LIVE_AWAKE nothing is streamed,
+   as before, and the toast is kept out of the frame too: `live_set_state` takes it away as the state
+   leaves LIVE_AWAKE (the sleep screen has no toast; the browser drops its own with the state frame,
+   as it does the pen), and `live_layer` tells a toast as none while the state is not LIVE_AWAKE (and
+   `live_layer_drawn` does not draw it then), so a toast drawn over the pairing card is never in the
+   frame for a viewer to send once the card closes; one still up then is drawn again by the closing's
+   full redraw and comes as it is. No toast carries the pairing code (pair.rs and share.rs raise none;
+   the code is drawn only on the card) or the Kindle's passcode (the Kindle's own keypad, while
+   Grimoire is asleep and draws nothing). The viewer checks the state again after copying a layer, as
+   after a run. The panel's and the corner's buffers in the shared frame are w * h bytes each; the
+   toast's holds the screen's longer side times the tallest toast (`ui_toast_max_h`: two one-line
+   boxes, 220 px at 300 dpi) at two bytes a pixel, about 1.1 MB on the Scribe (1860 x 2480, 1.2 MB on
+   the larger one) where a gray w * h buffer like the others would be 4.6 MB; a shared anonymous
+   mapping takes memory only for the pages written, so the frame costs at most the biggest toast
+   shown, about 0.75 MB for a two-line one sideways and 0.1 to 0.4 MB for a usual one. The main loop
+   needs the two canvases for the draws (one byte a pixel each, the toast's size) only while it tells
+   the layer. A browser that does not know a layer id leaves it out (`i < layers.length`), so a page
+   from before it shows no toast and nothing else changes, and the hello's version stays 3.
 
    The page works per animation frame: a batch read only unions its rect into what waits, and the
    next frame composes it once (a burst after a Wi-Fi stall is one compose), shows it, draws the
@@ -940,12 +1191,34 @@ announcements: goingToScreenSaver draws the sleep screen, outOfScreenSaver is th
    the JavaScript, and draws nothing: animation frames, size and pixel ratio follow that window,
    which renders 1:1 at its own device pixels. Closing it returns the same picture. Video PiP
    (Safari, Chromium on plain http; Firefox there through its own button on the video) floats a
-   video of a canvas of its own sized to the PiP window's pixels: the picture averaged into it,
-   the quick ink and the dot drawn over it, and `captureStream(0)` with `requestFrame` only when
+   video of a canvas of its own sized to the PiP window's pixels: the picture averaged into it, the
+   quick ink and the dot drawn over it, and `captureStream(0)` with `requestFrame` only when
    something changed. The page's view is off meanwhile and frames come from a Worker's timer as
-   well as animation frames, since a hidden tab has none; the held eraser's lease renewals use
-   that timer too. No second client, stream or watcher is made in any tier. A recording keeps its
-   own size independently.
+   well as animation frames, since a hidden tab has none; the held eraser's lease renewals use that
+   timer too. While the tab is hidden (behind the floating window, or another tab in front) a frame
+   is also drawn as soon as a network read asks for it, in a microtask, since Firefox Nightly 161
+   slows every timer of a hidden tab, a Worker's too, to once a second (measured in headless
+   Nightly: the picture changed once a second and the ink came 0.45 s late at the median, 0.9 s at
+   p90; now 1 ms and 2 ms, and the video shows 59 frames a second instead of 1, with
+   `tests/live_pip_bench.js`). A tile batch, a new stroke or a change of the pen's state draws at
+   once; the pen merely moving on draws once 8 ms at most and waits for its next packet otherwise
+   (it keeps sending while it is near). Those frames draw all the ink that has come and the dot at
+   the newest sample, not the playout's paced clock, as there are no frames between packets to
+   pace. A frame never asks for the next this way, so it cannot spin. With the tab shown, animation
+   frames draw video PiP as they draw the page, and the ticker stands in only when none has come
+   for 30 ms (it fires after 34): before 2.0.0-beta.2 it added a frame between every two, so PiP
+   drew and captured about 120 frames a second to the page's 60. Each frame draws again only what
+   changed (where the last frame laid the quick ink and the dot, what of the picture changed since,
+   where they go now; all of it after a refit or a new window) and asks the capture for a frame
+   only then; out, base and the see-through ink's scratch canvas are in memory
+   (willReadFrequently), so a captured frame is never read back from the GPU. The owner measured
+   the pen 15 to 23 ms later in a large PiP window than on the page, growing with the window: at
+   the Kindle's 1860 x 2480 every frame filled 4.6 million pixels and the capture took them all,
+   120 times a second. Headless Firefox draws canvases in software, where that cost 2 ms a frame
+   (now under 1, at 60 a second), and there PiP's pen age at paint is within 2 ms of the page's at
+   every size; a piecemeal frame matches the same picture drawn whole pixel for pixel
+   (`tests/live_pip_bench.js`). No second client, stream or watcher is made in any tier. A
+   recording keeps its own size independently.
 
    Monitor mode (M, or its button) fits the page, fades the controls rail until the pointer moves
    or keyboard focus reaches it, and asks for full screen when chosen; the browser remembers it (storage that
@@ -1042,6 +1315,184 @@ th, combining accents dropped), so Álgebra sorts among the A's; names that fold
 bytes. A name, folder or folders.ini line longer than 95 bytes is cut before the UTF-8 character
 that would cross the limit (`clean_line`).
 
+## What's new, the About sheet (2.0.0; every version's notes, 2.1.0)
+
+`about.rs`. The notes are a file for each version, `docs/whatsnew/VERSION.md` (2.1.0; until then the one
+docs/WHATSNEW.md), compiled in, each a small Markdown: `# ` the title, `## ` a heading, `- ` a bullet, other
+lines a paragraph, `{signature}` where the owner's signature goes. They are the owner's text, not translated.
+The bat in the Library's top bar (or the name beside it) opens What's new as a card hanging from the bat: What's
+new and the version, this version's notes (each heading with its first bullet; notes without headings, every
+bullet and paragraph), the signature, Read all and Dismiss.
+
+- **The notes, a file a version** (2.1.0). build.rs lists `docs/whatsnew/*.md` into `NOTE_FILES`, each with
+  the date of CHANGELOG.md's `## VERSION (YYYY-MM-DD)` heading (`unreleased` for `(unreleased)`, none
+  without a heading), so a release's notes are a new file and its date the changelog's, which the bump commit
+  dates anyway; no code lists them. A file there not named for a version, or empty, stops the build rather
+  than leave a version's notes out (hidden files are passed over); `the_built_in_notes_are_the_folders`
+  checks the list against the folder. `archive` orders them newest first by version (`update_version_cmp`:
+  2.1.0, 2.0.0, rc, beta, the numbers compared as numbers) and makes one entry of notes that are the same
+  block for block, naming every version that has them ("2.0.0, 2.0.0-beta.2") at the newest one's place,
+  with its date. `current` is this version's entry, or the newest when this version has no file; the card
+  shows it. 2.0.0-beta.2 has no file: it shipped 2.0.0-beta.1's notes, and its changes are in 2.0.0's. The
+  CI's docs-only path counts docs/whatsnew/ and CHANGELOG.md as code, since both are built in.
+- **The card ends at a whole note** (the owner's "do the small change", 2026-11-05: the card had cut
+  the last paragraph mid-sentence). `card_rows` keeps every line of each block up to the last that
+  fits whole above the signature, a heading counting with the block under it; a block that would be
+  cut, and everything after it, is Read all's. Only when not even the first block fits whole (a
+  paragraph longer than the card's room) does the card show part of one: the lines of it that fit,
+  cut at the end of a line, never inside one and never an empty card. The signature always shows. The
+  card's room ends at the Library's pager (2.1.0): sideways in Gothic its edge had covered the pager's
+  left button and the P of its Page 1 of 1. On the Scribe 2.0.0's notes fit whole upright (11 blocks)
+  and to the 9th sideways (it was the 10th in Gothic before 2.1.0). Probes: `library.about.card_blocks`,
+  `card_notes`, `card_cut`.
+- **Read all lists every version's notes** (2.1.0, the owner, 2026-11-06: "wire read all button to a
+  list of each UNIQUE release note, and allow users to easily browse the changes by version - some of
+  them are important"). The Library's sheet titled What's new, the bat and the version running under the
+  title, then a row for each entry, newest first, framed as the Library's menu rows (170 px, 20 px
+  apart): the versions in bold, the one running marked This version (white on a black box beside it),
+  the date at the right, and under them the notes' first heading or first line (`summary`: the title
+  when there is one; 2.0.0-beta.1's letter has none, so its first paragraph), cut short with an ellipsis.
+  As many rows a page as the tallest sheet holds (10 upright, 7 sideways on the Scribe), with the page
+  arrows left of Dismiss when they take more (`list_layout`); the sheet is as tall as a page of them,
+  placed as a version's notes' sheet is (`sheet_place`, below: 6 rows sideways or 9 upright would have
+  ended over the Library's pager). A
+  tap on a row shows that version's notes whole on the sheet, on one screen (below): their title as
+  the sheet's (else What's new), the version and its date under it, Back at the foot's left, Dismiss
+  at its right. Back returns to the list at the page it was left at.
+- **A version's notes fit one screen** (2.1.0, the owner, 2026-11-07: "The read all doesn't need text
+  that big -- either smaller text for all past messages, or fit all (which i lean toward)", then "The
+  note reading itself isn't polished enough"). `note_fit` sets them closer before it sets them smaller.
+  At the body size Read all always had, 44 px (`ui_text_size`), it first tightens the leading, from 1.3
+  down to 1.15 a hundredth a step, and the gaps with it, to 60% of theirs (`note_look`'s `tight`, 15
+  steps); only notes that do not fit the tallest sheet's body whole even at the tightest step down in
+  half pixels, to the largest size at which the tightest look fits, and the room that step leaves goes
+  back to the leading and the gaps, up to the open look (the most open step that fits, found by
+  halving: at one size each step tighter is no taller). The rest of the look scales with the size (the
+  headings, the bullets' indent, the signature); the title, the band under it and the foot keep their
+  sizes. Each size is tried whole, top down, since a smaller size wraps the lines anew. The floor is
+  34 px (`ui_small_size`), the size the card sets the same notes in and the list its rows' lines; notes
+  that do not fit even there at the tightest are set at it in the open look and take pages (`paginate`,
+  a heading's last line never alone at a page's foot, the page arrows left of Dismiss). None of today's
+  do. Gothic's text face, Jersey 10, is drawn in whole design pixels, so its text has two sizes in that
+  range: 44 and 43.5 px, and from 43 px down its next size (that of 34 px, two thirds as tall); notes
+  that need the smaller size are set in it at 43 px, as open as its room allows (today's in the leading
+  they always had, the rest of the room unused). On the Scribe (`library.about.body_px`
+  and `lead`):
+
+  | Notes | Gothic upright | Gothic sideways | Classic upright | Classic sideways |
+  |---|---|---|---|---|
+  | 2.1.0 (draft) | 44 px, 1.3 | 44 px, 1.3 | 44 px, 1.3 | 44 px, 1.3 |
+  | 2.0.0 | 44 px, 1.19 | 43 px (next size), 1.3 | 44 px, 1.3 | 41.5 px, 1.15 |
+  | 2.0.0-beta.1 | 44 px, 1.3 | 43 px (next size), 1.3 | 44 px, 1.3 | 44 px, 1.3 |
+
+  Gothic sideways has no room for 44 px type: 2.0.0's notes need 1871 px at the tightest and the letter
+  1460, of 1320. In Classic's other fonts (2.1, Settings > Font) 2.0.0's notes sideways take 44 px at
+  the leading 1.23 in Atkinson, 1.27 in Noto Sans and 1.22 in Literata, the rest 44 px at 1.3. A
+  bullet's dot keeps the proportion the card's has to the card's text, by the type's height as it is
+  drawn (`dot_scale`): a note at the card's size has the card's dots, at 44 px dots 1.29 times the
+  card's in Classic and 1.5 times in Gothic (whose 44 px type is that much taller). `wrap` breaks lines
+  at spaces, and in Japanese or Chinese between any two characters (font.rs `cjk`; never before a
+  closing mark such as 。 or 」, nor after an opening one), and a word wider than the line (a long link)
+  starts a line and is broken between its characters, so the fit, which measures heights, never leaves a
+  line cut short. `note_set` keeps each answer for the note, the screen's size, the look and Classic's
+  font (each sets the notes at its own widths), so a step on the sheet does not search again and a font
+  picked does. What the sheet's edges and title take is ui_sheet's own (`ui_sheet_inner`), so the body
+  the notes are fitted to is the body the sheet has at any dpi (two sums of their own had Gothic at
+  320 dpi 1 px short, every note on two pages). `sheet_place` keeps the list's and a note's sheet off
+  the Library's top bar's buttons and its pager: one that would start across the bar's buttons, their
+  icons' tops cut off above its edge, starts at the margin above them, as the tallest sheet does
+  (2.0.0's notes sideways in Classic, and the letter in every font but Noto Sans; a sheet that starts
+  below the buttons, the bat in sight, keeps its place, as the letter's does in Noto Sans), and one that
+  would end over the pager (its rule and its Page 1 of 1, which the sheet's edge would cut through)
+  reaches down to the margin. Probes: `library.about.body_px`, `lead`.
+- **The keys** (docs/SHORTCUTS.md's scheme). Esc goes back one layer: a version's notes to the list, the
+  list to the card that opened it (as the Templates sheet goes back to New notebook; a step, so only the
+  list's and the card's places refresh), and the card closes. Enter opens: the card's
+  Read all, and on the list the notes of the row marked as this version's (the card's notes); the
+  Library's sheets have no highlighted row, so Up and Down do nothing here either. Left and Right
+  (`previous-page`, `next-page`) turn the list's and the notes' pages, as their arrows, and a greyed
+  arrow does nothing.
+- **The refreshes.** Opening What's new and Dismiss refresh the whole screen as every sheet's do (the
+  Library's cards may have changed meanwhile). A step on it (Read all, a row, Back, a page, Esc to the
+  list or the card) draws the screen again and refreshes only where the card or sheet was and where it is
+  now (`about_step`, the union of the two places, in the sheet's refresh, GL16 on the Scribe): the
+  Library around it has not changed. `display.presents` shows it (tests/scenarios/z_about_list.qs).
+- **It opens by itself once after every update** (the owner's rule of 2026-11-05: "no don't show this
+  again, just a "Dismiss" and every update with changes by default has at least a basic what's
+  new"). store.rs sets `whatsnew_due` when settings.ini was saved by a Grimoire before (it has
+  `settings_version`) and its `whatsnew_seen` names another version; the Library then opens the card
+  over itself the first time it shows, and records this version as seen at once. Dismiss, Back and
+  Esc close it; the bat opens it again. The box Don't show this again (2.0.0-rc.11 to 2.0.0-beta.2)
+  is gone: its `whatsnew_hide` is still read and written back as it was, so those versions keep its
+  meaning, but this version never sets it and never reads it for the decision, so a Scribe that had
+  the box ticked sees the notes once after the update. Every release comes with its own What's new
+  for that reason: tools/release-preflight.sh fails when `docs/whatsnew/VERSION.md` is missing, has no
+  notes, or has the release before's notes again (docs/RELEASING.md, The bump commit).
+
+## Document links (2.1.0-beta.2)
+
+A PDF's own links (a planner's tabs) live in `notebooks/<id>/doclinks.ini`, never in links.ini: own caps (16,000
+links, 1.5 MiB, 1,024 a page), so the user's 4,000/512 KiB/64 and a 2.0 build's reading are untouched. `doclinks.rs`
+holds the file (24-byte records sorted by page, annotation order kept), `pdflinks.rs` takes records from any
+source (KOReader's `links.txt`, and the PDF import's link annotations) and validates, seeds (a hash of page and annotation index), fills (same
+target and area within 2 px is one link) and trims to a water level at 90% of links and bytes, the densest pages
+first. The editor keeps them in `EditorState.dl`, read at open; taps try the user's links, then a document link
+whose exact area holds the point, then one reached only through the 7 mm growth (`doclinks_at`, later annotation
+wins a tie); the eye draws `LinkBoxes.doc` dotted and unnumbered; the Links bar folds them into one row (before any Linked from rows) whose
+chips (`LinkBar.docs`, grouped by target, a vector since a month page has 365) open in the bar itself, with X
+going back; their card (`linkcard_set_doc`) is read only and offers Rename the page. A finger hold on one arms
+Select (D7b a): the hold asks `link_under`, which never sees them. Nothing that builds the Graph or the library
+index reads the file; Clear page, the lasso, the clipboard and the 64/4,000 checks read `nav.links` alone, so they
+never see them by construction. Copy page and Copy to notebook carry them (the latter only to targets that were
+copied too); the notebook PDF and raw zips carry them.
+
+## The notebook PDF, incremental and streamed (2.1.0-beta.2, lane L9)
+
+Closing a changed notebook used to draw every page again (minutes for a 400-page planner, holding the one
+background queue) and built the whole PDF in one buffer before writing it. Now `export_notebook_pdf_to` writes the
+PDF to any `Sink` (a Buf, a file, a count, a connection) as its objects are made: a scratch buffer holds one page's
+objects, a page's image goes to the sink straight, the xref's offsets are kept (8 bytes an object). Each page's
+Flate stream is cached in `grimoire/.cache/pdf/<id>/` under a stamp (`pdfcache.rs`; the record's layout is in
+FORMAT.md): a record that does not read or whose stamp is not the page's today is drawn again, and a page drawn
+while its picture was missing or did not decode is never kept, so the cache can only make a PDF faster, never
+different (tests hold the streamed bytes equal to a render with the cache off, count the pages drawn, and make a
+page's picture only after a mirror drew the page without it). The stamp has the page file's identity, the
+notebook's page size and paper, the dpi, the version and the ink renderer's fingerprint; the record has the
+picture file's channels, size and time, taken before any page on it is drawn; a picture job's end takes the
+notebook's records away (as it makes the page previews again). Links are not cached: the page is read for them
+only when the notebook has a link on it (the user's, or a document link), since they depend on `nav.ini` and
+`doclinks.ini`, not on the page's pixels. Only background jobs write records and prune them (256 MB in all;
+deleted pages and notebooks; then whole notebooks by last use, the one in hand last; a notebook alone over the
+cap keeps its first pages' records and writes no more); the share server's children read. Any job's process
+prunes once a day too, so the cache follows deleted notebooks with the mirror off.
+
+A page whose picture is colour (an imported PDF's page with colour, a colour template) is embedded as DeviceRGB:
+`bgimage_render_color` decodes the picture once, before the page's canvases, and puts its luma in the picture
+cache for the gray page under the ink (so the picture is not decoded twice); the ink drawn over it is applied as
+a change of the gray paper beneath (`ink_over_colour`). A copy of the RGB picture is kept for the next page only
+when the next page is on the same picture (`store_page_paper`, the page file's first bytes); otherwise the page's
+luma goes from the picture cache at once. The gray canvas goes before the compressor, and the compressed stream is
+handed to the sink as the compressor made it (no copy). Measured at the Scribe's page size (1860 x 2480,
+`rust/tests/test_pdf_colour_memory.rs`): 27 MiB for flat colour pages and 51 for near-incompressible photo-like
+ones on pictures of their own, 40 and 69 when pages share one picture (0c26d912: 53 and 81, 40 and 72).
+
+The share server's PDF and zip answers are made into a spool file in the child and sent from it (so the answer has
+its Content-Length and the progress counts stay exact), or made twice (count, then send, held to the count) with no
+room for a spool; a zip's PDF entry is written with a data descriptor, and a zip whose entry fails or passes what
+32 bits can say fails whole. A mirror holds its notebook's lock (`.cache/pdf/<id>.lock`) for the whole job and
+writes its own `<name>.pdf.<pid>.tmp`, renamed when whole, the folder synced; each mirror sweeps the temporary
+files of mirrors that are gone.
+
+Every background child carries two caps (`childcaps.rs`): `oom_score_adj` 500 (the PDF worker's 1000 is lane L5's;
+the UI's is unchanged) and `RLIMIT_AS` at the child's size at fork plus a margin by kind (a streaming mirror 128 MiB,
+from the colour page measured above with about 60 MiB of headroom; previews and map layouts 128; the font check's
+writer 128, two copies of a 24 MB font; compaction and the default 256; a picture job 512, above its own tighter
+cap), applied after `child_setup` for each bgjob child, the detached child, the share server's render children
+(128 MiB) and Live view's viewer children (64 MiB). A child that cannot read its own size (`/proc/self/statm`) is
+capped at 1 GiB plus its margin, never left without one. Both caps are Linux's; the host build applies nothing.
+The CI job `sandbox` mirrors a Scribe-sized colour page under the real cap. The mirror logs its pages, how many it
+drew, its time and `VmHWM` ("bg: export of ...: N pages, D drawn, T ms, VmHWM K kB").
+
 ## Fast navigation and optional KOReader integration (1.1.0-beta.2)
 
 The Pages screen (`pagesview.c`) draws a fixed screenful of numbered tiles, never `load_page` or
@@ -1051,12 +1502,50 @@ after the open page or the last selected page, using the notebook's paper. Copy 
 the one selected page after itself, with a new page id and the original bytes. Image-paper copies
 share their picture. Both keep the first page in place. A failed notebook-list save rolls the
 insertion back and removes the new file. Book-page labels come from `source.ini`; a copy is a note
-page and does not get the original's book-page mapping. The browser reader similarly
+page and does not get the original's book-page mapping. Since 2.0.0-beta.2 a held page's card and the
+bottom row (with pages ticked) also have Move to... and Copy to notebook.... Move to... reuses the number
+pad (`PagesView.moving`): the number typed is the page the ticked pages go before, one past the last (or
+an empty pad) the end; `store_move_pages` rewrites only `notebook.ini`'s order, and the editor follows the
+open page by id. A move is one undo step of the notebook's own, not the page history's (history stays per page,
+so the editor's Undo button never undoes a move): `store_move_pages_undo` gives a `PageMoveUndo` (the order
+before and after), kept in `PagesView.move_undo` and dropped as the notebook closes. While it applies (the
+same notebook, its pages still in the order the move left: an add, delete, copy or another move changes
+that; a rename does not) and nothing is ticked, the bottom row's Undo stands in Move to...'s place, and
+`store_undo_move_pages` writes the order back through the same `reorder_pages` path (notebook.ini only).
+A tile held `DRAG_HOLD_MS` (300 ms, half of `HOLD_MS`, by the contact's own clock), moved past the slop and then off the tile
+is dragged (`PageDrag`) with no card drawn: the card waits for `HOLD_MS` (600 ms) held still, and a drag
+from a card already up starts at the slop and takes the card down in the bar's first refresh (the owner,
+2026-11-04: the card popped and taken down again before every drag was "too disruptive as a pair"). Between
+the slop and the tile's edge the contact is `drag_armed` and nothing is drawn: a slow tap rolls past the 30 px
+slop too, and lifted on its tile it is the tap it was (`press_is_tap`), which matters most on a ticked tile,
+whose own gap would gather the ticked pages. A contact that passed the slop before `DRAG_HOLD_MS` is never
+armed, so never a drag (a flick, or nothing). The view as drawn is kept,
+and a bar in the gap alone (`drop_at`: the half of the tile under the contact says before or after it; past
+the last tile, the end; no outline of the tile, the owner's ruling of 2026-11-03) is drawn over it inside the
+grid's band and refreshed fast, only where it was and is; 700 ms over the top bar or the bottom row
+turns the screen (the band alone refreshed). The lift asks `store_move_order` whether the gap changes the
+order: then the carried pages (`PagesView.carry`, the ticks left as they are) take Move to...'s path (one
+undo step, one Full redraw);
+else no undo step: a lift in place or over the bars takes the bar off (copied back from the kept view, one
+fast refresh of its rect, or nothing when it was off the grid already), and a cancel draws the view again
+(one Ui redraw). Copy to
+notebook... opens `NotebookPicker::start_copy` over the Pages view, without the open notebook; a page tile
+there (the copies go before it) or At the end gives `NotebookPick::Place`. `store_copy_pages_to` copies the
+files (docs/FORMAT.md, Moving and copying pages), then `nav_copy_pages_across` the names and links, every
+target through `nav_target_across`, the one rule for a link crossing notebooks (lasso paste shares it).
+The destination's compaction stops first (`bg_cancel_notebook`), as when a notebook opens; its card is
+drawn again when the copies come first, its PDF mirror is queued, and so is its compaction when a copy
+holds erase strokes. The browser reader similarly
 uses one image at a time and a GET page field at the top (`?p=N`), clamped to the notebook's range.
 
 `src/koreader.c` discovers the hosted directory or three common installations and manages the
 plugin and optional patches. Different patch contents at a managed filename are preserved.
-Terminess fonts are copied from the binary's embedded font data. No KOReader settings Lua is
+Terminess fonts are copied from the binary's embedded font data. The Rust tree alone keeps them the
+binary's (`koreader_fonts_refresh` in rust/src/koreader.rs, rust/PORTING.md's Rust only): at each
+start it writes again the copy in KOReader's `fonts/Grimoire` that differs, where it is there or the
+Terminess patch is applied (docs/KINDLE.md). Right after it, `koreader_patch_refresh` (Rust only too)
+replaces a Terminess patch in KOReader that is byte for byte an earlier Grimoire copy
+(`app/koreader/legacy`) with the current one. No KOReader settings Lua is
 executed. The plugin's custom wallpaper export is a bounded PNG committed by write-then-rename,
 read by `store_load_koreader_sleep`; it is cached only when used and freed at shutdown.
 
@@ -1064,6 +1553,80 @@ The handover wrapper retains KOReader's frameworkStarted LIPC service across Dev
 its native framework was stopped. Input/screen teardown still occurs before Grimoire. The handle
 closes after Grimoire returns, before koreader.sh starts a new reader process. App exit statuses
 propagate to the plugin so failed launches keep the diagnostic marker.
+
+## Page previews: the Pages view and the page pickers (2.0.0-beta.2)
+
+The Pages view's tiles and the destination picker's (Copy to notebook..., Link to...'s other notebooks)
+show the small previews of `.page-previews/` (docs/FORMAT.md), which the UI only decodes. A screenful's
+missing previews are asked for before its tiles are drawn (`bg_request_page_previews_but`), as one batch
+for the background job (bgjob.rs, `store_build_page_previews`), which draws them in a forked child, so
+the UI never draws a page for a tile.
+
+- **Each tile as its preview lands.** The job makes the batch's missing previews cheapest first (pages
+  with a current kept drawing, then by the size of their files: a dense page last) and tells an open view
+  of each one as it is written (the `updated` token). While a batch of the notebook shown is being made the
+  editor looks every 100 ms (`PREVIEWS_POLL_MS`, else every 500 ms) and draws only the tiles that show
+  something else now (`PreviewCache::changed`, against what each tile was drawn showing), in one GL16 of
+  them: never the whole screen, never a flash, never twice for the same preview. Previews that land within
+  one look come in one refresh.
+- **A tile still waiting shows an hourglass** (`ui_tile_loading`, the md-timer_sand glyph, black, a third of
+  the tile), drawn once with the tile and left until the preview is drawn in its place. A tile whose batch
+  ended without its preview (a page that does not read, one from a newer Grimoire) shows its number alone,
+  as every tile did before; it is asked for again when the view opens again.
+- **A batch asked for while another runs** (the view turned to another screen while a dense page is drawn)
+  is queued, put before the other queued previews of that notebook (`bg_prefer`), and the batches of screens
+  turned away from that still wait in the queue are dropped (asked for again when they show). With three
+  cores or more (`std::thread::available_parallelism`), a batch a view waits on starts at once in a second
+  child beside the first (bgjob.rs `extra_slot`: one such child at most, previews only; each child holds a
+  page canvas and a page at a time).
+- **Never two children on the same pages** (bgjob.rs `next_job`): a previews batch does not start while the
+  other child runs one of the same notebook over any of the same page indexes (the same batch, or one that
+  meets it, as the 24 tiles of Choose from the pages... meet the warm-up's 9); it waits for that one, then
+  finds its pages made. The same batch queued already (the idle warm-up's, a view's from before) is the one a view waits on:
+  it reads the notebook's page list as it starts. One already running that the view did not ask for read the
+  list before, and the pages may have moved since (a page deleted, pages added), so the view queues its own,
+  which runs after it and makes only what it did not. A second child that cannot be forked (the memory short)
+  puts its batch back at the head of the queue, for the first child, and none is tried again until the first
+  is free. When the last batch of the notebook shown is gone, ended or dropped unstarted, the tiles still
+  waiting are drawn again (their numbers), so no hourglass stays.
+- **The open page's tile** is made from its canvas as the view opens (it is drawn already), kept while the
+  view is open (`retain_screen`), and left out of the job's batch, so a dense open page is never drawn twice.
+  It is left out as well when its preview is current, as the idle warm-up leaves it out: the two then ask for
+  the same batch. Its preview on disk is written by the idle save, or by the job once another page is open.
+- **Dense pages.** A page with a current kept drawing (`p<id>.full`) gets its preview from that drawing,
+  read back, not drawn; a dense page the job draws keeps its drawing too (`store_page_dense`: a page file of
+  512 KB or more, the test "Loading page..." below went by too until the owner's decision of 2026-11-04;
+  `store_save_page_render_at`, only while the page file is still the one it read), so the page then opens
+  quickly in the editor as well. No other page keeps one from the job, however long it took to draw, not
+  even a slow page under 512 KB that says "Loading page..." (the owner's ruling: ordinary pages save nothing
+  extra; the editor still keeps the drawing of a page it took a second or more to draw, as it did before
+  2.0.0-beta.2). A kept drawing does not make a page dense: counted, every page the editor kept, or an
+  earlier build's job, would keep a drawing from the job for good. A stale kept drawing is never used, nor
+  counted as a quick page when the batch is sorted (only one whose whole stamp is current: the page file, the
+  size and the renderer's fingerprint). A page drawn with its picture paper white (its picture missing or
+  unreadable in the child) keeps no drawing and gets no preview, as in the editor: its tile shows its number,
+  and the next view that opens asks for it again.
+- **Opening a slow page** (a page turn, a jump, a notebook opening on it, the page left after a deletion)
+  that has no current kept drawing (`store_page_slow`: a page file of 256 KB or more, so every dense page
+  too) says "Loading page..." (`render_page_open`): the toast is put on the panel (app_flush) before the
+  drawing starts, and taken down once the page is drawn. Never for a page that draws quickly, nor while a pen
+  held on an action holds the panel. It went by `store_page_dense` (512 KB), the job's rule, until the owner's
+  decision of 2026-11-04: a page of handwriting is under 0.3 MB and draws in well under a second, but one of
+  about 0.3 to 0.5 MB could sit 2 to 4 s on its first open with nothing said, so the notice now starts at
+  256 KB and kept drawings stay at 512 KB. A page between the two keeps no drawing from the job; the editor
+  keeps its drawing once it has taken a second or more to draw (on a Kindle, most such pages), so then only
+  its first open, or one after a change, says so.
+- **The log.** One line per batch, from the job: `previews: nb=ID pages=N cached=N kept=N drawn=N keep=N
+  ms=N first=N slow=pID:N cores=N` (pages in the batch, previews already made, kept drawings read back,
+  pages drawn, drawings kept, the batch's time, the first preview's time, the slowest page, the processor's
+  cores), beside bgjob's `bg: page previews of ID (pid N)` and `done` lines (`beside pid N` for the second
+  child).
+
+Drawing previews straight at their size (the page's strokes scaled to 300 x 400) was measured and not
+adopted: about 8 times faster on a dense page, but not the same picture (thin strokes and hatching come out
+darker or lighter: a mean difference of 13 to 81 gray levels on the owner's dense pages, against the shrink
+of the full drawing; drawn at twice the size and then shrunk, still 3 to 9 levels and up to 6% of the pixels
+more than 32 levels apart).
 
 ## Touch gestures, the Links bar, Find and the link areas (2.0.0-beta.5, the Rust build)
 
@@ -1084,7 +1647,7 @@ A swipe refused only for the pen says so once in ten minutes. The editor tells
 touchgest what its screen allows (`touch_context`: whether the page pans, zooms, may start a gesture)
 after every event, so a sheet, the bar or a keyboard makes a drag a swipe, which the mirror rule closes
 the menu with. What a gesture does is `gesturemap.rs`'s (the built-ins, then `gestures.ini`), through
-the same `editor_shortcut_at` a key uses; a page turned left by a gesture on the last page adds a page as the next-page key does, unless `gesture_new_page` is off (then a toast says it is the last page). The corner's
+the same `editor_shortcut_at` a key uses; a page turned left by a gesture on the last page adds a page as the next-page key does, unless `gesture_new_page` is off (then it stays on the last page, with no toast). The corner's
 clock tap (status.rs) decides at the lift and every finger tap that phase adds checks it first.
 `grimoire.log` has one line per touch session and the owner's opt-in `touch-trace.txt` has every
 contact frame (docs/FORMAT.md, docs/KINDLE.md).
@@ -1134,7 +1697,7 @@ display call or a wait.
 | Find open from the Pages view | Full (the view closes in the same refresh) | whole screen |
 | Find typing | Fast field, rows and key, each flushed; one Ui of keyboard and rows 900 ms after a pause | |
 | Find result | Full (`go_to_page`) | whole screen |
-| A page-turn toast at the end of the notebook | toast only | |
+| A gesture's page turn past either end of the notebook | none: the page stays, with no toast (2.0.0-beta.2) | |
 | `landscape_fit` toggled sideways | Full | whole screen |
 
 No GL16 and no toast ever run while the pen is down for ink: a pen down during a peek commits it at the
@@ -1148,6 +1711,28 @@ The status strip is retired: `status_reserved` always returns zero and the corne
 unmodified page viewport. Defaults are on, small, top left. Loading legacy Bar settings migrates to
 those defaults; legacy Off stays off. Display has no title-row mode button, and no Status display
 assignment is advertised. `status-mode` remains a compatibility alias for the corner toggle.
+
+## Links between notebooks: backlinks, anchors, broken links (2.0.0-beta.2)
+
+What links INTO a notebook is spread over every other notebook's `links.ini`, so `backlinks.rs` keeps
+it turned around in `root/backlinks.ini` (docs/FORMAT.md, Backlinks cache): a cache, rebuilt by stamps.
+A save of `links.ini` (nav_save_links) updates its notebook in memory at once; opening a notebook asks
+for a check of every notebook, which the editor's idle ticks do a few stamps at a time with at most one
+`links.ini` read a tick (512 KiB at most), so the page is never held up; the file itself is read on the first
+idle tick, never by a draw (a query sees what is in memory). Other notebooks' page names, for the Linked
+from rows and the anchors, come from `backlinks_book`: their `notebook.ini` and `nav.ini` only (never their
+`links.ini`), kept between builds for the 16 most recently used and read again only when one of the two
+files changed. The Links bar lists Linked from
+after the page's own entries (its own notebook's sources from the open Nav, always current, then the
+cache's); a bar that is up is built again only when its rows changed. A Linked from row has no hold: a
+long press on it is its tap. The Graph boxes other notebooks'
+pages beside the plot (anchors), never as layout nodes, so the map keeps its shape and `graph.ini` its
+`gen`. Each line is solid where that page links out to the box and dashed where it only has links in from
+it, and an arrow at the box's start says which way its links go (two arrows: both ways); a page linked only from elsewhere stays hidden there (its box names it). A target whose page or
+notebook was deleted (`nav_target_state`: a notebook folder that is not there is gone; one whose
+`notebook.ini` does not read is only unavailable) is broken: dashed wherever it shows, and a tap opens
+its link's card, which leads with what is gone. Following a link into another notebook pushes the
+origin's page, view (zoom and offset, for its screen size) and back list; Back restores all three.
 
 ## Links without ink and the long-press card (2.0.0-beta.6, Index phase 2)
 
@@ -1207,7 +1792,7 @@ hold path (its picker, Remove link, The Index) is gone. Deleting a link never de
 | Card opens from the bar, not peeking | four Fast strips per box (at most three boxes), else one Ui of their bounds; then Ui | |
 | Card closes | Ui | card and strips |
 | Link undo or redo, Areas on | Ui | the records' boxes, before and after |
-| Link undo or redo, Areas off | toast only | |
+| Link undo or redo, Areas off | none: no toast (2.0.0-beta.2); one left up goes | its rect |
 | Migration | nothing | |
 
 The border's strips hold only black and white pixels and never meet, so DU shows them exactly; one union
@@ -1228,19 +1813,109 @@ keeps the layout. On opening, kept dots stay put, a few new pages go beside thei
 a new link between far pages moves only its two ends and their neighbours (graph_relax_stressed);
 a map that changed a lot (over 10% new pages, or too many stretched links) is laid out again from
 where its dots were (graph_layout_warm), so it keeps its shape. The relaxation stops once the
-map's shape settles, usually well before its 300 steps. View cycles All (the whole linked map,
-fitted) and Around; after a pan or pinch its label reads Fit and the next press fits the current
-mode again, so a press always changes the view. Only All and Around are saved.
+map's shape settles, usually well before its 300 steps. The view button reads View: All (the whole
+linked map) or View: Adjacent (the rings around a page), the view it shows now, and a press always
+switches to the other one, fitted (2.0.0-beta.2: there is no "Fit:" label any more; the fit-page key
+fits again). Only All and Adjacent are saved (graph.ini still writes
+mode=around for Adjacent).
 
 Nested Library folders are logical slash-separated paths stored in notebook metadata and
 folders.ini. Notebook IDs and physical directories stay fixed. A subtree rename validates all
 new paths and collisions before writing, retaining original metadata for rollback on write failure.
 
+## Settings > Wi-Fi (2.1.0-beta.2)
+
+Issue #40 (from #36: someone who relies on Live view among several networks): choose among the Kindle's
+saved Wi-Fi networks from Settings, in the current Settings design. Nearby networks come first: opening the
+sheet finds them (when the radio is on), with Rescan, Other... and Saved networks above the list. Each scan
+row shows a three-bar signal icon, filled for the strength, and a small lock when the network is not open. A
+saved row has a trash button at its right that deletes that profile at once. The connected row is filled black
+with a white rule inside its edge; tapping it again disconnects, keeping the radio on. While Nearby is idle, a
+quiet scan every 20 s updates the list in place: it never clears it or moves a name that is still there. Other...
+types a hidden network's name, then asks whether it is Open, WPA/WPA2 with a masked password, WPA3-Personal with
+a masked password, or WPA2/WPA3-Enterprise with a username and masked password. Enterprise add uses
+PEAP/MSCHAPv2 through `wpa_cli` (credentials on stdin), with PMF optional and the SHA-256 AKM offered, so it
+joins WPA2-Enterprise and WPA3-Enterprise (non-192-bit); the profile lives in the supplicant, not Saved
+networks, and `save_config` is best effort. WPA3-Personal uses SAE through `wpa_cli`, with PMF required and its
+passphrase on stdin. Both disable the supplicant's background scan, whose learned channel list can take the link
+off-channel. WEP, OWE, WPA3-Enterprise 192-bit, EAP-TTLS and EAP-TLS stay out. No CA-certificate choice
+ships yet, so PEAP does not validate the school's certificate.
+
+- **Where.** A Wi-Fi row in Settings opens a full-page sheet drawn as its other submenus are. The status line
+  and the radio control (Turn on Wi-Fi, Turn off Wi-Fi, or Retry) sit over the top buttons: Rescan, Other...
+  and Saved networks. Nearby is the page it opens on; it scans once the radio is on, Rescan scans again, and an
+  idle Nearby asks for a quiet scan every 20 s (WIFI_REFRESH_MS). Saved networks shows the Kindle's saved
+  profiles, the one connected to first, eight a page with More, and
+  each row's trash button. Tapping Saved networks again returns to Nearby. Esc goes back to Settings. The
+  notebook's Settings has it too.
+- **Rows.** A network's name is a name: drawn smaller or shortened as names are, never counted as cut short.
+  Under it are what the sheet knows (Connected or Saved) and its security. The three signal bars fill from the
+  scan's `signal` against `signal_max`; a saved network no scan has measured shows the bars unlit. The lock is
+  over the icon's lower right for every security but Open, drawn from its shackle and body because the icon
+  font's lock is not in every face. The connected network's row is filled black with a white rule inside its
+  edge (its bars stay white); a tap on it calls the helper's disconnect.
+- **Status.** "Connecting to <name>..." while a switch is under way, "Could not connect to <name>." after
+  one failed, else the Share card's lines, with "Connected to <name>" when the name is known. A failed Add says
+  "Could not add the network." (wifi_add_failed) rather than the generic read error, and a failed trash tap
+  "Could not forget the network." (wifi_delete_failed); a later successful read clears either.
+- **Add and delete.** A scan result that is not saved opens the masked keyboard for WPA/WPA2 or
+  WPA3-Personal, or is added at once when Open; Other... takes a hidden name, then Open, WPA/WPA2, WPA3
+  or WPA2/WPA3-Enterprise and its password. `wifi_add` derives the WPA/WPA2 PSK (PBKDF2-HMAC-SHA1 over
+  the passphrase and the name) and sends its 64 hex digits on the helper's stdin, never in argv;
+  WPA3-Personal sends the passphrase itself there (SAE needs it); the helper also takes a passphrase
+  there for a direct call.
+  A saved row's trash calls `wifi_delete` directly, with no Yes/No page; the helper tries wifid's
+  `deleteProfile` property by name (older firmware), then by the profile's integer `netid` (from
+  `profileData`, or `netidValue` when it is absent; the Scribe's wifid), then the supplicant's own
+  network, and counts the profile gone only when a fresh read no longer
+  lists it. Add and delete both read the networks back. Duplicate names are handled by wifid's own profile rules and the next read (no guessed merge in the
+  app). A profile that is not among the saved networks afterwards did not stick: that is a failed add. The
+  add's exits name the step in the log: 18 no valid PSK, 19 wifid refused the profile,
+  20 no read came back after the change. The
+  keyboard draws over the Wi-Fi page, which stays on the panel under it.
+- **A switch** is wifi_join: the helper's `join <hex>` (ensureConnection), then a read of the network
+  connected to every 2 s. It has worked once a read has the Kindle connected to that network (the helper's
+  own report right after the request still names the old one: no false success), and failed when the
+  helper refused it or after 45 s (JOIN_WAIT). Nothing switches back: the Kindle's service decides what it
+  joins next. Turning the radio on or off forgets a switch; one switch runs at a time. A profile that took
+  joins the same watch (the helper already asked wifid to connect): the sheet says it is connecting until a
+  read names it, or names it failed.
+- **Disconnect** is the helper's `disconnect`, called from a tap on the connected row. Wi-Fi stays on. It
+  first puts wifid's connection manager in its manual `cmConnMode`, so it does not join the profile again
+  the moment the link drops, then writes `cmDisconnect` with the current `cmProfile` (some firmware ignores
+  it without that name), then without a name, then asks wpa_supplicant with `wpa_cli … disconnect` (with a
+  two-second bound, and the known control-socket paths tried). Once the link is down it pins the drop with
+  `wpa_cli disconnect` and disables that network at the supplicant, since the supplicant can reassociate on
+  its own within a moment, and so can a bare reconnect from wifid. It waits for `cmState` to leave
+  CONNECTED, looks once more a second later, and requires the report to say connected=0. A later join, add
+  or turn-on asks wifid to connect, which manages its own networks. A failure re-enables the network and
+  asks for `cmConnMode auto` again, keeping the last known status and saying "Could not disconnect." rather
+  than the generic read error; the helper's exit names the failed step in the log (10 radio, 11 connection
+  state, 12 no route took, 13 it came back past the disconnect pin, 17 it came back past the disable too,
+  15 it came back with no usable `wpa_cli` at all, 14 no final read). Joining, adding and turning the radio
+  on restore `auto` too. It is a change like a switch: one at a time, and success clears the current name.
+- **Reads** run only while the sheet is up (as the Share card's): everything as it opens, the saved
+  networks once more when the radio comes on if they could not be read while it was off, everything once
+  more after a refused switch, the network connected to while a switch is under way, or for 45 s after
+  a tap while the radio is on with no connection. A quiet scan of Nearby runs every 20 s while it is idle
+  with a list; `wifi_scan_quiet` keeps the old order and merges each name's new signal, security and known
+  flag, drops names that left, and appends new ones. Its failure leaves the old list and says nothing. A tap
+  on Rescan while it runs accepts it as the rescan instead of clearing the list. A tap on any change (join,
+  add, delete, disconnect, radio) cancels a running scan and starts at once; the 20 s wait starts when a
+  scan's answer returns, so a slow scan is never followed straight away by another one.
+- **Passwords** never leave the helper (docs/KINDLE.md, Wi-Fi): the profileData reader keeps essid values
+  only and gives no name at all for any format it does not know. A password goes from the masked keyboard to
+  the helper's stdin, is turned into a PSK, and is wiped from the keyboard on Done/Cancel; it is never in
+  argv, the environment, output, logs or scenario recordings, and the keyboard's probe returns empty for a
+  secret. Names cross in hex and are checked again in Rust (1 to 32 bytes, no control character; anything
+  else fails the whole report closed). No name is logged.
+
 ## Settings > Gestures and page finger shapes (Index phase 3)
 
-The Settings bottom row has five equal cells: KOReader, Controller, Gestures, Updates, Done.
-Controller, Gestures and Updates words have a 248 px budget at 34 px caps on the upright panel,
-in English and Spanish, in both themes. Coordinates remain pending main-scenario verification.
+The Settings bottom row has six cells: KOReader, Pair (Controller until 2.0.0-beta.2), Wi-Fi (2.1.0-beta.2),
+Gestures, Updates, Done. Pair, Wi-Fi, Gestures and Updates share about 810 px upright: evenly while the
+longest word fits a quarter (English, Japanese), else each as wide as its word needs (none under 160 px)
+with the rest shared out (Spanish: "Actualizaciones"). The tap points are in docs/SIM.md.
 Buttons and Gestures share the seven registry groups and row descriptors from `actions.rs`.
 Source masks expose every action to PEN. Hold eraser is pen-only in Gestures (hold/drag slots),
 and pan/zoom are PEN-only Pages actions 82/83 (drag slots). Keys/pads cannot learn their own
@@ -1255,7 +1930,9 @@ A hold clears touch, shape and pen sources for the row (both members of a pair);
 recovers from an unreadable file. Learn/clear use copy-save-swap: failed persistence leaves the
 live map and record card intact.
 
-The record card keeps three sample slots, Use, Try again and Cancel. First input selects a
+The record card keeps three sample slots and Use, Try again, Disable and Cancel. Disable saves
+"nothing" for the action, the built-in defaults included (both members of a pair), so its row
+says "no gesture", then closes the card. First input selects a
 pattern, one-finger swipe, shape or pen-button gesture. Paired rows continue to the second member after saving the first. Patterns can be accepted with Use after a valid attempt;
 shapes require two consistent samples, with an optional third. Conflict and accidental-slip
 checks run before saving, with progress/refusal text in the line's own rectangle. Moving a
@@ -1269,7 +1946,15 @@ the clock; deliberate motion can become a shape. Pen arrival, another contact, s
 screen/layout change aborts capture. The dotted, outlined black/white trail is drawn only on
 the screen canvas; it never enters the page, undo stack, exported PNG/PDF or autosave. The page
 backing restores the trail, including over the Links bar. Refusals fade; a first unknown shape
-can show the one-time tip (`hints` bit 7). Match dispatch uses the common action path.
+can show the one-time tip (`hints` bit 7). Match dispatch uses the common action path. A shape that
+fires names its action in a toast (1.2 s) only when the action did something (2.0.0-beta.2): when
+the app's count of redraws asked for (`App.changes`, counted by `app_invalidate`; the settle after
+writing, a refresh of what the panel shows already, is not counted) or its settings changed. Next
+page on the last page, Previous page on page 1, Clear page on an empty page, Undo and Redo with
+nothing to undo or redo, Close menu with nothing open, and a zoom or a scroll that leaves the view
+where it was (at the most zoom or the least, past the first or the last page: `view_moved`, nothing
+drawn) fire with nothing said, as does an action that raised its own toast, switched the screen or
+opened the Pages view.
 
 | Surface/event | Refresh | Contract |
 | --- | --- | --- |
@@ -1302,8 +1987,11 @@ use wrapping u32 milliseconds. A click is at most 450 ms with no nib contact, mu
 are at most 350 ms from release to next press, and the result resolves 350 ms after final release.
 A single click fires immediately only when neither double nor triple is bound. Hovering holds
 begin once at 1200 ms. The recorder always waits for a possible multi-click, even when none is currently bound; runtime
-waits still depend on bindings. Clear page defaults only to hold, with the duplicate RC1
-triple/hold pair migrated to hold. Both owners tick only after the input queue is drained, so a queued release
+waits still depend on bindings. No pen slot has a built-in action since 2.1.0-beta.2 (the hold's
+Clear page fired with the pen hovering, under a finger resting on the button: issues #36, #39);
+`gesturemap_retire_old_defaults` reads the old built-ins a file holds (RC1's triple and hold pair,
+or the triple=nothing and hold pair rc.2 to 2.1.0-beta.1 wrote after it) as the new ones, unmarked,
+while a hold given Clear page alone stays the owner's. Both owners tick only after the input queue is drained, so a queued release
 cannot be mistaken for a hold. Proximity loss cancels a pending sequence and ends capture.
 
 While the card is active, PenButton, proximity, contact and lift feed only its own recognizer.
@@ -1335,3 +2023,425 @@ Clear page saves removal of the current page's links before touching its ink, th
 `ActKind::Clear` carrying the removed strokes and `LinkEdit`. A link-only page still gets this
 step. Undo/Redo applies both parts; a failed link save reverses the tentative ink operation and
 keeps the Clear step for retry. Initial Clear save failure leaves ink and history unchanged.
+Run from a gesture or a shortcut (`editor_shortcut_in`), a Clear that cleared something raises
+its own toast, "Page cleared. Undo brings it back." (4 s), in place of a shape's action name: the
+way back is one Undo. The toast is an overlay with no controls of its own (drawn at each present,
+never stored in the screen, mirrored to Live view as a layer), so it points at Undo rather than
+carrying an Undo button. The toolbar's broom, in sight as it is tapped, says nothing (the
+owner, 2026-11-04).
+
+## Lasso select and scoped erasing (2.0.0-beta.2)
+
+The binding design is docs/beta2/LASSO-DESIGN.md; this is where it lives in the code.
+
+- `rust/src/lasso.rs` (pure): the lasso as a crossing table with non-zero winding; enclosure judged by
+  each ink stroke's visible spine (samples no later erase stroke in scope covers with its hard core): half
+  of what shows inside, or the middle of what shows for strokes under 1.5 mm; links that come along; the
+  erase strokes that go with selected ink (after it, in scope, meeting its tiles); the group, with each
+  distinct floor of those erase strokes encoded as a marker; seeds; where a paste goes; `lasso_place`,
+  which appends a group at the end of a page drawing it onto the page canvas as it goes and decides each
+  floor plain (its snapshot is the paper under its strokes' tiles: no marker, exact in older versions) or
+  scoped (a free layer).
+- `rust/src/page.rs` `render_from`: the renderer's floors. A page with no marker takes the old path
+  unchanged; at a marker the canvas over the union of its scoped strokes' boxes is copied, and those
+  strokes restore toward it. `page_render_from` draws appended strokes onto a canvas of the page before
+  them (a paste or a move draws only the group).
+- `rust/src/clipboard.rs`: `root/clipboard.qpg` (FORMAT.md, The clipboard).
+- `rust/src/history.rs` `ActKind::Lasso`: the ink taken off plus an Add of the strokes appended, with
+  the carried links' records, one step; undo and redo swap the step's canvas patch (instant on dense
+  pages). `undo_redo_link` swaps the patch for lasso steps with links, and rolls the ink back if
+  links.ini cannot be saved.
+- `rust/src/editor/select.rs`: Select mode (`SelState` Off, Armed, Lasso, Selected, Dragging), its bar,
+  the gestures (Move, Copy, Cut, Delete, Paste) and the scripts' probes (`editor.select`, `selected`,
+  `sel_links`, `sel_box`, `clipboard`, `layered`, `page_links`, `lasso_ms`; `tap panel select.<button>`,
+  `tap panel picker.select`). Moved ink goes to the end of the stroke order, on top of what is there.
+  While Select mode is on the panel's tool button shows the lasso, selected (no pen is), and the early
+  Live ink hook draws nothing (`editor_pen_not_ink`). `sel_hold` is `select` held on a pen button's hold
+  or drag (`pb_out`: the drag's contact is not claimed, so it reaches `sel_down` as the lasso);
+  `sel_tick` and `sel_finger_hold` paste on a long press (`HOLD_MS`, the link card's hold). Cut
+  copies, then deletes; a delete refused after the copy puts the clipboard back (`clipboard_snapshot`,
+  `clipboard_restore`). A lasso step's dirty rect leaves out floor markers (history.rs `bbox_of`), so its
+  undo refreshes only the group's place.
+- The drag (select.rs `drag_step`, `drag_tick`, `DragView`; 2.0.0, the owner's report of 2026-11-05 that a drag of
+  shading or of many strokes was "horrifically slow"). Until 2.0.0-beta.2 each pen sample composed and DU-refreshed
+  the box joined with the bar (1680 x 365 px on his page), the selection's halo walked again every time: about
+  22 ms a sample on the Scribe, one sample a loop turn, while the pen reports every 2 to 3 ms. Now a sample only
+  records the newest place (`drag`, clamped to the page) and when it changed, none until the pen has strayed
+  DRAG_SLOP_MM (1 mm; a finger, `finger_slop`) from where it came down (`dv.left`), so a tap that wobbles a pixel
+  is a tap; the editor's tick (`sel_tick`, once a loop turn, after the turn's samples) shows it when
+  `display_fast_busy` says the last DU is off the panel (never queued in the driver: at most about 5 a second at
+  25 C) and PREVIEW_MS (120 ms) went by since the last show, or the pen kept still PREVIEW_PAUSE_MS (50 ms). The
+  first move begins the display (`drag_begin`): the bar's rect and the outline's strips are composed again without
+  them (`bar_hidden`, `outline_off`: sel_draw draws the outline where the screen shows it, the place last shown),
+  then the page's part of the screen (lasso_clip, 4.6 MB at most) is copied as the drag's base; no memory for it,
+  and each show composes its strips instead. A show (`drag_show`) puts the old outline's strips back from the base,
+  draws the new outline (`draw_outline`, the same shapes sel_draw draws), and refreshes each strip by a DU flushed
+  on its own (`drag_present`, the link card's border strips' way: `dither_strips` is linkcard_strips' shape; two
+  join only when one rect over both covers no more), so no refresh spans the box's gray inside. sel_draw copies
+  whatever compose made of its rect into the base first (it is the last layer), except for Live view's composing
+  without the panel, so a panel repaint or any compose during the drag keeps the base true; a show waits while a
+  sheet, the peek or the Library's settings are in front. Each show adds the old outline's ink to the DU wear; the
+  first, the bar's rect. The halo and the ink are drawn only where the first move composes the outline's four
+  strips. The lift (`drag_done`) is as before: `sel_move` with the newest place, shown or not, then one Ui refresh
+  of every place the drag refreshed (`outline_rect`) and the overlay, the base freed; Back, an undo or the `select`
+  action in the middle (`sel_deselect`, `sel_off`) free it too. A sleep in the middle ends the drag as a cancel
+  (`editor_suspend` calls `sel_cancel`, as `owner_cancel` does for a lost lift): the bar is not laid out while it
+  is away, so a drag that outlived its lift would leave its buttons answering at their old place, unseen; a down
+  that still finds a drag with no owner ends it as a cancel and is swallowed (`sel_down`). Its log line: `lasso:
+  drag samples= shows= px= inked= copy=`. Probes: `editor.drag_samples`, `drag_shows`, `drag_shown`, `drag_inked`,
+  `drag_copy`, and the runner's `live.frame.stale` (Live view's frame against the screen).
+- `rust/src/lasso_live.rs` (pure): the live selection preview (docs/beta2/PIXEL-LASSO.md 2). Each sample a
+  stroke is judged by (`judged_samples`, shared with the lift; lengths in fixed point, 1/64 px) keeps its
+  winding as the integer sum of the lasso's edges' contributions, computed with the one crossing expression
+  `Lasso::new` uses (`edge_rows`, `edge_cross`). Folding points pn+1..pm subtracts the old closing edge's
+  contributions and adds the new stretch's and closing edge's: only samples between the first and last
+  crossing of that small polygon in their row can change, found through a 64 px grid of the ink's boxes
+  and 32-sample chunks. A full lasso (every other point dropped) and one taller than the table's 8192 rows
+  answer from a fresh crossing table. The lift takes the preview's answer (`lasso_select_from`) when the
+  page is unchanged (`holds`), and debug builds assert it equals `lasso_enclosed`. select.rs folds a batch
+  PREVIEW_MS (120 ms of input time) after the first point waiting, or at once when the pen pauses 50 ms
+  (`preview_tick`); the strokes whose halo flipped are drawn again in at most 6 merged fast refreshes
+  (DU wear counted), and the lift's Ui redraw covers every one. The halo (`sel_draw_halo`, in compose
+  under the panel) is a dither band 3 ui px wider than the ink each side with the page's pixels put back
+  over it by a min, so ink stays on top; it stays on the selection. Probes: `editor.halo`,
+  `preview_batches`, `preview_refreshes`, `preview_reused`, `preview_rect`, `lift_rect`,
+  `lift_covers_preview`.
+- Exact area (docs/beta2/PIXEL-LASSO.md 1): `stroke_dabs` runs a stroke's brush dry with
+  `BrushState.dab_log` (brush.rs: the dry branch pushes each dab's sample, radius and calligraphy nib) and
+  `stroke_cut` splits it into runs of dabs on one side of the lasso: a later piece starts at its first
+  dab's own sample (its spacing from there walks the stroke's line), an earlier one ends half a spacing
+  past its last dab, new points stored as the file stores them (`sample_as_stored`). A calligraphy piece
+  starts with a point leaning so its nib starts at the stroke's smoothed nib (`brush_tilt_for_nib`) and a
+  second point at the same place with the pen's tilt; one whose tilt widens or lightens it is not cut
+  (`stroke_cuttable`). `lasso_cut_plan` takes ink whole when its box is inside (`Lasso::rect_inside`) or
+  every dab is, cuts what crosses, judges beta.5 linked ink and short strokes (under `LASSO_SHORT_MM` of
+  what shows, as the preview's halo shows them) by the whole-strokes rule, and areas on the cut view. select.rs keeps the plan (crossing strokes by identity, their pieces) in `SelMode.plan` and the
+  lifted lasso in `kept` (the mode button, `SelBtn::Mode`, judges it again); Move, Cut and Delete splice it
+  in inside their step (`plan_splice`, the outside pieces at the original's place, so floors and erase
+  strokes keep their order), and the step is `history_push_lasso_at` (the originals and the whole ink
+  removed, the outside pieces and the placed group added, not contiguous); the old place is drawn again in
+  the tiles of the ink taken and of the outside pieces. Copy splices in and out at once (`plan_unsplice`).
+  The mode is a static for this run (`EXACT`); Shift or Alt held as a lasso begins (`hidkeys_mods_held`,
+  which input_evdev.rs keeps as every attached keyboard's modifiers together, after each of their key
+  events, resyncs and detaches) flips it for that lasso; `select-exact` (85) enters
+  Select mode in it or toggles it. The live preview in exact mode (`LassoLive::set_exact`, `halo_list`)
+  shows a crossing stroke's inside runs of judged samples and a solid tick halfway between an inside and an
+  outside sample. Probes: `editor.sel_exact`, `sel_cut`, `page_sig_keep`, `page_sig_same`;
+  `tap panel select.mode`.
+
+## The safe loader and the PDF import (2.1.0-beta.2, lane L5)
+
+PDFs are untrusted, and Grimoire runs as root, so no process that writes files parses one. The import is three
+processes: the UI (queues, shows the notice, and never parses a PDF: it reads the first and the last KiB of a file
+the scan found, to see that it is whole, and, in the picker, up to twelve 1 KiB samples for the book key, which it
+hashes), the writer (a
+background job child: opens the file through `fsview`'s walk, owns the work folder, validates every record
+and writes the files) and the worker, a fresh exec of the same binary (`grimoire --work pdf ...`, taken
+before any UI start-up) that inherits nothing: descriptors 0 to 5 only (0 to 2 on /dev/null, 3 the PDF, read
+only, 4 the pipe to the writer, 5 the pipe from it). On the Kindle the worker takes these steps in order, and a
+failed step sends `E sandbox <step>` and exits before a byte of the PDF is read: oom_score_adj 1000,
+no network or System V IPC (unshare), chroot into an empty directory on /tmp (checked to be tmpfs), the uid
+and gid 62001 (checked unused), no new privileges and not dumpable, the parent-death signal, the limits
+(`RLIMIT_NOFILE` 0, `NPROC` 0, `FSIZE` 0, `CORE` 0, `AS`, `CPU`) and a seccomp allow-list (read, write, the
+mmap family with mprotect and madvise, brk, futex, clock_gettime, rt_sigreturn, exit and exit_group), in which
+futex passes only as a private wait, wake or wait-bitset and mmap and mprotect only for a mapping not asked
+executable. Any other call traps into a reporter, but for the few that answer ENOSYS instead (the time64 calls
+musl tries first on the 32-bit ARM, and gettid). Before the `S 1` of its handshake the worker makes one allowed
+call of each of the three kinds, so a kernel that does not show the filter their arguments ends the worker
+there. A refused
+step, or a worker that cannot be started, marks nothing and counts no try; the session then imports no more PDFs
+(a later slice keeps the pages it made, for the next start). The handshake is two lines, the build and `S 1` (the
+steps are in place; `S 0` is a build without them, macOS); where the sandbox is required the writers take only
+`S 1`, and a worker is started only with descriptors 0 to 5 in place. The writer ignores SIGPIPE, and reads a worker's last
+records after a send that failed. The page watchdog runs on CLOCK_MONOTONIC (a sleep does not count); a page
+whose wait the Kindle slept through and that then stalls is tried again once without a strike. Off the Kindle a
+failed step refuses nothing unless the writer requires the sandbox (GRIMOIRE_SANDBOX=require: on Linux it then makes
+the worker's jail, and a worker given a jail holds every step, as on the Kindle). macOS has none of the steps (plain
+process isolation); a Linux build that does not require the sandbox still takes the steps that work without root (no
+new privileges, the limits and the allow-list among them) and has no chroot. The worker's records are text lines of
+a fixed grammar plus pixel bands, parsed strictly (`pdfwork.rs`). The writer ends a worker whose record lines pass
+4 MiB (`RECORDS_MAX_BYTES`: counted for each worker, the pixels and the handshake's two lines apart), and a job is
+many workers: a fresh one for each slice, and after each one that died or stalled. Only the first comes near the
+cap, with the links and the names; the others send the page count, a line a band and a line a page. Every
+number the device spike (S1) sets is in the one table `sandbox::s1`, marked "set by S1". The notebook, its
+slices, marks and colour rule are in FORMAT.md, "Imports: PDFs". Two rules hold the import together (the fix round
+of 2026-11-09): whether a file may be moved is decided by where it lies (`pdfimport::in_import`), never by a mark;
+and the state never names a picture the saved index does not (the index is saved first; a resume checks the files
+and makes again what is gone). Only an import's child keeps the import lock's descriptor (`bgjob::child_setup`),
+so a compaction or a mirror that starts as the last import ends never holds it; a pick that met a lock held
+elsewhere is queued by the first scan that takes it afresh, and the tick tries the lock every 10 s while a
+previous run's detached import holds it. The lock is a plain file at its own name (`pdfimport::lock_take`): it
+is opened without following a link (`O_NOFOLLOW`, and `O_NONBLOCK` as the other lock files), must be a regular
+file with one name, and once locked must still be the file at its name (`lock_is_at`), else the lock is asked
+for once more and then given up. What else is found at the name is never removed and never followed. Only
+`EWOULDBLOCK` means another process imports, and only then does a pick wait; a lock that cannot be taken for
+any other reason refuses a pick with the message for a file that cannot be imported, and leaves no mark. A third
+rule joined the two above in the hardening round of 2026-11: a file's path is kept in its mark and state as it
+is, and a path those files cannot hold (a line break in a name, `pdfimport::name_storable`) is refused where it
+comes in: the scan, the picker's rows, a pick, the job. `in_import` asks the folder itself where a path spells
+`import` in another case (`pdfimport::under_import`), and the scan's first look at a PDF opens it through the
+same walk as the job and reads only the file it listed (`read_ends`). The job reads its PDF through the file it
+opened, and a file of `import/` is moved to `done/` by its name, so the name is looked at once more just before
+the move (`finish_pdf`): it must still hold the file that was read (the lock's own test of a name against an
+open file, and the size and time the file was opened with), else nothing moves, nothing is marked done, and
+the next scan takes what is at the name; the try stays counted, so this cannot repeat without end. The record a
+notebook keeps of its file takes its key and its hash from the one file the last slice has open.
+
+The links and names (lane L6) come out of the same worker. After the page count the writer sends `LINKS <w> <h>`;
+the worker walks the annotations of every page (`pdfwork.rs`, module `links`), resolves each destination to a
+page (an explicit one by the page's object id, a named one through the name tree and the `/Dests` dictionary,
+read once and only when a link first names one, under the walk caps), maps the rectangle or quads through the
+transform the page was drawn with (`page_fit`, shared with the renderer so the box lands on what it covers), and
+answers `L`, `Q`, `O` and `F` records. The writer checks each one (`Collected::take`: pages inside the PDF,
+coordinates inside bounds, a quad only after its link, one name a page), keeps them in the work folder, and the
+last slice's commit puts them through `pdflinks_fill` and `pdflinks_water` into `doclinks.ini`, and the outline
+into `nav.ini`. A worker that fails in the walk costs the notebook its links, not its pages.
+Pictures (lane L7) go through the same worker as a second kind (`grimoire --work pic ...`, `picwork.rs`): the
+templates, photos and picture-folder pages come from outside Grimoire, so the writer reads their bytes (it hashes
+them, never parses them) and sends them down fd 5 one picture at a time (`C` a header check, `D` a decode, each a
+line then the bytes). The worker runs the very code the writer ran before (`bgimage.rs`: the header check, the
+decode within the 256 MiB budget, the EXIF turn for a photo, the fit onto the notebook's page) and answers with
+the source's size and the page picture, which the writer checks (the page's size, 1 or 3 channels, the source's
+bounds) before it writes a file. One worker serves up to 32 pictures (`s1::PICTURE_SLICE`), so a 2000-picture
+folder costs about 63 execs. A worker that dies or stalls on a picture twice in a row ends that picture alone: a
+template or photo is marked `.bad`, a folder's import counts one try of its three; a worker killed by the seccomp
+filter ends its picture so at once (never a reason to decode in the writer, which would hand a compromised
+worker's picture to a root process). When no worker can be had at all (a sandbox step failed before a byte was
+read, the exec did not start, the handshake failed), pictures fail closed wherever the sandbox is required (the
+owner's ruling of 2026-11-10, replacing D21's picture fallback; `sandbox::sandbox_required`: the Kindle always,
+elsewhere GRIMOIRE_SANDBOX=require): no picture is decoded in the writer, the pool answers `PicOut::NoWorker`, a
+template or photo is not ready yet (no `.bad`: the next scan makes its preview, and a notebook's picture is made
+when the template is picked again), and a picture folder's import ends with its try taken back
+(`import/.attempts` unchanged), so every later scan takes it again. Where the sandbox is not required (the Mac,
+the simulator, tests) a picture no worker was given still decodes in the writer, as in 2.0. Either way the log
+says so once a process, with the reason, and a picture a worker was given is never decoded in the writer.
+`sandbox::session_broken()` is the flag the PDF import also reads. KOReader's own page PNGs and Grimoire's own
+`bg/` pictures are still decoded by the UI, as they come from KOReader's encoder and from Grimoire. The UI never
+checks a template or photo itself: one with no preview yet waits for the previews job (`install_picture`, the
+fix round's M13).
+
+## Your own fonts (2.1.0-beta.2, lane L10)
+
+A font file someone copied into `grimoire/fonts` is untrusted, and stb_truetype, which draws the embedded
+fonts, says of itself that it does no range checking of the offsets it finds in a file. So stb never opens
+such a file, and the rule is: **the UI process never parses a font that has not passed the check for exactly
+its bytes.** Four parts keep it (`fontcheck.rs`, `userfonts.rs`, `font.rs`):
+
+- **The safe face.** skrifa (no unsafe code; the parser hayro already brings, pinned to the same version) reads
+  the tables. Each glyph's outline comes out unscaled, in font units, as stb's own vertex list, through a pen
+  that applies the caps: 4,096 points a glyph, every point within 4 line heights of the origin and the box no
+  larger, 256 KB of draw memory. `stbtt_Rasterize`, stb's rasterizer and nothing else of stb, draws it at the
+  scale the size asks. For a TrueType font at its default location the vertex list is the very one stb's own
+  parser makes (contours started as stb starts them, implied points rounded down as stb rounds them, the same
+  closing line), so the bitmap is stb's own, byte for byte, size and offsets too: `font.rs`'s test checks it
+  on every glyph of every embedded text file at five sizes (Terminess's icons apart: some are built of scaled
+  components, where stb's parser cuts a coordinate short, and they never go this road). The check and the UI
+  draw through the same functions, and outlines do not depend on the size, so what the check drew is what the
+  UI draws.
+- **The check** runs in the safe loader's worker as a third kind (`grimoire --work font ...`), one font a unit,
+  its bytes sent down fd 5. It refuses a WOFF or WOFF2 file, a file skrifa does not read, a font with no
+  Unicode cmap or a symbol one, and one that lacks a printable ASCII character. It takes the font's line
+  (ascent and descent) unless that is more than half again as far as, or less than two thirds of, what the
+  capitals, digits, tall letters and accented capitals reach above and g j p q y and the cedillas below: then
+  what they reach. It requires ink inside the line box for A to Z, a to z and 0 to 9, at the smallest and the
+  largest size the UI draws a custom font at (8 and 160 px of line: outside them a glyph comes from Terminess).
+  Then it walks every glyph that `Charmap::map` finds for a character the cmap lists (the UI's own question: a walk of
+  the cmap's groups could name another glyph where groups overlap), at each location the UI uses (the default, and the bold's when the
+  font has a weight axis that reaches 100 above its default: 700, or its heaviest), outlining under the caps
+  and drawing at both sizes; a glyph that fails is listed and comes from Terminess, and more than one in a
+  hundred is "Unreadable font.". It works in slices of 20 s of its own CPU time (`s1::FONT_SLICE_CPU_SECS`),
+  each a fresh worker that gets the bytes again and goes on from the glyph index the last reached, 10 minutes
+  in all; a worker silent for 30 s is killed and counts as out of time too. A first check that runs out of time
+  writes no verdict: the file is checked once more, a minute or more later (`<key>.slow`), and a second is
+  "Took too long to read.". It settles the
+  font's scale (capitals as tall as Terminess's, 0.592 of the line, between 0.85 and 1.25, then lowered a
+  hundredth at a time until 95 of 100 of Grimoire's strings, in every language, are no wider than Terminess
+  draws them, measured as `font.rs` measures: advances only), says which languages need letters the font
+  lacks, and draws the preview: the family's name in the font. Its records are text lines of a fixed grammar
+  and the preview's pixels; the writer validates every number.
+- **The writer** (`BgKind::FontCheck`, one job for every unchecked file, each read whole through `fsview`'s
+  walk) writes `<key>.checking` before a font and the verdict `<key>.font` with the preview after it
+  (FORMAT.md, "Your own fonts"). A worker that dies on a font leaves `<key>.bad` and the others go on; a job
+  that itself dies has its `.checking` mark turned into `.bad` by the UI, which queues the rest again. A
+  sandbox step that fails, or a worker that cannot start, marks nothing: the job ends with status 4 and the
+  session checks no more fonts. A file still being copied (under 5 s old, or changed between two looks 2 s
+  apart) waits: status 3, and the Font sheet looks again.
+- **The UI** lists the folder without opening a font (the rows are the check's previews), and loads one only
+  with a passing verdict whose `hash` is the FNV-1a 64 of the bytes it just read; another file under the same
+  name, size and time is checked again (`recheck:<key>`). It holds at most 32 MB of font files (the Bold file
+  gives way to overprint first), loads none under 100 MB of available memory, and none in Gothic. `font.rs`
+  keeps four face slots after the embedded files (the font in use and its bold, the Font sheet's sample and
+  its bold); a glyph's cache slot names its face, a cache now capped at 4 MB of bitmaps. `layout` draws a
+  custom face's own glyph when the font has it, it passed, and the size is one the check drew; everything
+  else, ASCII too, is borrowed from Terminess and then DotGothic16 as a family's missing glyphs are. Kana and
+  kanji of a custom font are drawn at the size whose em is DotGothic16's (0.691 of the line), so Japanese takes
+  the room it takes today. A custom font has no kerning (skrifa has no kerning API). Bold is `font_bold=`
+  when it names a file, else the font's weight axis, else the Bold file of its family in the same folder, else
+  overprint.
+- **The crash guard** (`grimoire/.font-inuse`): a font's mark is armed before its first use in a session and
+  taken away by the first present after a custom face drew a glyph (`userfonts_screen_drawn`, called at the end
+  of `app_flush`). An armed mark found at a start is a strike: one, and that start does not load the font; the
+  start after tries once more; two, and it stays out until the file changes. The Font sheet draws its own
+  words in Terminess while a custom font is in use (`font_with_family`, which sets a custom font aside), so a
+  bad pick can always be undone, and deleting the file over USB brings Terminess back ("File missing.").
+
+The share pages never serve a custom font (the browser gets Terminess), and nothing in a notebook, a PDF or a
+picture changes with one. grimoire.log never names a font file or a family.
+
+Tests: `test_fontcheck.rs` (real workers: good TrueType, variable and CFF fonts; the malformed-font corpus of
+`rust/tests/fontfix`: truncations, a cmap past the end, composites that include each other, CFF subroutines past the
+format's depth, a symbol cmap, a web font, letters that draw nothing, wild glyphs, a line ten ems tall, random
+byte flips; a killed worker leaves `.bad`; a hung one is slow; slices come to one slice's verdict; a replaced
+file is checked again; the listing; a file still being copied waits; 20,000 glyphs), `test_fontguard.rs` (the
+guard start by start, with the app killed at a custom font's first glyph), `font.rs` (stb's bitmaps byte for
+byte; a custom font draws as the same file embedded; the cache's cap), `fontcheck.rs` and `userfonts.rs` (the
+verdict and guard files read strictly; the strike rules), `test_sandbox_linux.rs` (the check in the real
+sandbox, as root in CI), and the scenarios `y_fonts_own_1_sheet`, `y_fonts_own_2_missing`, `z_fonts_own_kept`.
+
+## The file picker (2.1.0-beta.2, lane L8)
+
+`browser.rs` is the picker, `fsview.rs` everything it touches. Library > New notebook > From a file... opens it
+over the sheet (the sheet stays under it: Cancel at the picker's root and Esc come back to it), hosted by the
+Library as a mode the way it hosts the Graph (`LibraryState.files`; its events, ticks, keys, redraws and probes
+are routed in `library.rs` as the Graph's are, and two fingers down does nothing in it).
+
+- **The one exception to "a tap acts".** A tap on a PDF opens its card (the popout's place, `popout_place`),
+  and the card's Import as notebook is the second tap: an import can be 400 pages, and the card is the
+  confirmation. A folder's tap enters it; its card (a hold of `HOLD_MS`, or its `...`) offers Open and Import
+  %d pictures as notebook. A contact outside a card closes it at the lift and does nothing else, and the lift
+  after a hold never acts.
+- **Places.** Import (`grimoire/import`), Documents (`documents`), Downloads and All storage (the root), each
+  but All storage with its real path as a second line, and the free space at the top. Rows are 150 px, paged, never scrolled; the
+  keys are Left and Right (Up and Down unbound), Esc goes up and cancels at the root. The picker lists folders
+  and PDFs only, by `name_cmp`, folders first.
+- **Read only outside Grimoire's folders (D26).** Every listing, stat and open is fsview's walk: no link at any
+  component, one device, `grimoire/notebooks`, `PDFs` and `trash` refused by identity (so a path cased otherwise
+  on a case-insensitive storage cannot reach them), a listing of names and kinds only, read in slices of at most 20 ms a tick (a
+  folder row's picture count is a walk of its own, up to 200 ms), the
+  stats, picture counts and book keys of the rows on screen on idle ticks. The action checks the file again
+  ("File changed. Try again."). The jobs that follow open the file through the same walk: a PDF is
+  `pdfimport::pdf_import_queue`, a folder of pictures `bgwork_template::import_pick_queue` (marks in
+  `import/.marks/`, the source never moved or written, each picture opened `O_NOFOLLOW`; a pick inside
+  `grimoire/import` itself is filed in `import/done/` as a drop is, decided by where it lies).
+- **Names (D28).** The notebook takes the file's name (a folder's, for pictures) unless a name was typed in the
+  sheet (`new_name_typed`), and goes in the sheet's In: folder; the paper tiles do not apply.
+- **The Import place** reads each row's status from the marks, the queue and the attempts
+  (`pdfimport::import_status`, `bgwork_template::folder_failed`): the PDF rows' when the import's progress changes
+  (looked at at most once a second), every row's every 5 s (a folder's lists the folder), and redraws only the rows
+  that changed. The staying notice of an import stays off that place (`library_import_place_up`): its rows say it.
+- **"has notes"** is the PDF's book key (KOReader's partial MD5, 12 reads of 1 KiB through the walk) and its size
+  (one descriptor) compared with the keys the notebooks hold and the records of their files
+  (`pdfimport::key_holders`: `source=`, else the book their `source.ini` names, else the key of its `file=` line;
+  one small read a notebook, once for the picker's session). No file is read whole in the UI, so the row states
+  what the key and the size can say (`pdfimport::key_match`), and the card has three cases. A notebook holds the
+  key with a record of the file's size: "has notes", and the card offers Open its notebook and Import as
+  notebook (the import reads the whole file and gives the exact answer: "PDF already imported." for that very
+  file, a notebook of its own for another). A notebook holds the key with no record (one made before the
+  records, or from KOReader): "has notes", Open its notebook, as before. Only notebooks whose records are of
+  another size hold the key, or none does: no tag, Import as notebook.
+- **Logs** carry counts and timings only ("files: listed N entries (M usable) in T ms"), never a name.
+
+## Shared building blocks (2.1, lane L0)
+
+The 2.1 plan builds a few pieces once, for every later lane to reuse (no second one grows beside them).
+Lane L0 adds them with nothing visible: each keeps what the Scribe showed before.
+
+- **One hold, `ui::HOLD_MS` (600 ms).** Every touch hold that offers a control's choices reads it: the link
+  hold and Select's paste hold in the editor, the Library's row hold, the Pages view's card hold (its drag
+  hold is `HOLD_MS / 2`) and the Links bar's. Not the pen dwell for shapes (a setting), the pen button's
+  1200 ms, the power key's 4 s or the keyboard's repeat. rust/tests/test_ui.rs `every_hold_reads_hold_ms`
+  fails on a hold of its own number.
+- **One popout's place, `popout.rs` `popout_place(w, h, anchor, screen, avoid)`.** A card beside what was
+  held: right of the anchor, then left, below and above, each clamped 20 px into the screen on its free axis.
+  `avoid` lists what it keeps clear of: the first is a side panel (a candidate that meets it slides sideways
+  to its nearer side, and it is the first given up when nothing else fits), the rest are never covered when
+  any place avoids them; the last resort is the right place clamped, moved below each of the rest it meets.
+  The long-press card passes `[panel, clock corner]` and places exactly as `linkcard_place` did
+  (tests/test_popout.rs compares the two over 190,000 cases); the quick size card passes the same and the
+  Library's item cards (2.2) will pass nothing. The popout's chips, contacts, refreshes and keys are the quick
+  size card's (below).
+- **One notice that stays until ready, `app_notice(a, key, text)` until `app_notice_clear(a, key)`** (app.rs).
+  Drawn like a toast, in the toast's place above `toast_floor`, overlaid for its presents and never stored in
+  `App.screen`. A new text redraws it at most once every 2 s (`NOTICE_EVERY_MS`) by one Ui of its rect,
+  presented after the flush the way the clock corner presents itself, never counted in
+  `ui_refreshes_since_full` (whose 30th Ui is a Full); a flush that reaches its place anyway carries it; it
+  waits while the pen is down. Clearing it repaints its rect by one Ui, also uncounted. A toast takes its place
+  for the toast's time (the toast's own refresh repaints where it was) and it returns in the refresh that takes
+  the toast down. One shows at a time: the screen in front's own key (FontCheck, Loading, Previews, on the
+  screen that asked), then Book (every screen), then Import (the Library). The screen guard leaves it out of
+  its comparison (`app_overlay_rect`) and Live view's toast layer shows it when no toast does. Its texts are
+  its users': KOReader's book ("Adding book pages: %d of %d", made every 600 ms by `book_progress`) is its
+  first, so a long book no longer flashes the panel about every 18 s. Probes `notice`, `notice.key`.
+- **One name order, `store::name_cmp`.** `cmp_name`'s accent folding with `natural_cmp`'s digit runs
+  ("Álgebra 2" before "Álgebra 10"); equal so, the bytes decide, a total order. For the file browser, the
+  order of a PDF import and the font list. The Library's folders keep `cmp_name` and an import folder's
+  pictures `natural_cmp`.
+- **One storage layer, `fsview.rs`** (read-only so far; browser.md 8 and 9 in the 2.1 plan). The root is
+  `/mnt/us` on the Kindle (when Grimoire's folder is inside it), elsewhere `GRIMOIRE_STORAGE` (compiled out
+  of the Kindle build; never `/`). A `StoragePath` is a checked path relative to it, under 600 bytes, of
+  byte names. The walk opens each component with `openat(O_DIRECTORY|O_NOFOLLOW)` from the one before and
+  the file with `O_NOFOLLOW|O_NONBLOCK`, so a link anywhere fails and a FIFO never waits; each folder must be
+  on the root's device, and Grimoire's notebooks (for a pick also its PDFs and trash) are refused by `st_dev`
+  and `st_ino` whatever the case of the name. Zones by name in any case: the system's folders, dot-entries,
+  `*.sdr` and Grimoire's own refused; its import, templates, photos and fonts writable; the rest read-only.
+  `FsListing` reads names and `d_type` only, at most 5,000, in slices of at most 20 ms with the folder kept
+  open between ticks, links and refused entries left out; stats (`fstatat`, no link followed) only for the
+  rows asked, in slices. Free space: a big job leaves 100 MB; under 200 MB is "nearly full". The log has
+  counts and timings, never a name. Writes (trash, `renameat2(RENAME_NOREPLACE)`, the allow-list) come with
+  their first user.
+- **The Library reads each notebook.ini once.** `reload` lists the notebooks and takes their folders from
+  that list (`store_list_folders_from`), as the notebook picker and the share server's index do; it read
+  each twice (500 notebooks: 1,000 reads on FUSE at each enter).
+
+## Quick sizes (2.1, lane L1)
+
+A pen button on the toolbar held `HOLD_MS` (600 ms), with a finger or the nib, opens a card beside it
+(`quicksize.rs`, hosted by the editor like the long-press card): the tool's name and its width now, five chips
+of widths in millimetres, each with a short stroke of that tool's own brush at the view's zoom (no Pen feel chip:
+Pen feel stays in the tool picker and Settings); the eraser's card has rings in screen millimetres and a second row, Whole strokes / Precise. The buttons:
+a pinned pen, the eraser and the tool button while it shows a pen (not the grid, the lasso or the folded box).
+The hold makes that pen the pen in use as its tap would (Select mode ends; the eraser in use stays), and the
+lift after a hold never acts. The contact that opened the card (`Owner::QuickSize`, 22) may slide onto a chip
+and lift there once it has moved past the 30 px slop; a tap on a chip picks it; a pick closes the card. Outside,
+a finger closes it at the lift and the nib at its down (its stroke swallowed), the clock corner keeps its tap,
+Esc and Close menu close it, a turn or wake closes it silently. It counts as a sheet (`sheet_open`), and
+`editor_pen_not_ink` is true while it is up, so Live view's fast ink never previews a contact on it.
+
+A pick writes the tool's `size_max_mm` (the chip's width, `PRESETS`; the label) and `size_min_mm`, and nothing
+else: no page, no history step, no new key. The min is the chip's width times the tool's current min/max ratio,
+rounded to 0.01 and clamped to 0.10 .. the width (a constant-width tool stays min = max; a max that is 0 or not
+finite falls back to the tool's default ratio), so a pressure range tuned in Pen feel is kept; the other eleven
+fields are untouched. The rounding and the 0.10 floor mean a run of different picks can drift the min a little.
+The lit chip is the one whose width is `size_max_mm` within 0.005, whatever the min. The chips, full-pressure
+widths in mm, smallest first (pens: the ISO sqrt(2) pen-width series, each step about 1.4x; the mechanical
+pencil: lead sizes; the eraser: doubling, screen mm, 12 the format's largest); a tool's default max is always
+one of them (`tool_params_default`, brush.rs; `settings_version` 4 moves a pair still at its old default, FORMAT.md):
+
+| Tool | 1 | 2 | 3 | 4 | 5 |
+|---|---|---|---|---|---|
+| Pencil | 0.25 | 0.35 | 0.5 | 0.7 | 1.0 |
+| Mechanical pencil | 0.3 | 0.5 | 0.7 | 0.9 | 1.3 |
+| Charcoal | 0.5 | 0.7 | 1.0 | 1.4 | 2.0 |
+| Ballpoint | 0.25 | 0.35 | 0.5 | 0.7 | 1.0 |
+| Fineliner | 0.25 | 0.35 | 0.5 | 0.7 | 1.0 |
+| Marker | 0.7 | 1.0 | 1.4 | 2.0 | 2.8 |
+| Fountain pen | 0.5 | 0.7 | 1.0 | 1.4 | 2.0 |
+| Calligraphy pen | 1.0 | 1.4 | 2.0 | 2.8 | 4.0 |
+| Highlighter | 2.0 | 2.8 | 4.0 | 5.6 | 8.0 |
+| Eraser | 1 | 2 | 4 | 8 | 12 |
+
+ `settings_save`
+runs a pass of the loop after the card's close was presented (`qs_save`). White ink shares its pen's sizes (the
+samples are white on black). The first time Pen feel opens from the toolbar a toast says how to find the card
+(hints bit 9, FORMAT.md).
+
+Refreshes (no display call is added; MXCFB_WAIT_FOR_UPDATE_SUBMISSION is never involved):
+
+| Moment | Waveform | Rect |
+|---|---|---|
+| a pen button pressed | DU at once (`app_press_feedback`) | the button |
+| the hold reached: button let go, pen picked, card drawn | Ui, one present | the card with the button, or with the whole panel when the pen changed |
+| a chip entered while sliding, or pressed | DU at once | the chip |
+| a chip left while sliding | Ui (GL16 turns its black back to white exactly; a DU would leave issue #11's trace) | the chip |
+| picked, or closed | Ui | the card |
+| settings.ini written | none | |

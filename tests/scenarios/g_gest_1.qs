@@ -5,6 +5,8 @@
 # (g_gest_10_new_page has the default, which adds one).
 # settings: mirror_pdf=0
 # settings: gesture_new_page=0
+# (the clock corner held still: its minute's refresh would land among the counted ones)
+clock 1700000000
 wait 300
 tap 965 95
 wait 100
@@ -49,12 +51,12 @@ expect editor.page is 2
 swipe 2 600 1200 400 0
 expect touch.gesture is 2.right
 expect editor.page is 1
-# past the ends nothing is added: the toast says where it stopped
+# past the ends nothing is added, and nothing is said (the page stays)
 swipe 2 1300 1200 -400 0
 swipe 2 1300 1200 -400 0
 expect editor.page is 3
 swipe 2 1300 1200 -400 0
-expect toast is This is the last page.
+expect toast is
 expect editor.pages is 3
 expect editor.page is 3
 wait 1700
@@ -62,7 +64,7 @@ swipe 2 600 1200 400 0
 swipe 2 600 1200 400 0
 expect editor.page is 1
 swipe 2 600 1200 400 0
-expect toast is This is the first page.
+expect toast is
 expect editor.pages is 3
 expect editor.page is 1
 # the panel's + still adds a page, on the last one

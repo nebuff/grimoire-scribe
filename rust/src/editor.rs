@@ -17,9 +17,12 @@ use std::rc::Rc;
 // or once the pen has been gone this long.
 const SETTLE_NEAR_MS: u32 = 1500;
 const SETTLE_LEFT_MS: i32 = 150;
-// A finger held this long on a link (without moving) opens it to change or remove; a shorter tap
-// follows it.
-const LINK_HOLD_MS: u32 = 600;
+// The band of the page an erased stroke counts as toward DU wear (stroke_wear_area): its ink and the
+// paper right around it, about the height of a small handwritten letter.
+const WEAR_BAND_MM: f32 = 4.0;
+/// A pen that left proximity less than this before a finger came down still counts as in range for that
+/// finger: its hold arms no lasso (the writing hand, a grip thumb; select.rs sel_finger_arm).
+const FHOLD_PEN_MS: u32 = 500;
 // Migrated link areas wait this long after the first migration before links.ini is written (the idle
 // ticks migrate a page each, so the notebook's pages are saved once); a failed write is tried again
 // this long after.
@@ -28,23 +31,25 @@ const LINKS_FLUSH_MS: u32 = 2000;
 const LINK_BOX_MIN_MM: f32 = 5.0;
 // The lasso keeps at most this many points: past it every other point goes and the spacing a new point
 // needs doubles, so a long scribble around an area costs a bounded memory and compose.
+mod select;
+use select::*;
+use std::collections::HashSet;
+
 const LASSO_MAX: usize = 4096;
 /// The most targets kept for Link to...'s Recent targets (it offers four of them).
 const RECENT_MAX: usize = 8;
 
-// settings.hints' bits (docs/FORMAT.md): the one-time tips shown. Bits 5 and 7 are for later versions.
+// settings.hints' bits (docs/FORMAT.md): the one-time tips shown. Bits 2 (the link areas tip), 5 (the first
+// shape), 6 (the pan hint) and 8 (the sideways hint) were tips 2.0.0-beta.2 left out (the owner's toast pass,
+// 2026-11-04): no longer written, a settings.ini may still have them set.
 /// the first notebook that opened after the update said what two fingers up and down do now
 const HINT_FIRST_OPEN: i32 = 1 << 0;
 /// the first link made said that a finger's tap follows it and a hold opens its card
 const HINT_FIRST_LINK: i32 = 1 << 1;
-/// the eye was turned on: dotted boxes show where a finger tap follows a link
-const HINT_EYE: i32 = 1 << 2;
-/// two fingers dragged the page (a pan) while two fingers up and down are gestures
-const HINT_PAN: i32 = 1 << 6;
 /// the first unrecorded finger drawing faded away with its one-time explanation
 const HINT_FSHAPE: i32 = 1 << 7;
-/// the editor shows the whole page sideways now (landscape_fit), for an owner who had the width
-const HINT_SIDEWAYS: i32 = 1 << 8;
+/// the quick sizes tip was shown (Pen feel opened from the toolbar the first time), or the card was used (2.1)
+const HINT_QUICK_SIZE: i32 = 1 << 9;
 /// settings.hints' bits 3 and 4: how many times the Links bar showed its second header line (0 to 3)
 const HINT_BAR_SHIFT: i32 = 3;
 const HINT_BAR_MASK: i32 = 3;
@@ -88,6 +93,8 @@ const P_SHAPE_MIN: i32 = 64;
 const P_SHAPE_CORNER: i32 = 65;
 const P_SHAPE_DONE: i32 = 30;
 const P_SETTINGS: i32 = 31;
+/// the tool picker's Select (Select mode, select.rs)
+const P_PICK_SELECT: i32 = 66;
 
 /// Which input started the current gesture, and what it does.
 #[repr(i32)]
@@ -122,13 +129,20 @@ enum Owner {
     Map = 18,
     /// A bound side-button contact, swallowed without ink.
     PenDrag = 19,
+    /// Select mode: the pen drawing its lasso, a drag of the selection, its bar (select.rs)
+    Select = 20,
+    /// a pointer that began on the toolbar's count pad, or one let go while its batch was written
+    AddPad = 21,
+    /// the contact that opened the quick sizes card (a pen button held HOLD_MS), which may slide to a chip, or one
+    /// that began on the card (quicksize.rs)
+    QuickSize = 22,
 }
 
 /// The owner's name in grimoire.log and the `editor.owner` probe.
 fn owner_name(o: Owner) -> &'static str {
-    const K: [&str; 20] = [
+    const K: [&str; 23] = [
         "none", "draw", "erase", "panel", "modal", "display", "pages", "tools", "build", "templates", "link", "bar",
-        "outside", "find", "lasso", "card", "linkto", "strip", "map", "pen-drag",
+        "outside", "find", "lasso", "card", "linkto", "strip", "map", "pen-drag", "select", "add-pad", "quick-size",
     ];
     K[o as usize]
 }
@@ -241,13 +255,18 @@ struct LinkBoxes {
     /// its bar entry's number, from 1
     entry: [u8; LB_MAX],
     stale: bool,
+    /// the page's document links' exact areas, page px (the eye draws them dotted and unnumbered; no row of
+    /// the bar stands for one of them: they fold into its "From the PDF" row)
+    doc: Vec<Rect>,
     /// how many boxes the eye's last paint drew (the scripts' editor.eye_drawn: 0 when it painted none)
     drawn: usize,
+    /// how many document-link boxes it drew (editor.eye_docs)
+    doc_drawn: usize,
 }
 // (arrays derive Default only up to 32 elements: EditorState keeps its derive)
 impl Default for LinkBoxes {
     fn default() -> Self {
-        LinkBoxes { n: 0, link: [NavLink::default(); LB_MAX], area: [RECT_EMPTY; LB_MAX], entry: [0; LB_MAX], stale: true, drawn: 0 ,
+        LinkBoxes { n: 0, link: [NavLink::default(); LB_MAX], area: [RECT_EMPTY; LB_MAX], entry: [0; LB_MAX], stale: true, doc: Vec::new(), drawn: 0, doc_drawn: 0,
         }
     }
 }
@@ -310,7 +329,7 @@ struct SharedPaper {
 struct ShapeHold {
     anchor: (f32, f32), anchor_k: u32, still_fired: bool, burst: bool,
     preview: Option<ShapePreview>, last_lift: Option<PenSample>,
-    last_kind: ShapeKind, last_reason: ShapeReason, tip_pending: bool, kept: u32,
+    last_kind: ShapeKind, last_reason: ShapeReason, kept: u32,
 }
 struct ShapePreview { saved: Canvas, region: Rect, raw_n: usize, stroke: Box<Stroke> }
 
@@ -319,7 +338,9 @@ pub struct EditorState {
     /// when the open page's Pages preview was last made from its canvas (save_page), and whether the
     /// save under way is the idle autosave (which makes it at most every 30 s)
     preview_saved_ms: u32,
-    autosaving: bool,
+    /// The open page's file was written, and its preview or kept drawing is not made yet (or not made again):
+    /// editor_tick makes them at a quiet moment (caches_due). Never set while nothing can be made.
+    caches_pending: bool,
     /// The page canvas as it was before the step under way, a copy of it between steps (base_follow):
     /// what differs from it when a step ends is that step's patch (history.rs Patch), which undo and
     /// redo swap back. `base_page` is the page it mirrors (canvas_page's), 0 for none; `base_hold`
@@ -333,13 +354,30 @@ pub struct EditorState {
     /// the stroke eraser's tiles (MASK_TILE) drawn again, and those the boxes of what it took off
     /// cover (a probe, editor.erase_tiles)
     erase_tiles: (u32, u32),
-    /// the open page (its id) and how long its last whole drawing took, ms (KEEP_RENDER_MS when it came
-    /// from its kept drawing): a page this slow keeps its drawing at each save
+    /// the open page (its id) and how long its last whole drawing took, ms (u32::MAX when it came from its
+    /// kept drawing): a page that took store_keep_render_ms() or longer keeps its drawing at each save
     full_ms: (u32, u32),
     /// whether the open page came up from its kept drawing (a probe, editor.page_kept)
     page_kept: bool,
+    /// how many times "Loading page..." went up before a slow page was drawn (a probe, editor.loading_toasts)
+    loading_toasts: u32,
+    /// how many times "Adding N pages..." reached the panel before a batch of new pages was written, or a
+    /// batch's Redo wrote them again (a probe, editor.add_notices)
+    add_notices: u32,
+    /// Select mode (select.rs), and the last lasso move's or paste's times, ms (old place, new place)
+    sel: SelMode,
+    last_lasso_ms: (u32, u32),
     map: MapView,
     map_kb: Keyboard,
+    /// The toolbar's count pad (owner, 2026-11-03): the + (next page on the last page) held, or clicked with a
+    /// modifier key, or the new-pages action: how many blank pages to add after the open page, which stays.
+    add_kb: Keyboard,
+    /// when the toolbar's batch was written (now_ms): a contact that came down by then is let go to its lift,
+    /// as the Pages view's quiet_until (it was aimed at the pad, never at the page); cleared by the next one
+    add_quiet_until: Option<u32>,
+    /// the sample time (in_sample_ms) of the panel press under way: the + held that long at its lift (the
+    /// tick may not have seen it yet) opens the count pad
+    panel_down_k: u32,
     map_rename_pid: u32,
     sh: ShapeHold,
     open: bool,
@@ -382,6 +420,8 @@ pub struct EditorState {
 
     /// the C's hist, nhist
     hist: Vec<PageHistory>,
+    /// the drawings of pages left this session (PageView): turned back to, they are not drawn again
+    page_views: Vec<PageView>,
 
     // Pointer ownership: which input started the current gesture and what it does.
     owner: Owner,
@@ -433,6 +473,8 @@ pub struct EditorState {
     grab_dx: f32,
     grab_dy: f32,
     drag_start_rect: Rect,
+    /// every place a panel drag drew the panel by fast refreshes (screen px): its release cleans all of it
+    drag_trail: Rect,
     last_drag_paint: u32,
     hits: HitList,
     /// every button the expanded panel draws, greyed out ones too: what panel_tile_hit tiles
@@ -475,8 +517,6 @@ pub struct EditorState {
     /// the two fingers are a session touchgest classified (PinchBegin.value 1): its moves say zoom (1),
     /// pan (2) or swipe (3); the legacy pinch (the runner's `pinch`) decides itself
     pinch_classified: bool,
-    /// a classified pan moved the page this session: the pan hint is due when it ends
-    pinch_panned: bool,
     /// The pages the open notebook was left from by a link, the Pages view or Find, newest last, at most
     /// BACK_MAX (page ids): Back to the page before pops it. Memory only; a page turn does not push.
     back: Vec<u32>,
@@ -500,6 +540,12 @@ pub struct EditorState {
     lt: LinkBar,
     /// the long-press card (linkcard.rs): a link held on the page, or a row held on the bar
     card: LinkCard,
+    /// the quick sizes card (quicksize.rs): a pen button on the toolbar held HOLD_MS
+    qs: QuickSize,
+    /// a size picked, a pen the hold made the pen in use, or the tip's bit is not in settings.ini yet: 1 when it
+    /// was asked for, 2 once a pass of the loop has presented the screen (editor_tick writes it then, so the
+    /// card's close never waits for the storage)
+    qs_save: u8,
     /// the targets ("p<page id>") links were made to this session, newest last, at most RECENT_MAX: Link to...'s
     /// Recent targets. Memory only; the notebook's closing clears it.
     recent: Vec<FixedStr<NAV_TARGET_LEN>>,
@@ -535,19 +581,38 @@ pub struct EditorState {
     /// the Pages view (pagesview.h)
     pv: PagesView,
     destination: NotebookPicker,
-    notebook_back: Vec<(FixedStr<STORE_ID_LEN>,u32)>,
+    /// the pages Copy to notebook... copies (ids, in notebook order) while its notebook picker is up
+    copy_pids: Vec<u32>,
+    /// the notebooks a link was followed out of, newest last: Back returns to each one's page and view
+    notebook_back: Vec<NotebookBack>,
+    /// opened from the Graph the Library shows (2.0.0-beta.2): Back with nothing before it, and the Library
+    /// button, go back to that Graph (library_return_to_graph); kept across links into other notebooks
+    from_graph: bool,
     requested_page: Option<u32>,
     previews_checked: u32,
+    // whether a previews batch of the notebook whose previews show was queued or running at the last tick
+    previews_pending: bool,
     nav: Nav,
+    /// the links the document brought (doclinks.ini, 2.1): read at open, written only by Copy page and Copy to
+    /// notebook; never part of `nav` (links.ini's caps, the lasso and Clear page never see them)
+    dl: DocLinks,
     // Links (nav.h). Add a link (the Index, or the add-link shortcut) shows the strip, and the next pen
     // contact on the open page draws the dashed lasso around the link's area (lm), never ink; then Link
-    // to... picks where it goes. A finger's tap on a link follows it; one held on it (LINK_HOLD_MS) shows
-    // its border and the long-press card beside it (card), over the page.
+    // to... picks where it goes. A finger's tap on a link follows it; one held on it (HOLD_MS) shows
+    // its border and the long-press card beside it (card), over the page. Held anywhere else on the page,
+    // it arms the finger lasso (select.rs sel_finger_arm).
     lm: LinkMaking,
     /// a finger on the page (OWN_LINK)
     link_press: Press,
     link_down_at: u32,
     link_held: bool,
+    /// that finger's down ended a selection (a tap outside it, design 6.1): its tap and its swipe do nothing
+    /// more; its hold is a hold as anywhere
+    link_quiet: bool,
+    /// that finger's hold arms no lasso (no surprises: a palm or a grip thumb never selects or pastes): the
+    /// pen was in range (or left under FHOLD_PEN_MS before), or did anything since the down, or the panel
+    /// called the contact broad (TOUCH_F_BROAD)
+    link_spoiled: bool,
 
     // One-finger capture (phase 3): the path is integer-only and lives beside, never on, page_canvas.
     fs: FsStroke,
@@ -614,6 +679,92 @@ fn ed_ref(a: &App) -> &EditorState {
 /// pointers (canvas_page). Compared, never dereferenced.
 fn page_ref(p: &Page) -> usize {
     p as *const Page as usize
+}
+
+/// The whole drawing of a page left this session, kept in memory: a page turned back to shows it rather
+/// than drawing every stroke again (seconds on a dense page). `stamp` is the page file's identity when
+/// it was drawn (store_page_source_identity): a page written since is drawn again. `ms` is how long its
+/// last whole drawing took (full_ms), so a slow page still keeps its drawing on disk when it is left.
+struct PageView {
+    pid: u32,
+    stamp: String,
+    ms: u32,
+    canvas: Canvas,
+}
+/// The pages left this session whose drawings are kept in memory (4.6 MB each at the Scribe's page
+/// size): the three newest, so turning back a page or two is instant.
+const PAGE_VIEWS_MAX: usize = 3;
+/// PAGE_VIEWS_MAX, or what a scenario asks for: the simulator takes GRIMOIRE_PAGE_VIEWS (0 keeps none, so a
+/// scenario of the kept drawing on disk reaches the disk on a revisit, as on a page left in another session).
+fn page_views_max() -> usize {
+    #[cfg(feature = "sim")]
+    if let Some(n) = std::env::var("GRIMOIRE_PAGE_VIEWS").ok().and_then(|v| v.parse().ok()) {
+        return n;
+    }
+    PAGE_VIEWS_MAX
+}
+
+/// Puts the open page's drawing aside in memory, when its canvas is whole and the page is its file.
+/// `keep` is the page about to be shown: when every slot is taken, its drawing is not the one dropped
+/// (a jump to the oldest kept page would otherwise evict it just before page_view_load reads it).
+fn page_view_stash(s: &mut EditorState, keep: u32) {
+    let max = page_views_max();
+    if max == 0 {
+        return;
+    }
+    if s.page_canvas.px.is_empty() || s.canvas_page != s.open_page_ref() || s.picture_missing || s.page_dirty {
+        return;
+    }
+    let pid = s.open_pid();
+    if pid == 0 {
+        return;
+    }
+    let Some(stamp) = store_page_source_identity(&s.nb, pid) else { return };
+    // The page is already kept as it is (turned back to, then away again): no copy of it again.
+    if s.page_views.iter().any(|v| {
+        v.pid == pid && v.stamp == stamp && v.canvas.w == s.page_canvas.w && v.canvas.h == s.page_canvas.h
+            && v.canvas.px.len() == s.page_canvas.px.len()
+    }) {
+        return;
+    }
+    let mut canvas = Canvas::default();
+    if canvas_init(&mut canvas, s.page_canvas.w, s.page_canvas.h) != 0 {
+        return;
+    }
+    canvas.px.copy_from_slice(&s.page_canvas.px);
+    canvas.clip = s.page_canvas.clip;
+    let ms = if s.full_ms.0 == pid { s.full_ms.1 } else { 0 };
+    s.page_views.retain(|v| v.pid != pid);
+    while s.page_views.len() >= max {
+        let i = s.page_views.iter().position(|v| v.pid != keep).unwrap_or(0);
+        let mut old = s.page_views.remove(i);
+        canvas_free(&mut old.canvas);
+    }
+    s.page_views.push(PageView { pid, stamp, ms, canvas });
+}
+
+/// The drawing page pid was left with this session, copied into the page canvas, when the page file is
+/// still the one drawn: how long that drawing took, ms (full_ms), or None when there is none.
+fn page_view_load(s: &mut EditorState, pid: u32) -> Option<u32> {
+    let stamp = store_page_source_identity(&s.nb, pid)?;
+    let i = s.page_views.iter().position(|v| {
+        v.pid == pid && v.stamp == stamp && v.canvas.w == s.page_canvas.w && v.canvas.h == s.page_canvas.h
+            && v.canvas.px.len() == s.page_canvas.px.len()
+    })?;
+    s.page_canvas.px.copy_from_slice(&s.page_views[i].canvas.px);
+    let ms = s.page_views[i].ms;
+    if i + 1 != s.page_views.len() {
+        let v = s.page_views.remove(i);
+        s.page_views.push(v);
+    }
+    Some(ms)
+}
+
+/// Forgets every drawing kept in memory (the page size changed, or the notebook closed).
+fn page_views_clear(s: &mut EditorState) {
+    for mut v in s.page_views.drain(..) {
+        canvas_free(&mut v.canvas);
+    }
 }
 
 impl EditorState {
@@ -712,13 +863,14 @@ fn map_draw(a: &mut App, r: Rect) {
         ed(a).map_kb = kb;
     }
 }
+// The Graph opens on every notebook (past the Graph of all notebooks' caps, on this one, and says so).
 fn map_show(a: &mut App, around: bool) {
     app_toast(a,"",0);
     close_sheets(ed(a));
     pagesview_close(&mut ed(a).pv);
     link_off(a);
     let pid = ed_ref(a).open_pid();
-    let ok = with_map(a, |map, a, nb, nav| mapview_open(map, a, nb, nav, pid, around));
+    let ok = with_map(a, |map, a, nb, nav| mapview_open_scoped(map, a, nb, nav, pid, around, None));
     if !ok {
         mapview_close(&mut ed(a).map);
         pages_show(a);
@@ -735,9 +887,17 @@ fn map_hide(a: &mut App, draw: bool) {
     }
     touch_context(a);
 }
+// How often the tick looks for previews while a batch of the notebook shown is being made: each tile is drawn
+// as its preview lands (the job tells of each one), so a group of them that land together shows in one refresh.
+const PREVIEWS_POLL_MS: u32 = 100;
+// ...and while none is: previews written otherwise (the open page's, at an idle save) show within this.
+const PREVIEWS_IDLE_POLL_MS: u32 = 500;
+
+/// A previews batch ended: the tiles it made are drawn (those that landed since the last look), and those it
+/// could not make lose their loading mark.
 pub fn editor_previews_done(a:&mut App,id:&str) {
     if a.scr==ScreenId::Editor && a.ed.as_deref().is_some_and(|s|(s.pv.open&&s.nb.id==id)
-        ||(s.destination.open&&s.destination.selected.as_ref().is_some_and(|nb|nb.id==id))) {previews_repaint(a);}
+        ||(s.destination.open&&s.destination.selected.as_ref().is_some_and(|nb|nb.id==id))) {previews_repaint(a,true);}
 }
 
 // The notebook whose page previews show (the Pages view's, or the destination picker's pages), and the
@@ -747,18 +907,35 @@ fn previews_shown(s:&EditorState)->Option<(FixedStr<STORE_ID_LEN>,u64)> {
     s.pv.open.then(||(s.nb.id,pagesview_previews_generation(&s.pv)))
 }
 
-// New previews were written (the tick saw them, or their job ended): only the tiles are drawn again, in
-// a GL16 of the grid, and never twice for the same previews.
-fn previews_repaint(a:&mut App) {
+// New previews were written (the tick saw them), or a batch ended (`ended`): only the tiles that show something
+// else now are drawn again, in one GL16 of them, and never twice for the same previews.
+fn previews_repaint(a:&mut App,ended:bool) {
+    // (the Find sheet over the Pages view: its tiles are drawn as it closes)
+    if !ed_ref(a).destination.open && ed_ref(a).find.open {return;}
     let Some((id,drawn))=previews_shown(ed_ref(a)) else{return};
-    if store_page_previews_generation(id.as_str())==drawn {return;}
+    if !ended && store_page_previews_generation(id.as_str())==drawn {return;}
     let r=if ed_ref(a).destination.open {with_modal(a,|s|&mut s.destination,|p,a|p.repaint_pages(a))}
         else {with_pv(a,pagesview_repaint_tiles)};
     if !rect_is_empty(r) {app_invalidate(a,r,RefreshMode::Ui);}
 }
 pub fn editor_map_done(a: &mut App,id:&str, ok: bool) {
+    if crate::library::library_map_done(a, id, ok) {
+        return; // (the Library's Graph)
+    }
     if let Some(s) = a.ed.as_deref_mut() {
         mapview_background_done(&mut s.map,id, ok);
+    }
+}
+/// The Graph of all notebooks' layout child ended.
+pub fn editor_map_all_done(a: &mut App, ok: bool) {
+    if crate::library::library_map_all_done(a, ok) {
+        return; // (the Library's Graph)
+    }
+    match a.ed.as_deref_mut() {
+        Some(s) => mapview_all_background_done(&mut s.map, ok),
+        // (no editor, no Graph: the graph-all.ini kept in memory is what the child wrote over)
+        None if ok => mapview_forget_all_ini(),
+        None => {}
     }
 }
 fn map_result(a: &mut App, result: MapResult) {
@@ -774,6 +951,19 @@ fn map_result(a: &mut App, result: MapResult) {
             }
         }
         MapResult::Target(target) => {map_hide(a,false);if !follow_target(a,target.as_str()){compose_all(a,RefreshMode::Full);}}
+        MapResult::Repair(pid, seed) => {
+            // A broken link's anchor: the page with the link, and its card (Change where it goes, Delete link).
+            let to = ed_ref(a).nb.page_ids.iter().position(|&p| p == pid);
+            map_hide(a, false);
+            match to {
+                Some(i) if i as i32 == ed_ref(a).index || go_to_page_pushing(a, i as i32) => {
+                    if ed_ref(a).index != i as i32 {return;}
+                    compose_all(a, RefreshMode::Full);
+                    if ed_ref(a).nav.links_writable && nav_link_get(&ed_ref(a).nav, pid, seed).is_some() {card_show(a, &[seed]);}
+                }
+                _ => compose_all(a, RefreshMode::Full),
+            }
+        }
         MapResult::Pages => {map_hide(a,false);pages_show(a);}
         MapResult::List => {map_hide(a,false);map_show(a,false);with_map(a,|map,a,_,nav|mapview_set_list(map,a,nav));}
         MapResult::Rename(pid) => {
@@ -805,13 +995,12 @@ fn map_pointer(a: &mut App, phase: i32, ev: &InEvent) {
                 if nav_set_name(&mut s.nav, pid, text.as_str().trim()) == 0 && nav_save(s.nb.id.as_str(), &mut s.nav, &s.nb) == 0 {
                     s.changed = true;
                     let open = s.open_pid();
-                    let number = s.nb.page_ids.iter().position(|&p| p == pid).map_or(0, |i| i + 1);
+                    // (the node shows its new name: no toast, the owner, 2026-11-04; one left up from before goes)
                     with_map(a, |map, a, nb, nav| mapview_rebuild(map, a, nb, nav, open));
-                    let msg = cformat!(tr("Page %d is named %s."), number as i32, text.as_str().trim());
-                    app_toast(a, &msg, 2500);
+                    app_toast_dismiss(a);
                 } else {
                     nav_load(s.nb.id.as_str(), &mut s.nav);
-                    app_toast(a, tr("Could not save the page name."), 3000);
+                    app_toast(a, tr("Couldn't save page name."), 3000);
                 }
             }
             compose_all(a, RefreshMode::Ui);
@@ -850,6 +1039,14 @@ fn with_lt<R>(a: &mut App, f: impl FnOnce(&mut LinkBar, &mut App, &NotebookInfo,
     s.lt = lt;
     s.nb = nb;
     s.nav = nav;
+    r
+}
+
+// The same for the quick sizes card (it needs the App alone).
+fn with_qs<R>(a: &mut App, f: impl FnOnce(&mut QuickSize, &mut App) -> R) -> R {
+    let mut q = std::mem::take(&mut ed(a).qs);
+    let r = f(&mut q, a);
+    ed(a).qs = q;
     r
 }
 
@@ -1069,6 +1266,8 @@ fn eraser_back(st: &Settings) -> ToolKind {
 // What the tool button showed as the panel was last drawn (editor.tool_button): its pen, or these.
 const TB_GRID: i32 = -1;
 const TB_NONE: i32 = -2;
+/// Select mode is on: the tool button shows the lasso, selected (no pen is the one in use while it is).
+const TB_SELECT: i32 = -3;
 
 // While the drawing tools draw white ink, the pen in use shows its icon hollow: white on white
 // paper shows nothing, and without a mark the pen would seem broken.
@@ -1079,7 +1278,9 @@ fn draws_white(st: &Settings, t: ToolKind) -> bool {
 // A pen's button on the panel (the tool button's, or a pinned one's), selected while it is the pen
 // in use, hollow while that draws white.
 fn draw_pen_button(c: &mut Canvas, st: &Settings, s: &mut EditorState, r: Rect, t: ToolKind) {
-    if draws_white(st, t) {
+    if s.sel.state != SelState::Off {
+        ui_button(c, r, ui_tool_icon(t.0), "", ButtonStyle::Plain);
+    } else if draws_white(st, t) {
         ui_button_hollow(c, r, ui_tool_icon(t.0), ButtonStyle::Selected);
         s.white_mark = true;
     } else {
@@ -1100,7 +1301,9 @@ fn draw_panel(a: &mut App) {
         ui_frame(c, p, ui_px(22.0), 0, false, ui_px(6.0));
         let mut ir = rect_inflate(p, -ui_px(20.0));
         ir.h -= ui_px(12.0);
-        if draws_white(st, st.current_tool) {
+        if s.sel.state != SelState::Off {
+            ui_icon(c, IconKind::Lasso, ir, 0);
+        } else if draws_white(st, st.current_tool) {
             ui_icon_hollow(c, ui_tool_icon(st.current_tool.0), ir, 0, 255);
             s.white_mark = true;
         } else {
@@ -1144,7 +1347,14 @@ fn draw_panel(a: &mut App) {
     let dt_sel = !dt_pinned && st.current_tool == dt;
     let rt = Rect { x, y, w, h: btn_h() ,
     };
-    if dt_pinned {
+    // (Select mode on: the tool button shows the lasso, selected, so the panel says the pen draws a lasso;
+    // a tap still opens the picker, where a pen leaves Select mode)
+    let selecting = s.sel.state != SelState::Off;
+    let dt_sel = dt_sel && !selecting;
+    if selecting {
+        ui_button(c, rt, IconKind::Lasso, "", ButtonStyle::Selected);
+        s.tool_button_shows = TB_SELECT;
+    } else if dt_pinned {
         ui_button(c, rt, IconKind::Grid, "", ButtonStyle::Plain);
         s.tool_button_shows = TB_GRID;
     } else {
@@ -1152,13 +1362,13 @@ fn draw_panel(a: &mut App) {
         s.tool_button_shows = dt.0;
     }
     // A small corner mark says "more tools here" (the grid says it by itself).
-    if !dt_pinned {
+    if !dt_pinned || selecting {
         canvas_disc_aa(
             c,
             (rt.x + rt.w - ui_px(16.0)) as f32,
             (rt.y + rt.h - ui_px(16.0)) as f32,
             ui_px(7.0) as f32,
-            if dt_sel { 255 } else { 0 },
+            if dt_sel || selecting { 255 } else { 0 },
             1.0,
         );
     }
@@ -1176,7 +1386,7 @@ fn draw_panel(a: &mut App) {
     }
     let re = Rect { x, y, w, h: btn_h() ,
     };
-    ui_button(c, re, IconKind::Eraser, "", tool_style(st, TOOL_ERASER));
+    ui_button(c, re, IconKind::Eraser, "", if selecting { ButtonStyle::Plain } else { tool_style(st, TOOL_ERASER) });
     hits_add(&mut s.hits, re, P_TOOL, TOOL_ERASER.0);
     s.panel_cells.push(re);
     y += btn_h() + gap();
@@ -1341,7 +1551,7 @@ pub fn editor_panel_point(a: &mut App, name: &str) -> Option<(f32, f32)> {
     if a.scr != ScreenId::Editor || !s.open {
         return None;
     }
-    if name=="map.current" {return mapview_node_point(&s.map,s.open_pid());}
+    if name=="map.current" {return mapview_node_point(&s.map,&s.open_pid().to_string());}
     if let Some(n)=name.strip_prefix("map."){return mapview_control_point(&s.map,n);}
     if name.starts_with("music."){return musicbuild_control_point(&s.mb,name);}
     // The Paper sheet's tiles and buttons: paper.<kind number>, paper.custom, paper.more, paper.photos,
@@ -1353,13 +1563,23 @@ pub fn editor_panel_point(a: &mut App, name: &str) -> Option<(f32, f32)> {
         return s.modal_hits.h.iter().find(|h|h.id==id&&arg.is_none_or(|v|h.arg==v)).map(|h|((h.r.x+h.r.w/2) as f32,(h.r.y+h.r.h/2) as f32));
     }
     if let Some(n)=name.strip_prefix("pages."){return pagesview_control_point(&s.pv,n);}
+    // The toolbar's count pad's keys while it is up: addpad.key.0 to addpad.key.9, .done, .del, .cancel, .dec, .inc.
+    if let Some(k)=name.strip_prefix("addpad.key.") {
+        if !s.add_kb.open {return None;}
+        let code=match k {"done"=>KB_KEY_DONE,"del"=>KB_KEY_BKSP,"cancel"=>KB_KEY_CANCEL,"dec"=>KB_KEY_DEC,"inc"=>KB_KEY_INC,c if c.chars().count()==1=>c.chars().next()? as u32,_=>return None};
+        let mut r=RECT_EMPTY;
+        return keyboard_key_rect(&s.add_kb,code,&mut r).then(||((r.x+r.w/2) as f32,(r.y+r.h/2) as f32));
+    }
+    if let Some(n)=name.strip_prefix("quicksize."){return quicksize_control_point(&s.qs,n);}
     if let Some(n)=name.strip_prefix("display."){return dispmenu_control_point(&s.dm,n);}
     if name=="elsewhere.current" {return s.destination.point(&format!("book.{}",s.nb.id));}
     if let Some(n)=name.strip_prefix("elsewhere."){return s.destination.point(n);}
+    if let Some(control)=name.strip_prefix("select."){return sel_control_point(s,control);}
     if let Some(control)=name.strip_prefix("bar."){return linkbar_control_point(&s.lb,control);}
     if let Some(control)=name.strip_prefix("linkto."){return linkbar_control_point(&s.lt,control);}
     if s.tools_open {
         let target=if name=="picker.pin-mode" {Some((P_PIN_MODE,0))}
+            else if name=="picker.select" {Some((P_PICK_SELECT,0))}
             else if let Some(control)=name.strip_prefix("shapes.") {
                 match control {"on"=>Some((P_SHAPES,0)),"hold"=>Some((P_SHAPE_HOLD,0)),"quads"=>Some((P_SHAPE_QUADS,0)),
                     "round"=>Some((P_SHAPE_ROUND,0)),"links"=>Some((P_SHAPE_LINKS,0)),"min"=>Some((P_SHAPE_MIN,0)),"corner"=>Some((P_SHAPE_CORNER,0)),"done"=>Some((P_SHAPE_DONE,0)),_=>None}
@@ -1558,12 +1778,6 @@ pub fn editor_status_changed(a: &mut App) {
     } else if let Some(s) = a.ed.as_deref_mut() { s.view_w = 0; }
 }
 
-/// A read-only live preview of the corner while adjusting it in Display.
-pub fn editor_status_preview(a:&App)->bool {
-    if crate::library::library_status_preview(a) {return true;}
-    a.scr==ScreenId::Editor && !crate::library::library_settings_active(a)
-        && a.ed.as_deref().is_some_and(|s|s.open && s.dm.open)
-}
 
 // ---- view ----
 
@@ -1572,6 +1786,12 @@ fn view_identity(a: &App) -> bool {
     s.zoom == 1.0 && s.ox == 0.0 && s.oy == 0.0 && s.pgw == a.w && s.pgh == a.h
 }
 
+// Whether the view (the zoom and its offsets) moved from `was`, by more than rounding: a zoom step at the most zoom
+// or the least, or a scroll at the end of the first or the last page, leaves it where it was, and draws nothing (so
+// a finger shape bound to it says nothing either, fs_fire).
+fn view_moved(s: &EditorState, was: (f32, f32, f32)) -> bool {
+    (s.zoom - was.0).abs() > was.0 * 1e-5 || (s.ox - was.1).abs() > 0.01 || (s.oy - was.2).abs() > 0.01
+}
 fn view_clamp(a: &mut App) {
     let top = status_reserved(a);
     let (aw, ah) = (a.w, a.h - top);
@@ -1613,17 +1833,18 @@ fn touch_context(a: &App) {
     }
     let Some(s) = a.ed.as_deref() else { return };
     let pans = s.open && !sheet_open(s);
-    let keyboard_open = s.map_kb.open || s.pv.kb.open || s.find.open || s.lm.kb.open || s.card.kb.open;
+    let keyboard_open = s.map_kb.open || s.pv.kb.open || s.find.open || s.lm.kb.open || s.card.kb.open || s.add_kb.open;
     // The pen's hand rests on the page alone: nothing over it, and never on its panel or the strip.
     let ink = pans && a.scr == ScreenId::Editor && !keyboard_open && matches!(s.lm.state, LmState::Off | LmState::Armed | LmState::Lasso);
     let strip = if matches!(s.lm.state, LmState::Armed | LmState::Lasso) { s.lm.strip } else { RECT_EMPTY };
-    let keys = [&s.map_kb, &s.pv.kb, &s.find.kb, &s.lm.kb, &s.card.kb].into_iter().find(|k| k.open).map_or(RECT_EMPTY, |k| k.area);
+    let keys = [&s.map_kb, &s.pv.kb, &s.find.kb, &s.lm.kb, &s.card.kb, &s.add_kb].into_iter().find(|k| k.open).map_or(RECT_EMPTY, |k| k.area);
     input_touch_context(TgView {
         scrolls_v: pans && (a.h - status_reserved(a)) as f32 / s.zoom < s.pgh as f32 - 0.5,
         scrolls_h: pans && a.w as f32 / s.zoom < s.pgw as f32 - 0.5,
         zoom_ok: a.settings.pinch_zoom
             && !s.map_kb.open
-            && !(s.paper_open || s.mb.open || s.ts.open || s.lb.open || s.find.open || s.lt.open || s.card.open),
+            && !s.add_kb.open
+            && !(s.paper_open || s.mb.open || s.ts.open || s.lb.open || s.find.open || s.lt.open || s.card.open || s.qs.open),
         gestures_on: a.settings.gestures,
         record: false,
         keyboard_open,
@@ -1682,25 +1903,6 @@ pub fn editor_fit_changed(a: &mut App, in_editor: bool) {
         }
     } else {
         ed(a).view_w = 0;
-    }
-}
-
-/// The toast that says what flipping landscape_fit did (2500 ms): the new setting sideways, and upright
-/// where it applies to a later turn only.
-pub fn editor_fit_toast(a: &mut App) {
-    if a.w <= a.h {
-        // TRANSLATORS: a toast (about 1700 px at 44 px in bold, or two lines): the Display sheet's
-        // "Sideways, show the whole page" was changed with the Kindle upright, where it makes no
-        // difference yet.
-        app_toast(a, tr("Applies when the Kindle is sideways."), 2500);
-    } else if a.settings.landscape_fit {
-        // TRANSLATORS: a toast (about 1700 px at 44 px in bold, or two lines): the editor now shows
-        // the whole page when the Kindle is turned sideways.
-        app_toast(a, tr("Sideways shows the whole page."), 2500);
-    } else {
-        // TRANSLATORS: a toast (about 1700 px at 44 px in bold, or two lines): the editor now fills the
-        // width with the page when the Kindle is turned sideways.
-        app_toast(a, tr("Sideways fills the width."), 2500);
     }
 }
 
@@ -1907,6 +2109,20 @@ fn draw_tools(a: &mut App) {
         0,
     );
     hits_add(&mut s.tools_hits, hb, P_PIN_MODE, 0);
+    // Select (Select mode: the lasso), left of Pin while the pens are not being pinned.
+    let mut title_end = hb.x;
+    if !s.pin_mode {
+        // TRANSLATORS: the tool picker's button beside Pin that starts Select mode (the lasso that selects
+        // ink to copy, cut, paste or move); 116 px at 34 px, the button widens for a longer word.
+        let sel = c_("panel", "Select");
+        let sw = clampi(lx + font_measure(FontFace::Caps, hs, sel) + pad, ui_px(210.0), w / 3);
+        let sb = Rect { x: hb.x - ui_px(16.0) - sw, y: hb.y, w: sw, h: hh };
+        ui_button(c, sb, IconKind::None, "", ButtonStyle::Plain);
+        ui_icon(c, IconKind::Lasso, Rect { x: sb.x + ui_px(14.0), y: sb.y + (hh - hi) / 2, w: hi, h: hi }, 0);
+        ui_text(c, FontFace::Caps, hs, hs, Rect { x: sb.x + lx, y: sb.y, w: sb.w - lx - pad, h: hh }, sel, 1, true, 0);
+        hits_add(&mut s.tools_hits, sb, P_PICK_SELECT, 0);
+        title_end = sb.x;
+    }
     let mut title = String::new();
     if s.pin_mode {
         // TRANSLATORS: the tool picker's title while it chooses the pens pinned to the toolbar under the
@@ -1922,7 +2138,7 @@ fn draw_tools(a: &mut App) {
         FontFace::Bold,
         ui_text_size(),
         ui_small_size(),
-        Rect { x: x + ui_px(30.0), y, w: hb.x - x - ui_px(50.0), h: ui_px(100.0) ,
+        Rect { x: x + ui_px(30.0), y, w: title_end - x - ui_px(50.0), h: ui_px(100.0) ,
         },
         &title,
         2,
@@ -2084,6 +2300,10 @@ fn boxes_get(a: &mut App) {
     s.boxes.stale = false;
     s.boxes.n = 0;
     let pid = s.open_pid();
+    s.boxes.doc = match s.open_page() {
+        Some(page) if pid != 0 => doclinks_boxes(&s.dl, page, pid),
+        _ => Vec::new(),
+    };
     let mut links = [NavLink::default(); LB_MAX];
     let mut areas = [RECT_EMPTY; LB_MAX];
     // (exactly link_under's minimum: the eye promises what nav_link_at hits)
@@ -2139,17 +2359,19 @@ fn draw_areas(a: &mut App, r: Rect) {
         return;
     }
     // A peek is display-only: outline its links at its own viewport without committing it.
-    let (links,areas,n,zoom,ox,oy)=if ed_ref(a).peek.active {
+    let (links,areas,n,zoom,ox,oy,docs)=if ed_ref(a).peek.active {
         let s=ed_ref(a);let pk=s.peek;
         let mut links=[NavLink::default();LB_MAX];let mut areas=[RECT_EMPTY;LB_MAX];
         let page=s.hist.iter().find(|h|h.page_id==pk.pid).and_then(|h|h.page.as_deref()).or(s.ccache[pk.slot].page.as_deref());
         let n=page.map_or(0,|p|nav_link_areas(&s.nav,p,pk.pid,NAV_LINK_MIN_MM*a.dpi/25.4,&mut links,&mut areas)as usize);
+        let docs=page.map_or_else(Vec::new,|p|doclinks_boxes(&s.dl,p,pk.pid));
         let top=status_reserved(a);let (zoom,ox,oy)=peek_view(a.w,a.h-top,s.pgw,s.pgh,a.settings.landscape_fit||top>0);
-        (links,areas,n,zoom,ox,oy-top as f32/zoom)
+        (links,areas,n,zoom,ox,oy-top as f32/zoom,docs)
     } else {
-        boxes_get(a);let s=ed_ref(a);(s.boxes.link,s.boxes.area,s.boxes.n,s.zoom,s.ox,s.oy)
+        boxes_get(a);let s=ed_ref(a);(s.boxes.link,s.boxes.area,s.boxes.n,s.zoom,s.ox,s.oy,s.boxes.doc.clone())
     };
     ed(a).boxes.drawn = n;
+    ed(a).boxes.doc_drawn = docs.len();
     let (thick, halo) = (link_band(), ui_px(1.0));
     let clip = a.screen.clip;
     canvas_set_clip(&mut a.screen, r);
@@ -2164,6 +2386,15 @@ fn draw_areas(a: &mut App, r: Rect) {
         if links[i].outline.n>0 {draw_outline(&mut a.screen,links[i].outline,links[i].area,p,(zoom,ox,oy));}
         else {canvas_dither_rect(&mut a.screen,sr,thick,halo);}
     }
+    // The document links' boxes: dotted (a thinner band than the user's), unnumbered, only where r is.
+    let thin=(thick/2).max(2);
+    for p in docs {
+        let x0=((p.x as f32-ox)*zoom).round()as i32;let y0=((p.y as f32-oy)*zoom).round()as i32;
+        let x1=(((p.x+p.w)as f32-ox)*zoom).round()as i32;let y1=(((p.y+p.h)as f32-oy)*zoom).round()as i32;
+        let sr=Rect::new(x0,y0,(x1-x0).max(1),(y1-y0).max(1));
+        if !rect_overlaps(r,rect_inflate(sr,thin/2+ui_px(1.0)+1)) {continue;}
+        canvas_dither_rect(&mut a.screen,sr,thin.min((sr.w.min(sr.h)/2).max(1)),halo);
+    }
     a.screen.clip = clip;
 }
 
@@ -2176,6 +2407,11 @@ fn eye_bounds(a: &mut App) -> Rect {
         let sr = box_screen(s, s.boxes.area[i]);
         u = rect_union(u, eye_reach(a, sr));
     }
+    for i in 0..ed_ref(a).boxes.doc.len() {
+        let s = ed_ref(a);
+        let sr = box_screen(s, s.boxes.doc[i]);
+        u = rect_union(u, eye_reach(a, sr));
+    }
     rect_intersect(u, Rect { x: 0, y: 0, w: a.w, h: a.h ,
         },
     )
@@ -2185,13 +2421,8 @@ fn eye_bounds(a: &mut App) -> Rect {
 /// composition avoids split refreshes and restores anything the previous overlay covered.
 fn areas_toggle(a: &mut App, _button: Rect) {
     a.settings.link_areas = !a.settings.link_areas;
-    let tip = a.settings.link_areas && a.settings.hints & HINT_EYE == 0;
-    if tip { a.settings.hints |= HINT_EYE; }
     settings_save(&a.settings);
     compose_all(a, RefreshMode::Ui);
-    if tip {
-        app_toast(a, tr("Dotted outlines show where a finger tap follows a link. They never print."), 4000);
-    }
 }
 
 // Rebuild a screen rect from the layers.
@@ -2203,7 +2434,17 @@ fn compose(a: &mut App, r: Rect) {
         return;
     }
     if ed(a).pv.open && !ed_ref(a).pv.overlay {
-        // the Pages view covers everything
+        // the Pages view covers everything (but the Find sheet opened over it)
+        if ed_ref(a).find.open {
+            // Only where r is, as over the page: the sheet's typing refreshes its parts one by one, and a screen
+            // left holding the view where the keys are would show it there at the next key's refresh.
+            let clip = a.screen.clip;
+            canvas_set_clip(&mut a.screen, r);
+            with_pv(a, pagesview_draw);
+            with_find(a, |f, a, nb, nav| findsheet_draw(f, a, nb, nav, r));
+            a.screen.clip = clip;
+            return;
+        }
         with_pv(a, pagesview_draw);
         return;
     }
@@ -2229,9 +2470,9 @@ fn compose(a: &mut App, r: Rect) {
         let r = rect_intersect(r, Rect { x: 0, y: top, w: a.w, h: a.h - top ,
             },
         );
-        let App { screen, ed, .. } = a;
+        let App { screen, ed, w: aw, .. } = a;
         let pc = &ed.as_deref().unwrap().ccache[slot].canvas;
-        if zoom == 1.0 && ox == 0.0 && oy == 0.0 && pc.w == screen.w && pc.h == screen.h {
+        if zoom == 1.0 && ox == 0.0 && oy == 0.0 && pc.w == *aw && pc.h == screen.h {
             canvas_blit(screen, pc, r, r.x, r.y);
         } else {
             blit_canvas(screen, pc, zoom, ox, oy, r);
@@ -2244,6 +2485,7 @@ fn compose(a: &mut App, r: Rect) {
     }
     draw_areas(a, r);
     draw_lasso(a, r);
+    sel_draw_halo(a, r);
     draw_area_wait(a, r);
     draw_card_border(a, r);
     if rect_overlaps(r, ed(a).panel) && !ed(a).live_no_panel {
@@ -2256,6 +2498,7 @@ fn compose(a: &mut App, r: Rect) {
         a.screen.clip = clip;
     }
     draw_menus(a, r);
+    sel_draw(a, r);
 }
 
 /// Every menu, sheet and bar that is up, over the page and the panel, in the order they stack: Paper, Templates,
@@ -2345,6 +2588,25 @@ fn draw_menus(a: &mut App, r: Rect) {
             a.toast_floor = area.y;
         }
     }
+    // The toolbar's count pad, along the bottom.
+    let s = ed_ref(a);
+    if s.add_kb.open {
+        let screen = Rect { x: 0, y: 0, w: a.w, h: a.h };
+        let area = keyboard_area(&s.add_kb, screen);
+        if rect_overlaps(r, area) {
+            let App { screen: c, ed, .. } = a;
+            keyboard_draw(&mut ed.as_deref_mut().unwrap().add_kb, c, screen);
+        }
+        a.toast_floor = area.y;
+    }
+    // The quick sizes card, over the page and the panel (nothing else is up with it).
+    let s = ed_ref(a);
+    if s.qs.open && rect_overlaps(r, s.qs.rect) {
+        let clip = a.screen.clip;
+        canvas_set_clip(&mut a.screen, r);
+        with_qs(a, quicksize_draw);
+        a.screen.clip = clip;
+    }
     // The long-press card, above everything (the bar included), and Rename's keyboard over it; the card is
     // left out while that keyboard covers part of it.
     let s = ed_ref(a);
@@ -2381,22 +2643,24 @@ fn draw_panel_over(a: &mut App) {
     compose(a, p);
 }
 
-/// Live view: where the panel is, for its layer (RECT_EMPTY where none shows: no notebook, or a menu, sheet,
-/// bar or the Pages view in front, which draw over the panel: the browser's layer would be over them).
+/// Live view: where the panel is, for its layer (app.rs, live_push_screen), which holds the screen there as the
+/// Kindle shows it: the panel, and whatever menu, sheet or bar is over a part of it or all of it, drawn over it
+/// there too. So the browser shows the toolbar wherever the Kindle does, beside a menu as under none, and a menu
+/// over it as the Kindle does (2.0.0, issue #16: the layer was empty while any menu was up, so the browser lost
+/// the toolbar beside the Display sheet until it closed). None where the panel is not drawn (no notebook, the
+/// Pages view, the Graph or the notebooks' browser over the screen) and while Settings is over the notebook,
+/// whose screen, the panel's strip beside it included, the frame holds whole (editor_live_hole).
 pub fn editor_live_panel(a: &App) -> Rect {
     if crate::library::library_settings_active(a) {return RECT_EMPTY;}
     match a.ed.as_deref() {
-        Some(s) if !sheet_open(s) => s.panel,
-        // The tool picker (and its Pin mode, and the Smart shapes menu) opens beside the panel, which stays
-        // on the Kindle's screen: so it does in the browser, unless the menu is over it.
-        Some(s) if s.tools_open && !sheet_open_besides_tools(s) && rect_is_empty(rect_intersect(s.tools_rect, s.panel)) => s.panel,
+        Some(s) if s.open && !s.pv.open && !s.map.open && !s.destination.open => s.panel,
         _ => RECT_EMPTY,
     }
 }
 
 /// Live view: where the screen holds the panel, which the frame is pushed without (editor_live_under_panel): the
-/// panel's rect, with a menu over it or not (the browser's layer is gone while one is up, and the tiles must not
-/// hold the panel then), and none where the Pages view covers the screen.
+/// panel's rect, with a menu over it or not (the tiles hold the page and the menu there, never the panel, for a
+/// browser that shows no toolbar), and none where the Pages view covers the screen.
 pub fn editor_live_hole(a: &App) -> Rect {
     if crate::library::library_settings_active(a) {return RECT_EMPTY;}
     match a.ed.as_deref() {
@@ -2473,13 +2737,16 @@ fn repaint_panel(a: &mut App, m: RefreshMode) {
 
 // ---- pages ----
 
-fn save_thumb_from_canvas(s: &EditorState) {
+fn save_thumb_from_canvas(s: &mut EditorState) {
     let mut t = Canvas::default();
     if canvas_init(&mut t, s.pgw / 3, s.pgh / 3) != 0 {
         return;
     }
     canvas_downsample_keep_lines(&mut t, &s.page_canvas, 0.35);
-    store_save_thumb(s.nb.id.as_str(), &t);
+    if store_save_thumb(s.nb.id.as_str(), &t) == 0 {
+        store_note_thumb_source(s.nb.id.as_str(), &first_page_source(&s.nb));
+        s.thumb_dirty = false;
+    }
 }
 
 // Page `pid` was written with an erase stroke it did not have: its file keeps the ink under it
@@ -2518,13 +2785,22 @@ fn list_erased_pages(s: &mut EditorState) {
 // that would drop it (turning the page, closing) must stay put instead.
 // The idle autosave: save_page, marked so that it makes the Pages preview at most every 30 s.
 fn autosave(a: &mut App) -> bool {
-    ed(a).autosaving = true;
-    let ok = save_page(a);
-    ed(a).autosaving = false;
-    ok
+    save_page_for(a, Some(CacheSave::Idle))
 }
 
+/// The page is being left (a page turn or jump, the notebook closing): save_page, and the kept drawing of a dense
+/// page made now whatever the idle window says, so its first revisit reads it back.
+fn save_page_leaving(a: &mut App) -> bool {
+    save_page_for(a, Some(CacheSave::Leave))
+}
+
+/// Any other save (Ctrl+S, the Pages view, Settings, a move or a delete of pages, the power press, a sleep) writes
+/// the page file and nothing else: its preview and kept drawing wait for the idle save or for leaving.
 fn save_page(a: &mut App) -> bool {
+    save_page_for(a, None)
+}
+
+fn save_page_for(a: &mut App, caches: Option<CacheSave>) -> bool {
     let s = ed(a);
     if !s.open {
         return true;
@@ -2536,33 +2812,21 @@ fn save_page(a: &mut App) -> bool {
             None => false,
         };
         if failed {
-            app_toast(a, tr("Could not save this page. Is the storage full?"), 5000,
+            app_toast(a, tr("Couldn't save page. Is the storage full?"), 5000,
             );
             return false;
         }
         if s.index == 0 {
             s.thumb_dirty = true; // written when leaving the page (it is slow)
         }
-        // Its Pages preview from the canvas, which is the page drawn already: a cache file written without
-        // waiting on the disk, by the idle autosave alone (2 s after the pen lifts, at most every 30 s).
-        // Turning the page and closing write the page and nothing more, so they never wait on a cache
-        // file; a page left before its idle save gets its preview from the background job when Pages
-        // next opens elsewhere (pagesview_prefetch leaves the open page out).
         let pid = s.open_pid();
         pagesview_page_saved(&mut s.pv, pid);
-        let now = now_ms();
-        let whole = s.canvas_page == s.open_page_ref() && s.page_canvas.w == s.pgw && s.page_canvas.h == s.pgh
-            && !s.page_canvas.px.is_empty() && !s.picture_missing;
-        if whole && s.autosaving && now.wrapping_sub(s.preview_saved_ms) >= 30_000 {
-            store_save_page_preview(&s.nb, pid, &s.page_canvas);
-            // A page that took a second or more to draw keeps its drawing too, so it opens at once.
-            if s.full_ms.0 == pid && s.full_ms.1 >= keep_render_ms() {
-                store_save_page_render(&s.nb, pid, &s.page_canvas);
-            }
-            s.preview_saved_ms = now;
-        }
+        s.caches_pending = true;
         s.page_dirty = false;
         s.info_dirty = true;
+    }
+    if let Some(why) = caches {
+        save_page_caches(s, now_ms(), why);
     }
     list_erased_pages(s); // their files have the erase strokes now (and the ink under them)
     if s.info_dirty {
@@ -2572,6 +2836,132 @@ fn save_page(a: &mut App) -> bool {
         s.info_dirty = false;
     }
     true
+}
+
+/// When a save may make the open page's preview and kept drawing (save_page_caches).
+#[derive(Clone, Copy, PartialEq)]
+enum CacheSave {
+    /// The idle autosave.
+    Idle,
+    /// The page is left.
+    Leave,
+}
+
+/// How long idle cache writes are spaced, and how long the page must have been quiet for its kept drawing to be
+/// written at an idle save: 30 s. (The simulator takes GRIMOIRE_CACHE_WINDOW_MS, so scenarios need not wait.)
+fn cache_window_ms() -> u32 {
+    #[cfg(feature = "sim")]
+    if let Some(ms) = std::env::var("GRIMOIRE_CACHE_WINDOW_MS").ok().and_then(|v| v.parse().ok()) {
+        return ms;
+    }
+    30_000
+}
+
+// Whether the open page's canvas is the page as it is on disk, whole: what a preview or a kept drawing may be
+// made from (not a page changed since its file was written: page_is_its_file, nor one with its picture white).
+fn caches_writable(s: &EditorState) -> bool {
+    let whole = s.canvas_page == s.open_page_ref() && s.page_canvas.w == s.pgw && s.page_canvas.h == s.pgh
+        && !s.page_canvas.px.is_empty() && !s.picture_missing;
+    page_is_its_file(s) && whole && s.open_page().is_some_and(|p| !p.readonly)
+}
+
+// Whether editor_tick should save for the caches alone: some are still to make, nothing can have changed them
+// since, the last write of one is a window ago and the page has been quiet that long. (Not while they cannot be
+// made: a pending flag that outlived a canvas that is not whole, or a read-only page, ran the autosave at every
+// pass of the main loop.)
+fn caches_due(s: &EditorState, now: u32) -> bool {
+    let window = cache_window_ms();
+    s.caches_pending && caches_writable(s) && now.wrapping_sub(s.preview_saved_ms) >= window
+        && now.wrapping_sub(s.last_up) >= window
+}
+
+// Cache work happens after saving, never as the pen moves, and each file only when it is not current. The idle
+// save makes the Pages preview, at most once a window (30 s, across page turns and reopens too), and the kept
+// drawing of a dense page only once the page has been quiet that long as well: a page written in bursts would
+// otherwise write its whole drawing (3.4 MB) at every pause. Leaving writes the drawing at once, window or not
+// (without it the first revisit draws all the ink again), and no preview: that is the previews job's. Every
+// other save writes neither; they stay pending for one of these.
+fn save_page_caches(s: &mut EditorState, now: u32, why: CacheSave) {
+    if !caches_writable(s) {
+        // (a read-only page, never written, has nothing pending)
+        if s.open_page().is_some_and(|p| p.readonly) {
+            s.caches_pending = false;
+        }
+        return;
+    }
+    let pid = s.open_pid();
+    let layered = s.open_page().is_some_and(page_layered);
+    let keep = store_page_dense(&s.nb, pid)
+        || (s.full_ms.0 == pid && s.full_ms.1 >= store_keep_render_ms());
+    let window = cache_window_ms();
+    match why {
+        CacheSave::Leave => {
+            if keep && !store_page_render_kept(&s.nb, pid, s.pgw, s.pgh, layered) {
+                store_save_page_render(&s.nb, pid, &s.page_canvas, layered);
+                s.preview_saved_ms = now;
+            }
+        }
+        CacheSave::Idle => {
+            if !s.caches_pending || now.wrapping_sub(s.preview_saved_ms) < window {
+                return;
+            }
+            // (a try that fails, a full store, counts too: it is tried again a window later, not at every pass)
+            let mut tried = false;
+            if !store_page_preview_ok(&s.nb, pid) {
+                store_save_page_preview(&s.nb, pid, &s.page_canvas);
+                tried = true;
+            }
+            if keep && !store_page_render_kept(&s.nb, pid, s.pgw, s.pgh, layered) && now.wrapping_sub(s.last_up) >= window {
+                store_save_page_render(&s.nb, pid, &s.page_canvas, layered);
+                tried = true;
+            }
+            if tried {
+                s.preview_saved_ms = now;
+            }
+            s.caches_pending = !store_page_preview_ok(&s.nb, pid)
+                || (keep && !store_page_render_kept(&s.nb, pid, s.pgw, s.pgh, layered));
+        }
+    }
+}
+
+// What the Library card is drawn from: page 1's id and its file's identity (store_note_thumb_source).
+fn first_page_source(nb: &NotebookInfo) -> String {
+    let pid = nb.page_ids[0];
+    format!("{pid}:{}", store_page_source_identity(nb, pid).unwrap_or_default())
+}
+
+// A change on another page leaves the Library card alone, when the card was drawn from page 1 as it is now (what
+// it was drawn from is kept beside it, store_note_thumb_source: a card of before, or one drawn from another page 1
+// or from a page 1 since written, is drawn again, whatever it held at the open). A changed or reordered first page
+// uses its kept drawing, then its current small preview, before falling back to drawing the strokes. (A card of
+// no known source, one a version before 2.1.0 made, may show a cleared page's old picture, and the preview beside
+// it may too: that one is drawn from the strokes, once, as every close did before.)
+fn refresh_library_thumb(s: &mut EditorState, dpi: f32) {
+    let source = first_page_source(&s.nb);
+    let pid = s.nb.page_ids[0];
+    let was = store_thumb_source(s.nb.id.as_str());
+    if !s.thumb_dirty && was.as_deref() == Some(source.as_str()) {
+        return;
+    }
+    let mut p = None;
+    if s.load_page(0, &mut p) != 0 { return; }
+    let Some(p) = p else { return; };
+    let mut t = Canvas::default();
+    if canvas_init(&mut t, s.pgw / 3, s.pgh / 3) != 0 { return; }
+    let mut full = Canvas::default();
+    let kept = canvas_init(&mut full, s.pgw, s.pgh) == 0
+        && store_load_page_render(&s.nb, pid, s.pgw, s.pgh, &mut full, page_layered(&p));
+    if kept {
+        canvas_downsample_keep_lines(&mut t, &full, 0.35);
+    } else if was.is_some() && store_load_page_preview(&s.nb, pid, &mut full) {
+        canvas_downsample_keep_lines(&mut t, &full, 0.35);
+    } else {
+        page_render_thumb(&mut t, &p, dpi);
+    }
+    if store_save_thumb(s.nb.id.as_str(), &t) == 0 {
+        store_note_thumb_source(s.nb.id.as_str(), &source);
+        s.thumb_dirty = false;
+    }
 }
 
 // Draws r of the open page into the page canvas. An image paper's picture that is not there (a
@@ -2693,16 +3083,44 @@ fn draw_page_in(a: &mut App, r: Rect, mask: Option<Rc<TileMask>>) {
     base_follow(s, r);
 }
 
+// Whether the page in memory is the page file on disk: what a drawing kept of the file (store_load_page_render,
+// which goes by the file's stamp alone) may stand for. Not while it has a change not yet written (page_dirty), so
+// whatever changes the page marks it changed (mark_changed) before it draws it again. Clear page and a new paper
+// drew it first, and read back the drawing kept of the file as it was before the change: the old ink came back on
+// the cleared page, the old paper under a new one, and the idle save kept that picture under the new file's stamp,
+// with the Pages preview and the Library card made from it (2.0.0 to 2.0.1).
+fn page_is_its_file(s: &EditorState) -> bool {
+    !s.page_dirty
+}
+
+// A drawing 2.0.0 or 2.0.1 kept of the open page, current for its file or not, goes as the page is drawn whole from
+// its strokes with nothing unsaved (never read since 2.1.0, store.rs RENDER_TAG_VERSION: it may show the page as it
+// was before a Clear or a new paper), and the Pages preview and the Library card made beside it are made again from
+// this drawing: the preview now (a view decodes it again: bgjob.rs PreviewCache goes by the preview file too), the
+// card as page 1 is left (write_thumb_if_needed). Not from a drawing with its picture white: later, then. For
+// render_page_full and the Links bar's commit of a page it drew.
+fn retire_kept_before(s: &mut EditorState) {
+    let pid = s.open_pid();
+    if page_is_its_file(s) && !s.picture_missing && s.page_ix().is_some() && store_retire_page_render(&s.nb, pid) {
+        store_save_page_preview(&s.nb, pid, &s.page_canvas);
+        if s.index == 0 {
+            s.thumb_dirty = true;
+        }
+    }
+}
+
 fn render_page_full(a: &mut App) {
     let s = ed(a);
     s.boxes.stale = true; // (a page drawn whole is another page, or one that changed whole)
     let r = Rect { x: 0, y: 0, w: s.pgw, h: s.pgh ,
     };
-    // A dense page's drawing kept from before, when it is current (store_load_page_render): read back
-    // in a fraction of a second instead of drawing every stroke again.
+    // A dense page's drawing kept from before, when it is current (store_load_page_render) and the page in
+    // memory is the file it was kept of (page_is_its_file): read back in a fraction of a second instead of
+    // drawing every stroke again.
     let pid = s.open_pid();
-    let kept = s.page_ix().is_some() && !s.page_canvas.px.is_empty()
-        && store_load_page_render(&s.nb, pid, s.pgw, s.pgh, &mut s.page_canvas);
+    let layered = s.open_page().is_some_and(page_layered);
+    let kept = page_is_its_file(s) && s.page_ix().is_some() && !s.page_canvas.px.is_empty()
+        && store_load_page_render(&s.nb, pid, s.pgw, s.pgh, &mut s.page_canvas, layered);
     s.page_kept = kept;
     if kept {
         s.picture_missing = false;
@@ -2712,16 +3130,19 @@ fn render_page_full(a: &mut App) {
         draw_page(a, r);
         let s = ed(a);
         s.full_ms = (pid, now_ms().wrapping_sub(started));
+        retire_kept_before(s);
         // A page that took this long, as it is on disk (nothing unsaved), keeps its drawing at once:
         // the next open is quick even if it is only read, never written.
-        if s.full_ms.1 >= keep_render_ms() && !s.page_dirty && !s.picture_missing && s.page_ix().is_some() {
-            store_save_page_render(&s.nb, pid, &s.page_canvas);
+        if s.full_ms.1 >= store_keep_render_ms() && !s.page_dirty && !s.picture_missing && s.page_ix().is_some() {
+            let layered = s.open_page().is_some_and(page_layered);
+            store_save_page_render(&s.nb, pid, &s.page_canvas, layered);
         }
     }
     let s = ed(a);
     s.canvas_page = s.open_page_ref();
     base_reset(s);
-    s.preview_saved_ms = now_ms().wrapping_sub(30_000); // (a page opened: its first idle save writes them)
+    s.preview_saved_ms = now_ms().wrapping_sub(store_page_cache_age_ms(&s.nb, pid).min(cache_window_ms()));
+    s.caches_pending = false;
     // An image paper's picture can have come since its paper alone was drawn (S->paper: a picture
     // made in the background draws white until it is there), and the page now shows it.
     if paper_is_image(s.open_page().unwrap().paper) {
@@ -2729,10 +3150,45 @@ fn render_page_full(a: &mut App) {
     }
 }
 
+// TRANSLATORS: a toast (about 1700 px at 44 px in bold) while a dense page is drawn as it opens (seconds on a
+// Kindle); it goes as the page shows.
+const K_LOADING_PAGE: &str = n_("Loading page...");
+
+/// render_page_full for a page that opens (a page turn, a jump, a notebook opening, the page left after a
+/// deletion): one that takes seconds to draw (store_page_slow: a page file of 256 KB or more, the owner's
+/// decision of 2026-11-04; it went by store_page_dense's 512 KB before) and has no current kept drawing to read
+/// back says "Loading page..." first, on the panel before the drawing starts, and the toast goes once the page
+/// is drawn. Never for a page that draws quickly.
+fn render_page_open(a: &mut App) {
+    let toast = loading_toast_due(a);
+    if toast {
+        app_toast(a, tr(K_LOADING_PAGE), 120_000);
+        app_flush(a); // (on the panel now: the drawing holds the main loop)
+        ed(a).loading_toasts += 1;
+    }
+    render_page_full(a);
+    // (another toast that took its place stays)
+    if toast && a.toast_visible && a.toast.as_bytes() == tr(K_LOADING_PAGE).as_bytes() {
+        app_toast_dismiss(a);
+    }
+}
+
+// Whether the open page takes seconds to draw and has no current kept drawing to come up from (page_is_its_file;
+// a pen held on an action holds the panel, so no toast could show before the drawing: none then).
+fn loading_toast_due(a: &App) -> bool {
+    let s = ed_ref(a);
+    if a.pen_action_down || s.page_ix().is_none() || s.page_canvas.px.is_empty() {
+        return false;
+    }
+    let pid = s.open_pid();
+    let layered = s.open_page().is_some_and(page_layered);
+    !(page_is_its_file(s) && store_page_render_kept(&s.nb, pid, s.pgw, s.pgh, layered)) && store_page_slow(&s.nb, pid)
+}
+
 // A page from a newer Grimoire (or one this build cannot fully read) is shown as far as it can
 // be and never changed: writing, erasing, clearing and paper changes are refused with this.
 // TRANSLATORS: in a toast (about 1700 px at 44 px in bold, or two lines).
-const K_READONLY_MSG: &str = n_("This page was made by a newer Grimoire. It is read-only here.");
+const K_READONLY_MSG: &str = n_("This page was made by a newer version, and will be viewed as read-only.");
 
 fn refuse_readonly(a: &mut App) -> bool {
     if !ed(a).open_page().is_some_and(|p| p.readonly) {
@@ -2796,6 +3252,21 @@ impl EditorState {
     }
 }
 
+/// Where a link into another notebook was followed from (2.0.0-beta.2): the notebook, its page, the view
+/// on it (zoom and offset, for the screen size they were for) and its own back list, so Back returns to the
+/// same page at the same zoom, and that notebook's Back goes on where it left off.
+#[derive(Clone, Debug, Default)]
+struct NotebookBack {
+    id: FixedStr<STORE_ID_LEN>,
+    pid: u32,
+    zoom: f32,
+    ox: f32,
+    oy: f32,
+    view_w: i32,
+    view_h: i32,
+    back: Vec<u32>,
+}
+
 /// go_to_page, leaving the page it left on the back list (when it went anywhere else).
 fn go_to_page_pushing(a: &mut App, index: i32) -> bool {
     let s = ed(a);
@@ -2832,7 +3303,7 @@ fn go_to_page(a: &mut App, index: i32) -> bool {
     lm_drop(s); // (a link's area is drawn on the page Add a link was asked on; the screen is drawn whole below)
     s.settle = RECT_EMPTY; // the whole screen is about to be redrawn anyway
     s.panel_stale = false;
-    if !save_page(a) {
+    if !save_page_leaving(a) {
         compose_all(a, RefreshMode::Full);
         return false;
     }
@@ -2842,9 +3313,15 @@ fn go_to_page(a: &mut App, index: i32) -> bool {
     let index = clampi(index, 0, s.nb.npages() - 1);
     let Some(np) = s.page_at(index) else {
         compose_all(a, RefreshMode::Full);
-        app_toast(a, tr("Could not open that page"), 3000);
+        app_toast(a, tr("Couldn't open page"), 3000);
         return false;
     };
+    // The page left keeps its drawing in memory; the page come to takes its own back if it was left this
+    // session and its file is still the one drawn (a dense page then shows at once, not seconds later).
+    // Its drawing is never the one the page left takes, even when that fills every slot (a jump to the
+    // oldest kept page, issue #60).
+    page_view_stash(s, np);
+    let kept_ms = page_view_load(s, np);
     live_reset();
     a.live_processed = 0;
     a.live_processed_ms = 0;
@@ -2853,9 +3330,30 @@ fn go_to_page(a: &mut App, index: i32) -> bool {
     s.index = index;
     s.nb.last_page = index;
     s.info_dirty = true;
-    render_page_full(a);
+    match kept_ms {
+        Some(ms) => {
+            // render_page_full's bookkeeping, without its drawing: the page canvas already holds the page.
+            s.canvas_page = s.open_page_ref();
+            s.boxes.stale = true;
+            s.picture_missing = false;
+            s.page_kept = false;
+            s.full_ms = (np, ms);
+            base_reset(s);
+            let pid = s.open_pid();
+            s.preview_saved_ms = now_ms().wrapping_sub(store_page_cache_age_ms(&s.nb, pid).min(cache_window_ms()));
+            s.caches_pending = false;
+            if s.open_page().is_some_and(|p| paper_is_image(p.paper)) {
+                s.paper_stale = true;
+            }
+        }
+        None => render_page_open(a),
+    }
     view_reset(a);
-    compose_all(a, RefreshMode::Full);
+    // A page at the fitted view (100% upright, no offset) is the screen whole, blitted in compose: a
+    // partial (GL16) refresh rather than GC16's flash of the whole panel, which cost 147 ms on a light
+    // page and 1250 ms on a dense one (issue #31). Another view (zoomed, another page size) is composed
+    // as before. The 30th UI refresh flashes anyway (app_invalidate_all), so ghosts still clear.
+    compose_all(a, if view_identity(a) { RefreshMode::Ui } else { RefreshMode::Full });
     arrive_readonly(a);
     true
 }
@@ -2872,6 +3370,7 @@ fn use_page_size(s: &mut EditorState) {
     s.pgh = h;
     canvas_free(&mut s.page_canvas);
     canvas_free(&mut s.base);
+    page_views_clear(s);
     s.base_page = 0;
     s.canvas_page = 0;
     for k in 0..PAPER_COUNT as usize {
@@ -2942,6 +3441,12 @@ fn close_notebook(a: &mut App) {
     }
     card_drop(s);
     lm_drop(s);
+    s.sel = SelMode::default(); // (Select mode ends with the notebook)
+    s.pv.move_undo = None; // (a page move is undone only while its notebook stays open)
+    s.pv.add_undo = None; // (and a batch of new pages)
+    s.pv.redo = None; // (and their Redo)
+    keyboard_close(&mut s.add_kb); // (the toolbar's count pad: nothing added)
+    s.add_quiet_until = None;
     s.recent = Vec::new();
     s.back = Vec::new();
     s.boxes.stale = true;
@@ -2955,21 +3460,15 @@ fn close_notebook(a: &mut App) {
             s.thumb_dirty = true;
         }
     }
-    save_page(a);
+    save_page_leaving(a);
     links_flush(a); // (before the PDF, which reads the areas)
+    backlinks_flush();
+    libindex_flush();
     write_thumb_if_needed(a);
     let dpi = a.dpi;
     let s = ed(a);
     if s.index != 0 && s.changed {
-        // Keep the library thumbnail (page 1) in sync even if we never visited it.
-        let mut p0: Option<Box<Page>> = None;
-        if s.load_page(0, &mut p0) == 0 {
-            let mut t = Canvas::default();
-            if canvas_init(&mut t, s.pgw / 3, s.pgh / 3) == 0 {
-                page_render_thumb(&mut t, p0.as_deref().unwrap(), dpi);
-                store_save_thumb(s.nb.id.as_str(), &t);
-            }
-        }
+        refresh_library_thumb(s, dpi);
     }
     if a.settings.mirror_pdf && ed(a).changed {
         let id = ed(a).nb.id;
@@ -2997,6 +3496,7 @@ fn close_notebook(a: &mut App) {
             unlisted
         );
     }
+    page_views_clear(s);
     s.free_histories();
     s.paper = SharedPaper::default();
     canvas_free(&mut s.image_prev); // (it may have drawn a picture white: made again from the file)
@@ -3008,6 +3508,7 @@ fn close_notebook(a: &mut App) {
     s.pv.tab_initialized = false;
     nav_free(&mut s.nav);
     nav_init(&mut s.nav);
+    s.dl = DocLinks::default();
     s.links_dirty = false; // (what a failed flush kept is left for this notebook's next open)
     s.migrate_done = Vec::new();
     s.open = false;
@@ -3019,16 +3520,20 @@ fn close_notebook(a: &mut App) {
 pub fn editor_open_notebook(a: &mut App, id: &str) {
     let requested=ed(a).requested_page.take();
     ed(a).notebook_back.clear();
+    ed(a).from_graph = false;
+    backlinks_revalidate(); // (another notebook may have changed its links since: checked on idle ticks)
+    libindex_revalidate(); // (and the Graph of all notebooks' index, for any notebook's files)
     close_notebook(a);
     // Every way into a notebook comes here (the Library's card and its menu, a new notebook): its
     // compaction, queued or running, is stopped before anything here reads or writes its pages (a
     // stopped compaction leaves each page file as it was; the list keeps the pages for later).
     bg_cancel_notebook(id);
     if store_load_info(id, &mut ed(a).nb) != 0 {
-        app_toast(a, tr("Could not open that notebook"), 3000);
+        app_toast(a, tr("Couldn't open notebook"), 3000);
         return;
     }
     let s = ed(a);
+    s.thumb_dirty = false;
     store_recover_pages(&s.nb); // pages an older version set aside that open now
     // Pages an older version saved on blank paper get their pictures back (bg/pages.ini), all of
     // them now: the thumbnail and PDF it drew are drawn again when the notebook closes.
@@ -3039,11 +3544,13 @@ pub fn editor_open_notebook(a: &mut App, id: &str) {
     s.page = s.page_at(s.index);
     if s.page.is_none() {
         s.free_histories();
-        app_toast(a, tr("Could not open that notebook"), 3000);
+        app_toast(a, tr("Couldn't open notebook"), 3000);
         return;
     }
     s.open = true;
     nav_load(s.nb.id.as_str(), &mut s.nav);
+    s.dl = doclinks_load(s.nb.id.as_str());
+    doclinks_prune(&mut s.dl, &s.nb); // (a tab to a page deleted since the last write is not a tab)
     // The page it opens at was read before its links were: its beta.5 links migrate now, before the
     // first tap.
     s.links_dirty = false;
@@ -3060,16 +3567,11 @@ pub fn editor_open_notebook(a: &mut App, id: &str) {
     if s.page_canvas.px.is_empty() && canvas_init(&mut s.page_canvas, s.pgw, s.pgh) != 0 {
         return;
     }
-    render_page_full(a);
+    render_page_open(a);
     ed(a).view_w = 0; // set the view up afresh on enter
-    let sideways_seen = a.settings.hints & HINT_SIDEWAYS;
     app_switch(a, ScreenId::Editor);
     arrive_readonly(a);
-    // One tip at a time: a notebook that came up sideways told the owner why (editor_enter, a toast of six
-    // seconds), and the first-open tip would take its place. It waits for the next open instead.
-    if a.settings.hints & HINT_SIDEWAYS == sideways_seen {
-        first_open_tip(a);
-    }
+    first_open_tip(a);
 }
 
 // The owner who updated from the build before is told once, as the first notebook comes up, what two
@@ -3085,7 +3587,7 @@ fn first_open_tip(a: &mut App) {
     settings_save(&a.settings);
     // TRANSLATORS: a toast (about 1700 px at 44 px in bold, or two lines), shown once after an update: what
     // two fingers dragged up and down on a page do now.
-    app_toast(a, tr("New: two fingers up show this page's links. Two fingers down open the Graph."), 6000,
+    app_toast(a, tr("New: two fingers down for the Graph, up for page links."), 6000,
     );
 }
 
@@ -3146,6 +3648,7 @@ pub fn editor_save_now(a: &mut App) -> bool {
 
 // ---- ink ----
 
+// The open page changed: as it changes, before it is drawn again (page_is_its_file).
 fn mark_changed(s: &mut EditorState) {
     s.page_dirty = true;
     s.changed = true;
@@ -3258,7 +3761,7 @@ fn draw_begin(a: &mut App, ev: &InEvent) {
     // Ink never shares a seed with a stroke or a link of the page: a link's box is its seed's strokes.
     if !erase {
         let pid = s.nb.page_ids[s.index as usize];
-        seed = nav_new_seed(&s.nav, s.open_page().unwrap(), pid, seed);
+        seed = nav_new_seed_with(&s.nav, Some(&s.dl), s.open_page().unwrap(), pid, seed);
     }
     // (stroke_new cannot fail here: the C's NULL check has nothing to catch)
     let mut cur = if erase { stroke_new(TOOL_ERASER, &prm, erase_seed(ps.tool, seed)) } else { stroke_new(ps.tool, &prm, seed) };
@@ -3399,12 +3902,12 @@ fn draw_end(a: &mut App) {
 
 fn draw_end_stroke(a: &mut App) {
     let shape_log = a.shape_log;
+    let dpi = a.dpi;
     let s = ed(a);
     let snapped = s.sh.preview.take();
     if let Some(preview) = snapped {
         s.cur = Some(preview.stroke);
         s.sh.kept=s.sh.kept.saturating_add(1);
-        s.sh.tip_pending = true;
         if shape_log {qlog!("shape: kept");}
         s.settle = rect_union(s.settle, preview.region);
         live_reset();
@@ -3431,6 +3934,9 @@ fn draw_end_stroke(a: &mut App) {
         stroke_free(st);
         return;
     }
+    // An erase stroke (the precise eraser, white ink) turned ink back to paper under DU: what it swept
+    // counts toward a clean (display.rs, DuWear), added once the stroke is kept below. Pen-up work only.
+    let wear = stroke_is_erase(&st).then(|| (st.bbox, stroke_wear_area(&st, dpi)));
     let h = s.cur_hist();
     let had_undo = h.is_some_and(|i| history_can_undo(&s.hist[i].h));
     let had_redo = h.is_some_and(|i| history_can_redo(&s.hist[i].h));
@@ -3461,6 +3967,21 @@ fn draw_end_stroke(a: &mut App) {
     if !had_undo || had_redo || was_empty {
         s.panel_stale = true;
     }
+    if let Some((bbox, area)) = wear {
+        let (sr, z) = (page_to_screen(a, bbox), ed_ref(a).zoom as f64);
+        du_wear_add(&mut a.du_wear, sr, (area * z * z) as i64, now_ms());
+    }
+}
+
+/// The page px a stroke counts as toward DU wear (display.rs, DuWear) when the eraser takes it away, or
+/// an erase stroke sweeps: the band its line lies in, its tip's width but at least WEAR_BAND_MM (the ink
+/// and the paper right around it, what the eye takes for the erased place), never more than its box. So a
+/// long thin line counts for its length, not for the page its box spans; a word for about its own box.
+fn stroke_wear_area(st: &Stroke, dpi: f32) -> f64 {
+    let tip = 2.0 * brush_max_radius(stroke_render_tool(st), &st.params, dpi);
+    let band = tip.max(mm_to_px(WEAR_BAND_MM, dpi)) as f64;
+    let len: f64 = st.pts.windows(2).map(|w| ((w[1].x - w[0].x) as f64).hypot((w[1].y - w[0].y) as f64)).sum();
+    (len * band + band * band).min(st.bbox.w.max(0) as f64 * st.bbox.h.max(0) as f64)
 }
 
 fn dist2_to_segment(px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
@@ -3619,6 +4140,7 @@ fn erase_segment(a: &mut App, sx: f32, sy: f32, pressure: f32) {
     let (mut x, mut y) = (0.0, 0.0);
     to_page(s, sx, sy, &mut x, &mut y);
     let mut d = RECT_EMPTY;
+    let mut worn = 0.0f64; // (page px: stroke_wear_area)
     let first = s.removed.len(); // (this step's strokes go after)
     // (the open page's cache entry: nothing below adds or drops one)
     let ip = s.page_ix().unwrap();
@@ -3643,6 +4165,7 @@ fn erase_segment(a: &mut App, sx: f32, sy: f32, pressure: f32) {
             }
         }
         d = rect_union(d, st.bbox);
+        worn += stroke_wear_area(&st, dpi);
         s.removed.push(st);
     }
     let s = ed(a);
@@ -3654,6 +4177,9 @@ fn erase_segment(a: &mut App, sx: f32, sy: f32, pressure: f32) {
         // whole page) again in 34 s on the Kindle (2.0.0-rc.11); its tiles take a thirteenth of that.
         let d = draw_page_without(a, d, first);
         show(a, d, RefreshMode::Fast);
+        // (DU turned that ink back to paper: its traces count toward a clean, display.rs DuWear)
+        let (sr, z) = (page_to_screen(a, d), ed_ref(a).zoom as f64);
+        du_wear_add(&mut a.du_wear, sr, (worn * z * z) as i64, now_ms());
         let s = ed(a);
         s.erase_dirty = rect_union(s.erase_dirty, d);
     }
@@ -3701,57 +4227,65 @@ fn erase_end_sweep(a: &mut App) {
     s.snap = Vec::new();
 }
 
-fn clear_page(a: &mut App) {
+/// Clears the open page (its ink and its links), one undo step: true when it did. A read-only page, an
+/// empty one or links that cannot be saved leave it as it was (false).
+fn clear_page(a: &mut App) -> bool {
     if refuse_readonly(a) {
-        return;
+        return false;
     }
+    // (an empty page stays as it is: nothing to clear, no step, no toast)
     if ed(a).open_page().is_none_or(|p| p.strokes.is_empty())
         && nav_links_of(&ed_ref(a).nav,ed_ref(a).open_pid(),&mut 0)==0 {
-        app_toast(a, tr("This page is already empty"), 1500);
-        return;
+        return false;
     }
     let s = ed(a);
-    let Some(h) = s.cur_hist() else { return };
+    let Some(h) = s.cur_hist() else { return false };
     let ip = s.page_ix().unwrap();
     let pid=s.open_pid();
     if !s.nav.links_writable {
-        app_toast(a,tr("Could not save the links. The page was not cleared."),3000);return;
+        app_toast(a,tr("Couldn't save links. Page unchanged."),3000);return false;
     }
     let mut records=Vec::new();
     let count=nav_links_of(&s.nav,pid,&mut 0) as usize;
     if count>0 {
         if records.try_reserve_exact(count).is_err() {
-            app_toast(a,tr("Could not save the links. The page was not cleared."),3000);return;
+            app_toast(a,tr("Couldn't save links. Page unchanged."),3000);return false;
         }
         for link in s.nav.links.iter().filter(|link|link.pid==pid) {records.push((Some(link_rec(link)),None));}
         for (link,_) in &records {nav_link_remove(&mut s.nav,pid,link.as_ref().unwrap().seed);}
         if nav_save_links(s.nb.id.as_str(),&mut s.nav,&s.nb)!=0 {
             nav_load(s.nb.id.as_str(),&mut s.nav);migration_reset(s);
-            app_toast(a,tr("Could not save the links. The page was not cleared."),3000);return;
+            app_toast(a,tr("Couldn't save links. Page unchanged."),3000);return false;
         }
         s.links_dirty=false;
     }
     let links=(!records.is_empty()).then_some(LinkEdit{pid,records});
     let (hh, page) = hist_page(&mut s.hist, h, ip);
     history_push_clear_links(hh, page,links);
+    mark_changed(s); // (before it is drawn: page_is_its_file)
     ed(a).boxes.stale = true;
     bar_rebuild(a);
     render_page_full(a);
     compose_all(a, RefreshMode::Full);
-    mark_changed(ed(a));
     repaint_panel(a, RefreshMode::Full);
-    app_toast(a, tr("Page cleared"), 1500);
+    // (the broom says nothing: the owner, 2026-11-04; a toast left up from before goes. A gesture or a
+    // shortcut says it cleared the page: editor_shortcut_in, PAGE_CLEARED)
+    app_toast_dismiss(a);
+    true
 }
+
+// TRANSLATORS: a toast (about 1700 px at 44 px in bold, or two lines): a gesture or a shortcut (the pen
+// button held, a finger shape, a key) cleared the page; the toolbar's Undo, or the undo gesture or key,
+// brings back everything it took, in one step.
+const PAGE_CLEARED: &str = n_("Page cleared. Undo brings it back.");
 
 // Whether a sheet is in front of the page: the Pages view, the tool picker, Custom music, Display
 // or the paper sheet. The pen's button clears no page from under one.
 fn sheet_open(s: &EditorState) -> bool {
-    s.tools_open || sheet_open_besides_tools(s)
-}
-fn sheet_open_besides_tools(s: &EditorState) -> bool {
     s.destination.open
         || s.map.open
         || s.pv.open
+        || s.tools_open
         || s.mb.open
         || s.dm.open
         || s.paper_open
@@ -3760,6 +4294,7 @@ fn sheet_open_besides_tools(s: &EditorState) -> bool {
         || s.find.open
         || s.lt.open
         || s.card.open
+        || s.qs.open
 }
 
 /// Whether the pen's next contact is no ink: the Links bar is up (a tap on it, or outside it, which closes or
@@ -3774,7 +4309,9 @@ pub fn editor_pen_not_ink(a: &App) -> bool {
             || s.lb.open
             || s.find.open
             || s.card.open
+            || s.qs.open
             || s.lm.state != LmState::Off
+            || s.sel.state != SelState::Off
             || (s.owner == Owner::Outside && s.owner_is_pen)
     })
 }
@@ -3869,6 +4406,7 @@ fn pb_reset(s: &mut EditorState) {
     s.pb_drag = None;
     s.hold_eraser_key = false;
     s.hold_eraser = false;
+    sel_hold_reset(s);
 }
 
 fn pb_dispatch(a: &mut App, action: i32) {
@@ -3897,13 +4435,20 @@ fn pb_out(a: &mut App, out: PbOut, t: u32) {
         }
         PbOut::HoldBegin(button) => {
             ed(a).pb_last = Some((button, PenKind::Hold));
-            pb_dispatch(a, gesturemap_action(&a.gestures, pb_key(button, PenKind::Hold)));
+            let action = gesturemap_action(&a.gestures, pb_key(button, PenKind::Hold));
+            // (`select` on a hold is held, not toggled: Select mode while the button is down)
+            if action == SHORTCUT_SELECT { sel_hold(a, true); return; }
+            pb_dispatch(a, action);
         }
-        PbOut::HoldEnd(_) => {}
+        PbOut::HoldEnd(button) => {
+            if gesturemap_action(&a.gestures, pb_key(button, PenKind::Hold)) == SHORTCUT_SELECT { sel_hold(a, false); }
+        }
         PbOut::DragBegin(button) => {
             ed(a).pb_last = Some((button, PenKind::Drag));
             let action = gesturemap_action(&a.gestures, pb_key(button, PenKind::Drag));
             if action == 0 || pb_momentary(a, button) { return; }
+            // `select` on a drag: Select mode held, and this contact (not claimed here) its lasso
+            if action == SHORTCUT_SELECT { sel_hold(a, true); return; }
             // (what the pen held ends first: ink kept as drawn, a lasso back to the strip; a lasso the drag
             // took over stayed half drawn, and the next stroke was ink with the strip still up)
             owner_cancel(a);
@@ -3923,7 +4468,10 @@ fn pb_out(a: &mut App, out: PbOut, t: u32) {
                 s.owner_is_pen = true;
             }
         }
-        PbOut::DragEnd(button) => pb_drag_end(a, button),
+        PbOut::DragEnd(button) => {
+            if gesturemap_action(&a.gestures, pb_key(button, PenKind::Drag)) == SHORTCUT_SELECT { sel_hold(a, false); }
+            pb_drag_end(a, button)
+        }
     }
 }
 
@@ -3961,6 +4509,8 @@ fn pb_input(a: &mut App, ev: &InEvent) -> bool {
     if !matches!(ev.type_, InType::PenButton | InType::PenHover | InType::PenDown
         | InType::PenMove | InType::PenUp | InType::PenLeave) { return false; }
     if !ed_ref(a).open { return ev.type_ == InType::PenButton; }
+    // The pen in range: a finger's hold arms no lasso now, and an armed one is dropped (select.rs)
+    sel_finger_pen(a);
     if matches!(ev.type_, InType::PenDown | InType::PenHover) {
         fs_abort_view(a, FsAbortView::Pen);
     }
@@ -4018,6 +4568,7 @@ fn pb_input(a: &mut App, ev: &InEvent) -> bool {
 
 fn undo_redo(a: &mut App, undo: bool) {
     settle_now(a);
+    sel_deselect(a);
     if refuse_readonly(a) {
         return;
     }
@@ -4137,11 +4688,17 @@ fn pages_delete(a: &mut App) {
     if k == 0 {
         return;
     }
+    // (no toast when done: the owner, 2026-11-04. One left up from before goes first, so one the delete raises,
+    // a page that could not be saved, stays.)
+    app_toast_dismiss(a);
+    let s = ed(a);
     if k == n {
         // A notebook keeps at least one page: add a fresh blank one to stay behind.
         let paper = s.open_page().map_or(s.nb.paper, |p| p.paper);
         if store_add_page(&mut s.nb, n, paper) != 0 {
-            app_toast(a, tr("Could not delete those pages"), 2500);
+            // TRANSLATORS: a toast (about 1700 px at 44 px in bold, or two lines): Delete in the Pages view
+            // could not delete the ticked pages (the blank page a notebook keeps could not be added).
+            app_toast(a, tr("Couldn't delete selection."), 2500);
             return;
         }
     }
@@ -4166,7 +4723,7 @@ fn pages_delete(a: &mut App) {
     s.nb.last_page = s.index;
     s.page = s.page_at(s.index);
     if s.page.is_some() {
-        render_page_full(a);
+        render_page_open(a);
     }
     let s = ed(a);
     s.changed = true;
@@ -4180,11 +4737,12 @@ fn pages_delete(a: &mut App) {
     if s.nav.links_writable && nav_save_links(s.nb.id.as_str(), &mut s.nav, &s.nb) != 0 {
         qlog!("index: deleted pages' links left for a later save");
     }
-    let mut msg = String::new();
-    // TRANSLATORS: deleted pages go to the trash folder on the Kindle's storage (%s).
-    csnprintf!(&mut msg, 256, ng_("Deleted %d page (kept in %s)", "Deleted %d pages (kept in %s)", k as i64), k, "grimoire/trash");
+    // Document links to or from the deleted pages go from the screen now (the file loses them at its next write).
+    if doclinks_prune(&mut s.dl, &s.nb) > 0 {
+        s.boxes.stale = true;
+    }
+    // (the pages' files went to grimoire/trash; the view shows them gone)
     compose_all(a, RefreshMode::Full);
-    app_toast(a, &msg, 2500);
 }
 
 // A page added (or copied) at index `at` this session: the open page moves along if it was there or
@@ -4211,7 +4769,7 @@ fn pages_new(a: &mut App, at: i32) {
     let s = ed(a);
     let paper = s.open_page().map_or(s.nb.paper, |p| p.paper);
     if at < 1 || store_add_page(&mut s.nb, at, paper) != 0 {
-        app_toast(a, tr("Could not add a page"), 3000);
+        app_toast(a, tr("Couldn't add page"), 3000);
         return;
     }
     pages_added(a, at);
@@ -4224,6 +4782,9 @@ fn pages_copy(a: &mut App, index: i32) {
     if !save_page(a) {
         return;
     }
+    // (no confirmation: the owner, 2026-11-04. A toast left up from before goes first, so one the copy raises
+    // stays: the copy opening read-only says so.)
+    app_toast_dismiss(a);
     // The source page read first (PHASE2 9.2): it is migrated as it is read, so the copy takes its areas. (One
     // that does not read keeps legacy links; they are copied anyway and find the copy's ink: same strokes,
     // same seeds.)
@@ -4231,7 +4792,7 @@ fn pages_copy(a: &mut App, index: i32) {
     if store_duplicate_page(&mut ed(a).nb, index, index + 1) != 0 {
         // TRANSLATORS: a toast (about 1700 px at 44 px in bold, or two lines): Copy page in the
         // Pages view could not copy the page (the storage is full, or the notebook has 2000 pages).
-        app_toast(a, tr("Could not copy that page"), 3000);
+        app_toast(a, tr("Couldn't copy page"), 3000);
         return;
     }
     // Copy page keeps links: the copy gets every link of its source, same seed, target and area. Not an undo
@@ -4251,6 +4812,19 @@ fn pages_copy(a: &mut App, index: i32) {
             s.links_dirty = false; // (the save wrote every migrated area too)
         }
     }
+    // The document links come too (a planner's tabs are part of the page): Copy page's rewrite of
+    // doclinks.ini. Past the water level, or with the file unwritable, the page is copied without them and
+    // the same toast says so.
+    if !doclinks_of(&ed_ref(a).dl, src).is_empty() {
+        let s = ed(a);
+        let mut dl = s.dl.clone();
+        if doclinks_copy_page(&mut dl, src, copy) < 0 || doclinks_save(s.nb.id.as_str(), &mut dl, &s.nb) != 0 {
+            links_failed = true;
+        } else {
+            s.dl = dl;
+            s.boxes.stale = true;
+        }
+    }
     pages_added(a, index + 1);
     let s = ed(a);
     let erased = s.open_page().is_some_and(|p| p.strokes.iter().any(|x| stroke_is_erase(x)));
@@ -4261,15 +4835,694 @@ fn pages_copy(a: &mut App, index: i32) {
     if links_failed {
         // TRANSLATORS: a toast as the copy Copy page made opens (about 1700 px at 44 px in bold, or two
         // lines): the page was copied, but the links drawn on it could not be saved for the copy.
-        app_toast(a, tr("The copy has no links: they could not be saved."), 3000,
+        app_toast(a, tr("Copied without links: couldn't save them."), 3000,
         );
+    }
+}
+
+// Move to... (and a held tile dragged to a gap): the ticked pages, together and in their order, before
+// page `to` (npages: at the end), store_move_pages_undo. Only the page list changes (pages, links, names
+// and history go by page id), so the open page stays open wherever it went, and the view stays, on the
+// screenful where the moved pages are now. One undo step of the notebook's own (pv.move_undo, the bottom
+// row's Undo): the editor's Undo button keeps to the open page's history and never undoes a move.
+fn pages_move(a: &mut App, to: i32) {
+    // (a drag's carried pages, else the ticked ones; a failure draws the view again, as the drag's outline
+    // and gap bar are still on the screen and the ticks stay as they were)
+    let carry = std::mem::take(&mut ed(a).pv.carry);
+    if !save_page(a) {
+        compose_all(a, RefreshMode::Ui);
         return;
     }
-    let mut msg = String::new();
-    // TRANSLATORS: a toast as the copy Copy page made opens (about 1700 px at 44 px in bold, or two
-    // lines): %d is the page it copies.
-    csnprintf!(&mut msg, 160, tr("This page is a copy of page %d."), index + 1);
-    app_toast(a, &msg, 2500);
+    let s = ed(a);
+    let ticked: Vec<i32> = if carry.is_empty() { (0..s.nb.npages()).filter(|&i| pagesview_ticked(&s.pv, i)).collect() } else { carry };
+    if ticked.is_empty() {
+        return;
+    }
+    let moved: Vec<u32> = ticked.iter().map(|&i| s.nb.page_ids[i as usize]).collect();
+    let open = s.open_pid();
+    let first_was = s.nb.page_ids[0];
+    s.nb.last_page = s.index;
+    if store_move_pages_undo(&mut s.nb, &ticked, to, &mut s.pv.move_undo) != 0 {
+        // TRANSLATORS: a toast (about 1700 px at 44 px in bold, or two lines): Move to... could not save
+        // the notebook's new page order (the storage is full).
+        app_toast(a, tr("Couldn't move pages."), 3000);
+        compose_all(a, RefreshMode::Ui);
+        return;
+    }
+    let s = ed(a);
+    s.pv.redo = None; // (a new move: the Redo of what an Undo took back goes)
+    s.index = s.nb.page_ids.iter().position(|&p| p == open).map_or(s.index, |i| i as i32);
+    s.nb.last_page = s.index;
+    s.pv.current = s.index;
+    s.changed = true; // (the PDF mirror runs at close)
+    if s.nb.page_ids[0] != first_was && s.index == 0 {
+        s.thumb_dirty = true; // a new first page: the Library's card (written from its canvas as it is left)
+    }
+    pagesview_untick(&mut s.pv);
+    let at = s.nb.page_ids.iter().position(|&p| p == moved[0]).unwrap_or(0) as i32;
+    let (cols, rows) = pagesview_grid(&ed_ref(a).pv, a);
+    let s = ed(a);
+    s.pv.screen = at / (cols * rows).max(1);
+    // (the view shows the pages where they went, with no toast: the owner, 2026-11-04; one left up from before,
+    // a failed try's, goes)
+    compose_all(a, RefreshMode::Full);
+    app_toast_dismiss(a);
+}
+
+// The bottom row's Undo, right after a move (or the `undo` action over the Pages view): the pages back in the
+// order they had (store_undo_move_pages, the same path as the move), the open page still open, the view on the
+// screenful where the first page that moved back is; the move is then the Redo (pv.redo). A record that no
+// longer applies (the pages changed since) is dropped, never used.
+fn pages_undo_move(a: &mut App) {
+    if !save_page(a) {
+        return;
+    }
+    let s = ed(a);
+    let Some(u) = s.pv.move_undo.take() else { return };
+    let open = s.open_pid();
+    let first_was = s.nb.page_ids[0];
+    s.nb.last_page = s.index;
+    if store_undo_move_pages(&mut s.nb, &u) != 0 {
+        if u.applies(&s.nb) {
+            s.pv.move_undo = Some(u); // (notebook.ini could not be written: it can be tried again)
+        }
+        // TRANSLATORS: a toast (about 1700 px at 44 px in bold, or two lines): the Pages view's Undo could
+        // not put the moved pages back (the storage is full).
+        app_toast(a, tr("Couldn't undo move."), 3000);
+        compose_all(a, RefreshMode::Ui);
+        return;
+    }
+    let s = ed(a);
+    s.index = s.nb.page_ids.iter().position(|&p| p == open).map_or(s.index, |i| i as i32);
+    s.nb.last_page = s.index;
+    s.pv.current = s.index;
+    s.changed = true;
+    if s.nb.page_ids[0] != first_was && s.index == 0 {
+        s.thumb_dirty = true;
+    }
+    pagesview_untick(&mut s.pv);
+    let at = u.before.iter().zip(&u.after).position(|(b, f)| b != f).unwrap_or(0) as i32;
+    s.pv.redo = Some(PageRedo::Move(u));
+    let (cols, rows) = pagesview_grid(&ed_ref(a).pv, a);
+    let s = ed(a);
+    s.pv.screen = at / (cols * rows).max(1);
+    compose_all(a, RefreshMode::Full);
+    app_toast_dismiss(a); // (no confirmation; a toast left up from before, a failed try's, goes)
+}
+
+/// From how many pages New page's batch takes its pad down (one refresh) before it writes them (a batch under it
+/// takes about a second at most on a Kindle, ADD_PAGE_MS, and keeps its one refresh).
+const ADD_BUSY_PAGES: i32 = 25;
+/// A batch says "Adding N pages..." while it is written when it should take longer than this on a Kindle, ms, and
+/// always from ADD_NOTICE_PAGES pages; a smaller one is written with nothing said (the owner, 2026-11-04: "Show
+/// "Adding N pages..." only for big batches (100 or more pages, or when adding takes longer than about 2
+/// seconds), and take it down when done. Small batches stay silent.").
+const ADD_NOTICE_MS: i32 = 2000;
+const ADD_NOTICE_PAGES: i32 = 100;
+/// What one page of a batch takes on a Kindle, ms: a batch's time is told from its count before it starts, as
+/// nothing reaches the panel while it runs. Each page is one write_file_atomic of its blank file (store_add_pages),
+/// two fsyncs, and an fsync takes 15 to 25 ms there (util.rs: a page's save, two files, took 65 to 104 ms): about
+/// 40 ms a page, so a batch takes 2 s from about 50 pages. The same on every paper: a picture paper's pages are the
+/// same blank files, and bg/pages.ini is written once for the batch (the simulator: 0.13 to 0.20 ms a page on Blank
+/// and on a template's picture alike, batches of 200 and 1000 pages). grimoire.log's "pages: added=" line gives
+/// each batch's time, to set it by.
+const ADD_PAGE_MS: i32 = 40;
+// Whether a batch of `n` pages says "Adding N pages..." as it is written: a big one, or one that should take a
+// while. Not while a pen held on an action holds the panel: no toast could show before the writing then (it would
+// come after, once the pen lifts).
+fn add_notice_due(a: &App, n: i32) -> bool {
+    !a.pen_action_down && (n >= ADD_NOTICE_PAGES || n.saturating_mul(ADD_PAGE_MS) > ADD_NOTICE_MS)
+}
+// The notice itself, for `n` pages.
+fn add_notice_text(n: i32) -> String {
+    // TRANSLATORS: a toast while New page's batch is being written (about 1700 px at 44 px in bold, or two
+    // lines): %d blank pages are being added. Only for a large batch, which can take a minute; it goes when
+    // they are added.
+    cformat!(ng_("Adding %d page...", "Adding %d pages...", n as i64), n)
+}
+// The refresh that puts what is drawn on the panel before a batch's pages are written (nothing reaches it while
+// they are), with "Adding N pages..." when `notice` (put up just before): counted (editor.add_notices) only when
+// that refresh carried it, so the count says the notice was on the panel before the writing began.
+fn add_notice_flush(a: &mut App, notice: bool) {
+    let shown = a.toast_presents;
+    app_flush(a);
+    if notice && a.toast_presents != shown {
+        ed(a).add_notices += 1;
+    }
+}
+// The writing a batch of new pages does, from the Pages view's New page (a tap is a batch of one, its count
+// pad more) or the toolbar's count pad: `n` blank pages at index `at` (never first), on the paper of the page
+// they go after (the owner, 2026-11-03: the selected page's, else the open page's; in the Pages view the batch
+// goes after the last page ticked, else after the open page, and from the toolbar after the open page; a
+// document picture's falling back to the notebook's, store_new_page_paper), in one store operation
+// (store_add_pages: one notebook.ini write; a failure adds none). An annotated notebook takes them as it
+// takes New page's (note pages). The open page stays open (its index follows it) and the batch is the
+// notebook's Undo record (pv.add_undo), which the Pages view's bottom row offers while its pages are still
+// blank. `redraw` draws the screen as it will be without the pad (the batch's pad has closed): first, for a
+// large batch, and on a failure. A big batch says "Adding N pages..." until it is written (add_notice_due),
+// and the notice is down at the end on every path: replaced by the failure's toast, or taken down. False when
+// nothing was added (a toast said so).
+fn add_pages_write(a: &mut App, at: i32, n: i32, redraw: fn(&mut App)) -> bool {
+    if store_room_for_pages(&ed_ref(a).nb) < n {
+        // (New page tapped in a full notebook: its count pad, held, says the same)
+        app_toast(a, &cformat!(tr("Notebook full with %d pages."), STORE_MAX_PAGES as i32), 3000);
+        redraw(a);
+        return false;
+    }
+    if !save_page(a) {
+        redraw(a);
+        return false;
+    }
+    let notice = add_notice_due(a, n);
+    if n >= ADD_BUSY_PAGES || notice {
+        // A batch this large takes a while (each page file is written and synced, ADD_PAGE_MS on a Kindle):
+        // the pad goes first, in one refresh, so the screen never sits on the pad, with "Adding N pages..." in
+        // the same refresh when the batch is big (the main loop is held until the pages are written).
+        redraw(a);
+        if notice {
+            let msg = add_notice_text(n);
+            app_toast(a, &msg, 120_000);
+        }
+        add_notice_flush(a, notice);
+    }
+    let started = now_ms();
+    let s = ed(a);
+    let paper = batch_paper(s, at - 1);
+    let open = s.open_pid();
+    s.nb.last_page = s.index;
+    let mut undo = None;
+    let failed = at < 1 || store_add_pages(&mut s.nb, at, n, paper, &mut undo) != 0;
+    // (a large batch's time on this device, which ADD_PAGE_MS estimates; a picture paper's said apart)
+    if n >= ADD_BUSY_PAGES || notice || failed {
+        qlog!("pages: added=%d of %d ms=%d notice=%d paper=%s", if failed { 0 } else { n }, n,
+            now_ms().wrapping_sub(started) as i32, notice as i32,
+            if paper_is_image(store_new_page_paper(&ed_ref(a).nb, paper)) { "picture" } else { "drawn" });
+    }
+    if failed {
+        // TRANSLATORS: a toast (about 1700 px at 44 px in bold, or two lines): New page's batch could not
+        // add the pages (the storage is full); none was added.
+        app_toast(a, tr("Couldn't add pages."), 3000); // (in the notice's place)
+        redraw(a);
+        return false;
+    }
+    // (another toast that took the notice's place stays)
+    if notice && a.toast_visible && a.toast.as_bytes() == add_notice_text(n).as_bytes() {
+        app_toast_dismiss(a);
+    }
+    let s = ed(a);
+    s.index = s.nb.page_ids.iter().position(|&p| p == open).map_or(s.index, |i| i as i32);
+    s.nb.last_page = s.index;
+    s.pv.current = s.index;
+    s.pv.add_undo = undo;
+    s.pv.redo = None; // (a new batch: the Redo of what an Undo took back goes)
+    s.changed = true; // (the PDF mirror runs at close)
+    let npages = s.nb.npages() as usize;
+    if s.pv.sel.len() < npages {
+        s.pv.sel.resize(npages, false);
+    }
+    true
+}
+
+// The paper a batch takes from page `after`, the page it goes after: the open page's as it is in memory (saved
+// just before), another page's from its file (store_page_paper, which reads no strokes).
+fn batch_paper(s: &EditorState, after: i32) -> PaperKind {
+    if after == s.index {
+        if let Some(p) = s.open_page() {
+            return p.paper;
+        }
+    }
+    if after >= 0 && after < s.nb.npages() {
+        return store_page_paper(&s.nb, after);
+    }
+    s.open_page().map_or(s.nb.paper, |p| p.paper)
+}
+
+// New page's batch in the Pages view (its count pad, from a hold or a modifier tap, or a tap: a batch of
+// one): add_pages_write, and the view stays, on the screenful of the first new page, its tiles marked
+// "(new)" and its bottom row offering Undo while those pages are still blank.
+fn pages_add_batch(a: &mut App, at: i32, n: i32) {
+    let ok = add_pages_write(a, at, n, |a| compose_all(a, RefreshMode::Ui));
+    // Taps made while it was written (the pump read them) were aimed at the pad: none lands on the grid.
+    ed(a).pv.quiet_until = Some(now_ms());
+    if !ok {
+        return;
+    }
+    let s = ed(a);
+    pagesview_untick(&mut s.pv);
+    let (cols, rows) = pagesview_grid(&ed_ref(a).pv, a);
+    let s = ed(a);
+    s.pv.screen = at / (cols * rows).max(1);
+    // (its tiles show, marked new, with no toast: the owner, 2026-11-04; one left up from before goes)
+    compose_all(a, RefreshMode::Ui);
+    app_toast_dismiss(a);
+}
+
+// ---- the quick sizes card (2.1, lane L1) ----
+
+// The pen a toolbar button stands for when it is held: a pinned pen, the eraser, or the tool button while it shows
+// a pen (not the grid, whose pen is pinned and which opens the picker, nor the lasso).
+fn qs_target(s: &EditorState, h: Hit) -> Option<ToolKind> {
+    match h.id {
+        P_TOOL if (h.arg as u32) < TOOL_COUNT as u32 => Some(ToolKind(h.arg)),
+        P_TOOLPICK if s.tool_button_shows >= 0 => Some(ToolKind(s.tool_button_shows)),
+        _ => None,
+    }
+}
+
+// Whether a pen button held opens the card now: nothing in front of the page (a link being made, its strip up,
+// does not stop it, as it does not stop a pen tap), and not over the toolbar's count pad.
+fn qs_allowed(s: &EditorState) -> bool {
+    s.open && !s.add_kb.open && !sheet_open(s) && matches!(s.lm.state, LmState::Off | LmState::Armed)
+}
+
+// The held button's pen becomes the pen in use, as its tap would make it (Select mode ends; the eraser in use
+// stays, a hold never goes back to the pen before it), the button's press look is let go and the card opens
+// beside it, in one Ui. The contact (a finger or the nib) stays the card's unless it was lifted already.
+fn qs_hold(a: &mut App, h: Hit, tool: ToolKind, lifted: bool) {
+    if h.id == P_TOOL {
+        sel_off(a);
+    }
+    let mut save = false;
+    let st = &mut a.settings;
+    let changed = st.current_tool != tool;
+    if changed {
+        if h.id == P_TOOL && tool == TOOL_ERASER {
+            st.before_eraser = st.current_tool.0;
+        }
+        st.current_tool = tool;
+        save = true;
+        if h.id != P_TOOL {
+            sel_off(a);
+        }
+    }
+    if a.settings.hints & HINT_QUICK_SIZE == 0 {
+        // (a user who found the card needs no tip about it)
+        a.settings.hints |= HINT_QUICK_SIZE;
+        save = true;
+    }
+    if !lifted {
+        canvas_invert(&mut a.screen, h.r); // (the press look is let go; the redraw below draws it right)
+    }
+    let screen = Rect { x: 0, y: 0, w: a.w, h: a.h };
+    let s = ed_ref(a);
+    let (panel, zoom) = (s.panel, s.zoom);
+    let mut avoid = vec![status_zone(a)];
+    if s.lm.state == LmState::Armed {
+        avoid.push(s.lm.strip);
+    }
+    let mut q = QuickSize::default();
+    quicksize_open(&mut q, tool, h.r, screen, panel, &avoid, zoom);
+    let card = q.rect;
+    let s = ed(a);
+    s.qs = q;
+    s.has_pressed = false;
+    if save && s.qs_save == 0 {
+        s.qs_save = 1;
+    }
+    if !lifted {
+        s.owner = Owner::QuickSize;
+        s.qs.opener = true;
+        let p = s.press;
+        press_begin(&mut s.qs.press, p.x, p.y, p.t0);
+    }
+    // (the card with the button, or with the whole panel when the pen changed and its marks moved)
+    let u = rect_union(card, if changed { panel } else { h.r });
+    compose(a, u);
+    app_invalidate(a, u, RefreshMode::Ui);
+}
+
+// The card closes with nothing picked (outside it, Esc, Close menu): the page and the panel where it was, one Ui.
+fn qs_close(a: &mut App) {
+    let s = ed(a);
+    if !s.qs.open {
+        return;
+    }
+    let r = s.qs.rect;
+    s.qs = QuickSize::default();
+    compose(a, r);
+    app_invalidate(a, r, RefreshMode::Ui);
+}
+
+// What a contact on the card asked for (quicksize.rs). A pick is a setting: the tool's two widths, nothing on the
+// page, no history step; settings.ini is written a pass after the card's close was presented (qs_save).
+fn qs_result(a: &mut App, r: QsResult, d: Rect) {
+    match r {
+        QsResult::None => {}
+        QsResult::Changed => {
+            if !rect_is_empty(d) {
+                app_invalidate(a, d, RefreshMode::Ui);
+            }
+        }
+        QsResult::Chip(i) => {
+            let t = ed_ref(a).qs.tool;
+            quicksize_apply(t, &mut a.settings.tools[t.0 as usize], i);
+            ed(a).qs_save = 1;
+            qs_close(a);
+        }
+        QsResult::Mode(m) => {
+            a.settings.eraser_mode = m;
+            let s = ed(a);
+            s.qs_save = 1;
+            let r = s.qs.rect;
+            compose(a, r);
+            app_invalidate(a, r, RefreshMode::Ui);
+        }
+    }
+}
+
+// ---- the toolbar's count pad (owner, 2026-11-03) ----
+
+// Whether the toolbar's + (the next-page button on the last page) held opens the count pad now: nothing in
+// front of the page that takes the pad's place (no link being made).
+fn add_pad_allowed(s: &EditorState) -> bool {
+    s.open && !s.add_kb.open && s.lm.state == LmState::Off && !sheet_open(s)
+}
+
+// The screen under the toolbar's count pad, as it is when the pad is not up (its area composed and refreshed).
+fn add_pad_area(a: &App) -> Rect {
+    keyboard_area(&ed_ref(a).add_kb, Rect { x: 0, y: 0, w: a.w, h: a.h })
+}
+
+// The toolbar's + held (HOLD_MS, as the Pages view's New page), clicked with a modifier key held, or the
+// new-pages action: the count pad along the bottom, over the page, which stays. A full notebook says so.
+fn add_pad_open(a: &mut App) {
+    if !add_pad_allowed(ed_ref(a)) {
+        return;
+    }
+    let room = store_room_for_pages(&ed_ref(a).nb);
+    if room < 1 {
+        // (the Pages view's toast for New page held in a full notebook)
+        app_toast(a, &cformat!(tr("Notebook full with %d pages."), STORE_MAX_PAGES as i32), 3000);
+        return;
+    }
+    // (the Pages view's title for its count pad: the same pad)
+    keyboard_open_count(&mut ed(a).add_kb, tr("Pages to add"), room, add_label);
+    let r = add_pad_area(a);
+    compose(a, r);
+    app_invalidate(a, r, RefreshMode::Ui);
+}
+
+// The count pad goes with nothing added (its Cancel, Esc, Back, or a tap outside it): the page under it again.
+fn add_pad_cancel(a: &mut App) {
+    if !ed_ref(a).add_kb.open {
+        return;
+    }
+    let r = add_pad_area(a);
+    keyboard_close(&mut ed(a).add_kb);
+    app_toast_dismiss(a);
+    compose(a, r);
+    app_invalidate(a, r, RefreshMode::Ui);
+}
+
+// What a key of the toolbar's count pad did: Done adds the count after the open page (toolbar_add_batch),
+// Cancel closes it. A count held at what the notebook can take shows as that count (no toast: the owner,
+// 2026-11-04).
+fn add_pad_result(a: &mut App, r: KbResult) {
+    match r {
+        KbResult::Done => {
+            let n = keyboard_count(&ed_ref(a).add_kb);
+            toolbar_add_batch(a, n);
+        }
+        KbResult::Cancel => add_pad_cancel(a),
+        _ => {}
+    }
+}
+
+// A finger or the pen on the toolbar's count pad.
+fn add_pad_pointer(a: &mut App, ph: i32, ev: &InEvent) {
+    let mut kb = std::mem::take(&mut ed(a).add_kb);
+    let r = app_keyboard_pointer(a, &mut kb, ph, ev);
+    ed(a).add_kb = kb;
+    add_pad_result(a, r);
+}
+
+// The toolbar's batch: `n` blank pages right after the open page (on the last page, where the toolbar's +
+// adds one: the end), the open page staying open and on screen, the panel's page count showing them; the Pages
+// view's bottom row has their Undo (the editor's Undo is the page's own history).
+fn toolbar_add_batch(a: &mut App, n: i32) {
+    let r = add_pad_area(a);
+    keyboard_close(&mut ed(a).add_kb);
+    app_toast_dismiss(a);
+    let at = ed_ref(a).index + 1;
+    let ok = add_pages_write(a, at, n, |a| {
+        let r = add_pad_area(a);
+        compose(a, r);
+        app_invalidate(a, r, RefreshMode::Ui);
+    });
+    // Contacts made while it was written were aimed at the pad: none lands on the page.
+    ed(a).add_quiet_until = Some(now_ms());
+    if !ok {
+        return;
+    }
+    // The panel drawn again (its page count, and its + is the next-page arrow now), then the page where the pad
+    // was, in one refresh with the two buttons that changed (never the whole panel: the pad covers most of it).
+    draw_panel_over(a);
+    let u = ed_ref(a).hits.h.iter().filter(|h| h.id == P_PAGES || h.id == P_NEXT).fold(r, |u, h| rect_union(u, h.r));
+    compose(a, r);
+    app_invalidate(a, u, RefreshMode::Ui);
+}
+
+// The bottom row's Undo right after a batch: those pages taken back (store_undo_add_pages) while they are
+// still the blank pages it wrote, the open page still open, the view on the screenful of the page before
+// them. A record that no longer applies is dropped, never used.
+fn pages_undo_add(a: &mut App) {
+    if !save_page(a) {
+        return;
+    }
+    let s = ed(a);
+    let Some(u) = s.pv.add_undo.take() else { return };
+    // A link to one of them, or a name on one, makes them pages in use: not taken back (nor offered).
+    let used = pagesview_add_in_use(&u, &s.nav);
+    let open = s.open_pid();
+    let first = s.nb.page_ids.iter().position(|p| u.added.contains(p)).unwrap_or(0) as i32;
+    s.nb.last_page = s.index;
+    if used || u.added.contains(&open) || store_undo_add_pages(&mut s.nb, &u) != 0 {
+        let s = ed(a);
+        if !used && u.applies(&s.nb) && store_added_pages_untouched(&s.nb, &u) && !u.added.contains(&open) {
+            s.pv.add_undo = Some(u); // (notebook.ini could not be written: it can be tried again)
+        }
+        // TRANSLATORS: a toast (about 1700 px at 44 px in bold, or two lines): the Pages view's Undo could
+        // not take back the pages a batch added (one was written on, linked or named since, or the storage
+        // is full).
+        app_toast(a, tr("Couldn't undo: pages in use."), 3000);
+        compose_all(a, RefreshMode::Ui);
+        return;
+    }
+    let s = ed(a);
+    for &pid in &u.added {
+        forget_page(s, pid); // (one opened and left blank: its entry goes with it)
+    }
+    s.pv.redo = Some(PageRedo::Add(u)); // (the same pages again, by the bottom row's Redo or the redo action)
+    s.index = s.nb.page_ids.iter().position(|&p| p == open).map_or(s.index, |i| i as i32);
+    s.nb.last_page = s.index;
+    s.pv.current = s.index;
+    s.changed = true;
+    pagesview_untick(&mut s.pv);
+    let (cols, rows) = pagesview_grid(&ed_ref(a).pv, a);
+    let s = ed(a);
+    let to = (first - 1).max(0);
+    s.pv.screen = to.min(s.nb.npages() - 1) / (cols * rows).max(1);
+    compose_all(a, RefreshMode::Ui);
+    app_toast_dismiss(a); // (no confirmation; a toast left up from before goes)
+}
+
+// The bottom row's Redo, right after an Undo (or the `redo` action over the Pages view): the move again, in the
+// exact order it left (store_redo_move_pages), or the batch's blank pages again, with the same ids at the same
+// places (store_redo_add_pages), the open page still open, the view on the screenful of the first page it
+// changes. The record goes back to Undo (one step each). One that no longer applies is dropped, never used.
+// A batch's Redo writes its pages as slowly as the batch did: a big one says "Adding N pages..." as the batch
+// did (add_notice_due), on the panel before the writing, and the notice is down at the end, replaced by the
+// failure's toast or taken down with the rest.
+fn pages_redo(a: &mut App) {
+    if !save_page(a) {
+        return;
+    }
+    let s = ed(a);
+    let Some(r) = s.pv.redo.take() else { return };
+    if !r.applies(&s.nb) {
+        return;
+    }
+    let batch = match &r {
+        PageRedo::Add(u) => u.added.len() as i32,
+        PageRedo::Move(_) => 0,
+    };
+    let notice = batch > 0 && add_notice_due(a, batch);
+    if notice {
+        app_toast(a, &add_notice_text(batch), 120_000);
+        add_notice_flush(a, true);
+    }
+    let started = now_ms();
+    let s = ed(a);
+    let open = s.open_pid();
+    let first_was = s.nb.page_ids[0];
+    s.nb.last_page = s.index;
+    let rc = match &r {
+        PageRedo::Move(u) => store_redo_move_pages(&mut s.nb, u),
+        PageRedo::Add(u) => store_redo_add_pages(&mut s.nb, u),
+    };
+    // (a large batch's time again, as add_pages_write logs the batch's)
+    if batch >= ADD_BUSY_PAGES || notice || (batch > 0 && rc != 0) {
+        qlog!("pages: redo added=%d of %d ms=%d notice=%d", if rc != 0 { 0 } else { batch }, batch,
+            now_ms().wrapping_sub(started) as i32, notice as i32);
+    }
+    if rc != 0 {
+        let s = ed(a);
+        if r.applies(&s.nb) {
+            s.pv.redo = Some(r); // (a file could not be written: it can be tried again)
+        }
+        // TRANSLATORS: a toast (about 1700 px at 44 px in bold, or two lines): the Pages view's Redo could not
+        // do the page move or the new pages again (the storage is full).
+        app_toast(a, tr("Couldn't redo."), 3000); // (in the notice's place)
+        compose_all(a, RefreshMode::Ui);
+        return;
+    }
+    let s = ed(a);
+    s.index = s.nb.page_ids.iter().position(|&p| p == open).map_or(s.index, |i| i as i32);
+    s.nb.last_page = s.index;
+    s.pv.current = s.index;
+    s.changed = true;
+    if s.nb.page_ids[0] != first_was && s.index == 0 {
+        s.thumb_dirty = true;
+    }
+    let npages = s.nb.npages() as usize;
+    if s.pv.sel.len() < npages {
+        s.pv.sel.resize(npages, false);
+    }
+    pagesview_untick(&mut s.pv);
+    let at = match r {
+        PageRedo::Move(u) => {
+            let at = u.before.iter().zip(&u.after).position(|(b, f)| b != f).unwrap_or(0) as i32;
+            s.pv.move_undo = Some(u);
+            at
+        }
+        PageRedo::Add(u) => {
+            let at = s.nb.page_ids.iter().position(|p| u.added.contains(p)).unwrap_or(0) as i32;
+            s.pv.add_undo = Some(u);
+            at
+        }
+    };
+    let (cols, rows) = pagesview_grid(&ed_ref(a).pv, a);
+    let s = ed(a);
+    s.pv.screen = at / (cols * rows).max(1);
+    compose_all(a, RefreshMode::Full);
+    app_toast_dismiss(a); // (no confirmation; the notice, or a toast left up from before, a failed try's, goes)
+}
+
+// The `undo` and `redo` actions (keys, a controller, gestures) with the Pages view's grid in front: its own Undo
+// and Redo, never the open page's history (and the editor's never these: the owner, 2026-11-03, "keep them
+// seperate to each other"). Nothing to undo or redo does nothing. True when the view took the action.
+fn pages_history_action(a: &mut App, action: i32) -> bool {
+    let s = ed(a);
+    let pv = &s.pv;
+    if !pv.open || pv.kb.open || pv.index_tab || pv.picking || pv.overlay || pv.name_only || !pv.unified {
+        return false;
+    }
+    if !pagesview_quiet(pv) {
+        return true; // (a held tile's card, or a drag under way: the action is taken and does nothing)
+    }
+    if action == SHORTCUT_UNDO {
+        match pagesview_undo_result(&s.pv, &s.nb, &s.nav) {
+            Some(PvResult::UndoAdd) => pages_undo_add(a),
+            Some(_) => pages_undo_move(a),
+            None => {}
+        }
+    } else if pagesview_redo_offered(&s.pv, &s.nb) {
+        pages_redo(a);
+    }
+    true
+}
+
+// Copy to notebook... (a held page's card, or the bottom row with pages ticked): the notebook picker
+// over the Pages view, the open notebook left out; a page tile there or At the end says where.
+fn pages_copy_to_pick(a: &mut App) {
+    if !save_page(a) {
+        return;
+    }
+    links_flush(a); // (the copies take the links as saved, migrated areas too)
+    let s = ed(a);
+    s.copy_pids = (0..s.nb.npages()).filter(|&i| pagesview_ticked(&s.pv, i)).map(|i| s.nb.page_ids[i as usize]).collect();
+    if s.copy_pids.is_empty() {
+        return;
+    }
+    let (folder, id) = (s.nb.folder.as_str().to_string(), s.nb.id.as_str().to_string());
+    if with_modal(a, |s| &mut s.destination, |p, _| p.start_copy(&folder, &id)) {
+        app_toast_dismiss(a);
+        compose_all(a, RefreshMode::Full);
+    } else {
+        ed(a).copy_pids.clear();
+        app_toast(a, tr("Couldn't read notebooks."), 3000);
+    }
+}
+
+// The copy itself (store_copy_pages_to, then nav_copy_pages_across): pages `pids` into notebook `id`
+// before its page `at`. That notebook's compaction stops first, as when a notebook opens; its card is
+// drawn again when the copies come first, and its PDF mirror is made again.
+fn pages_copy_to(a: &mut App, id: &str, at: i32, pids: &[u32]) {
+    let dpi = a.dpi;
+    compose_all(a, RefreshMode::Full);
+    if pids.is_empty() {
+        return;
+    }
+    bg_cancel_notebook(id);
+    let mut dst = NotebookInfo::default();
+    let mut out = Vec::new();
+    let s = ed(a);
+    if store_load_info(id, &mut dst) != 0 || dst.page_ids.len() + pids.len() > STORE_MAX_PAGES
+        || store_copy_pages_to(&s.nb, pids, &mut dst, at, &mut out) != 0 {
+        // TRANSLATORS: a toast (about 1700 px at 44 px in bold, or two lines): Copy to notebook... copied
+        // nothing (the storage is full, a page does not read, or that notebook has 2000 pages).
+        app_toast(a, tr("Couldn't copy pages."), 3000);
+        return;
+    }
+    let (mut sw, mut sh, mut dw, mut dh) = (0, 0, 0, 0);
+    store_notebook_page_size(&s.nb, &mut sw, &mut sh);
+    store_notebook_page_size(&dst, &mut dw, &mut dh);
+    let mut res = NavCopyResult::default();
+    let nav_ok = nav_copy_pages_across(&s.nav, s.nb.id.as_str(), &out, &dst, dw as f32 / sw.max(1) as f32, dh as f32 / sh.max(1) as f32, &mut res) == 0;
+    // The document links of the pages whose targets were copied too (a page out of a planner loses the tabs to
+    // pages left behind); a notebook whose doclinks.ini does not write gets the pages without them.
+    let docs_ok = doclinks_copy_across(&s.dl, &out, &dst, dw as f32 / sw.max(1) as f32, dh as f32 / sh.max(1) as f32) >= 0;
+    for c in out.iter().filter(|c| c.erased) {
+        if compact_note_page(id, c.to) != 0 {
+            qlog!("compact: %s: p%u.qpg (a copy) could not be listed", id, c.to);
+        }
+    }
+    if at == 0 {
+        // The copies come first: the Library's card of that notebook from its new first page.
+        let mut p0: Option<Box<Page>> = None;
+        if store_read_page(&dst, 0, &mut p0) == 0 {
+            let mut t = Canvas::default();
+            if canvas_init(&mut t, dw / 3, dh / 3) == 0 {
+                page_render_thumb(&mut t, p0.as_deref().unwrap(), dpi);
+                store_save_thumb(id, &t);
+            }
+        }
+    }
+    if a.settings.mirror_pdf {
+        bg_mirror_pdf(id, dpi, &app_mirror_dir(), false);
+    }
+    if compact_listed(id) {
+        bg_queue(BgKind::CompactPages, Some(id), None, dpi, false);
+    }
+    pagesview_untick(&mut ed(a).pv);
+    compose_all(a, RefreshMode::Full);
+    // (done, no toast: the owner, 2026-11-04; only names and links that could not be saved there say so, and a
+    // toast left up from before goes)
+    app_toast_dismiss(a);
+    if !nav_ok {
+        let n = out.len() as i32;
+        // TRANSLATORS: a toast as Copy to notebook... is done (about 1700 px at 44 px in bold, or two lines): %d
+        // pages were copied into the notebook named %s, but their page names and links could not be saved there.
+        let msg = cformat!(ng_("Copied %d page to %s, without its names and links.", "Copied %d pages to %s, without their names and links.", n as i64), n, dst.name.as_str());
+        app_toast(a, &msg, 3000);
+    } else if !docs_ok {
+        let n = out.len() as i32;
+        // TRANSLATORS: a toast as Copy to notebook... is done (about 1700 px at 44 px in bold, or two lines): %d
+        // pages were copied into the notebook named %s with their names and links, but not the links the
+        // document brought (a planner's tabs: that notebook has no room for them, or its file does not read).
+        let msg = cformat!(ng_("Copied %d page to %s, without its document links.", "Copied %d pages to %s, without their document links.", n as i64), n, dst.name.as_str());
+        app_toast(a, &msg, 3000);
+    }
 }
 
 // ---- making a link without ink (PHASE2 6) ----
@@ -4297,7 +5550,10 @@ fn migration_reset(s: &mut EditorState) {
 /// Pages view coming up, closing). A pen still drawing the lasso has the rest of its stroke ignored; Link
 /// to... and New page...'s keyboard close with it.
 fn lm_drop(s: &mut EditorState) {
-    s.destination=NotebookPicker::default();
+    sel_drop(s);
+    if !s.destination.copying {
+        s.destination=NotebookPicker::default(); // (Copy to notebook...'s picker is the Pages view's, not link making's)
+    }
     if s.owner == Owner::Lasso || s.owner == Owner::Strip || s.owner == Owner::LinkTo {
         s.owner = Owner::None;
     }
@@ -4495,7 +5751,7 @@ fn link_arm(a: &mut App, from_bar: bool, redraw: Option<u32>) {
     if !s.nav.links_writable {
         // TRANSLATORS: a toast (about 1700 px at 44 px in bold, or two lines): Add a link was asked while
         // the notebook's links.ini could not be read, so no link can be made.
-        app_toast(a, tr("Links could not be read in this notebook."), 3000);
+        app_toast(a, tr("Couldn't read links in this notebook."), 3000);
         return;
     }
     let pid = s.open_pid();
@@ -4503,7 +5759,7 @@ fn link_arm(a: &mut App, from_bar: bool, redraw: Option<u32>) {
         let mut msg = String::new();
         // TRANSLATORS: a toast (about 1700 px at 44 px in bold, or two lines): Add a link on a page that
         // has the most links a page may have; %d is that number (64).
-        csnprintf!(&mut msg, 160, tr("This page has %d links: delete one to add another."), NAV_LINKS_PER_PAGE);
+        csnprintf!(&mut msg, 160, tr("Link limit (%d) reached: delete one first."), NAV_LINKS_PER_PAGE);
         app_toast(a, &msg, 3000);
         return;
     }
@@ -4688,7 +5944,7 @@ fn lasso_end(a: &mut App) {
         lasso_cancel(a);
         // TRANSLATORS: a toast (about 1700 px at 44 px in bold, or two lines): after Add a link, the
         // stroke drawn was too small to be the link's box.
-        app_toast(a, tr("Too small for a link: draw around what links."), 3000);
+        app_toast(a, tr("Link area too small."), 3000);
         return;
     }
     if let Some(seed) = s.lm.redraw {
@@ -4814,7 +6070,7 @@ fn lt_result(a: &mut App, r: LbResult, d: Rect) {
         }
         LbResult::Search => find_pick_open(a),
         LbResult::Choose => link_choose(a),
-        LbResult::Cancel => link_cancel(a, true),
+        LbResult::Cancel => link_cancel(a),
         LbResult::Pager => {
             let g = ed(a).lt.grid;
             compose(a, g);
@@ -4830,6 +6086,9 @@ fn link_choose(a: &mut App) {
     if ed_ref(a).lt.no_pages {
         return;
     }
+    // (no "Where does the link go?": the owner, 2026-11-04. A toast left up goes first, so a page that could not
+    // be saved still says so.)
+    app_toast_dismiss(a);
     ed(a).lt.hidden = true;
     save_page(a);
     let index = ed(a).index;
@@ -4845,9 +6104,6 @@ fn link_choose(a: &mut App) {
         return;
     }
     compose_all(a, RefreshMode::Full);
-    // TRANSLATORS: a toast over the Pages view (about 1700 px at 44 px in bold, or two lines): the
-    // box of a new link is drawn; tap the page (or the Index) it goes to.
-    app_toast(a, tr("Where does the link go? Tap its page."), 3000);
 }
 
 /// New page... (6.8): a keyboard names the page to add, docked where Link to... is (at the top exactly when it
@@ -4904,7 +6160,7 @@ fn newpage_done(a: &mut App, name: &str) {
         let u = rect_union(kb_area, s.lt.rect);
         compose(a, u);
         app_invalidate(a, u, RefreshMode::Ui);
-        app_toast(a, tr("Could not add a page"), 3000);
+        app_toast(a, tr("Couldn't add page"), 3000);
         return;
     }
     let pid = s.nb.page_ids[n as usize];
@@ -4920,7 +6176,7 @@ fn newpage_done(a: &mut App, name: &str) {
     csnprintf!(&mut target, NAV_TARGET_LEN, "p%u", pid);
     link_pick_as(a, &target, n + 1);
     if name_failed {
-        app_toast(a, tr("Could not save the page name."), 3000);
+        app_toast(a, tr("Couldn't save page name."), 3000);
     }
 }
 
@@ -4961,7 +6217,7 @@ fn strip_pointer(a: &mut App, ph: i32, ev: &InEvent) {
         return;
     }
     if !touch_cancelled(ev) && press_is_tap(&s.lm.press, cancel) {
-        link_cancel(a, true);
+        link_cancel(a);
     } else {
         compose(a, cancel);
         app_invalidate(a, cancel, RefreshMode::Fast);
@@ -5007,7 +6263,7 @@ fn link_pick_as(a: &mut App, target: &str, new_page: i32) {
     let page = s.open_page().unwrap();
     // unique among the page's ink and link seeds: a link never takes in ink, and new ink never joins it
     let want = now_ms().wrapping_mul(2654435761) ^ page.strokes.len() as u32;
-    let seed = nav_new_seed(&s.nav, page, pid, want);
+    let seed = nav_new_seed_with(&s.nav, Some(&s.dl), page, pid, want);
     s.boxes.stale = true;
     let ok = nav_link_set(&mut s.nav, pid, seed, target) == 0
         && nav_link_set_area(&mut s.nav, pid, seed, Some(area)) == 0
@@ -5018,7 +6274,7 @@ fn link_pick_as(a: &mut App, target: &str, new_page: i32) {
         migration_reset(s);
         lm_close(a, u);
         // TRANSLATORS: a toast (about 1700 px at 44 px in bold, or two lines).
-        app_toast(a, tr("Could not save the link."), 3000);
+        app_toast(a, tr("Couldn't save link."), 3000);
         if from_bar {
             bar_show(a, false);
         }
@@ -5050,7 +6306,7 @@ fn link_pick_as(a: &mut App, target: &str, new_page: i32) {
         // TRANSLATORS: a toast, once, after the first link is made (about 1700 px at 44 px in bold, or two
         // lines): a finger's tap on the link goes where it goes; a finger held on it opens its card (rename,
         // change, redraw or delete it).
-        app_toast(a, tr("Linked. Tap it with a finger to go there; hold it for more."), 4000,
+        app_toast(a, tr("Linked. Finger tap to go there; hold for more."), 4000,
         );
         return;
     }
@@ -5079,7 +6335,7 @@ fn linked_msg(s: &EditorState, to: i32, new_page: i32) -> String {
     if new_page > 0 {
         // TRANSLATORS: a toast (about 1700 px at 44 px in bold, or two lines): New page... added page %d at the
         // end of the notebook and the new link goes to it.
-        csnprintf!(&mut msg, 200, tr("Linked to the new page %d."), new_page);
+        csnprintf!(&mut msg, 200, tr("Linked to new page %d."), new_page);
     } else if to >= 0 {
         let name = nav_name(&s.nav, s.nb.page_ids[to as usize]);
         if !name.is_empty() {
@@ -5135,7 +6391,7 @@ fn link_retarget(a: &mut App, target: &str, new_page: i32) {
         nav_load(s.nb.id.as_str(), &mut s.nav);
         migration_reset(s);
         lm_close(a, u);
-        app_toast(a, tr("Could not save the link."), 3000);
+        app_toast(a, tr("Couldn't save link."), 3000);
         if from_bar {
             bar_show(a, false);
         }
@@ -5178,7 +6434,7 @@ fn redraw_done(a: &mut App, seed: u32, r: Rect, drawn: Rect) {
         migration_reset(s);
         compose(a, u);
         app_invalidate(a, u, RefreshMode::Ui);
-        app_toast(a, tr("Could not save the link."), 3000);
+        app_toast(a, tr("Couldn't save link."), 3000);
         if from_bar {
             bar_show(a, false);
         }
@@ -5203,15 +6459,14 @@ fn redraw_done(a: &mut App, seed: u32, r: Rect, drawn: Rect) {
     if from_bar {
         bar_show(a, false);
     }
-    // TRANSLATORS: a toast (about 1700 px at 44 px in bold, or two lines): the long-press card's Redraw the
-    // area gave the link the area just drawn; Undo brings the old one back.
-    app_toast(a, tr("New area saved. Undo brings the old one back."), 2500);
+    app_toast_dismiss(a); // (no confirmation: the owner, 2026-11-04; a toast left up from before goes)
 }
 
 /// No link is made (6.10): from the strip's or Link to...'s Cancel, a tap outside Link to..., the add-link
 /// action again, Close menu, and Back while Link to... is up. The strip, the lasso, the rectangle and Link
-/// to... go; `toast` says so; the bar comes back when its New link began it.
-fn link_cancel(a: &mut App, toast: bool) {
+/// to... go, with no toast (the owner, 2026-11-04), and a toast left up from the making goes too; the bar
+/// comes back when its New link began it.
+fn link_cancel(a: &mut App) {
     let s = ed(a);
     if s.lm.state == LmState::Off && !(s.pv.open && s.pv.picking) {
         return;
@@ -5219,18 +6474,12 @@ fn link_cancel(a: &mut App, toast: bool) {
     let u = lm_bounds(a);
     let s = ed(a);
     let from_bar = s.lm.from_bar;
-    // (a retarget or a redraw the card began made nothing: it ends silently, its border going)
-    let quiet = !s.lm.retarget.is_empty() || s.lm.redraw.is_some();
     lm_drop(s);
     lm_close(a, u);
     if from_bar {
         bar_show(a, false);
     }
-    if toast && !quiet {
-        // TRANSLATORS: a toast (about 1700 px at 44 px in bold, or two lines): link making was cancelled
-        // (its Cancel, or Back while picking where it goes), and no link was made.
-        app_toast(a, tr("No link made."), 2500);
-    }
+    app_toast_dismiss(a);
 }
 
 /// A menu came up while a link was being made (any menu's button, on the panel or as an action): the link is
@@ -5290,7 +6539,10 @@ fn lm_say(a: &mut App) {
 fn undo_redo_link(a: &mut App, ih: usize, ip: usize, undo: bool) {
     let before = if a.settings.link_areas { eye_bounds(a) } else { RECT_EMPTY };
     let s = ed(a);
-    let clearing=if undo {history_undo_kind(&s.hist[ih].h)}else{history_redo_kind(&s.hist[ih].h)}==Some(ActKind::Clear);
+    let kind=if undo {history_undo_kind(&s.hist[ih].h)}else{history_redo_kind(&s.hist[ih].h)};
+    let clearing=kind==Some(ActKind::Clear);
+    // A lasso step (select.rs) with links: its ink goes back by its patch, as undo_redo's does.
+    let lasso=kind==Some(ActKind::Lasso);
     let mut d = RECT_EMPTY;
     let (hh, page) = hist_page(&mut s.hist, ih, ip);
     if !(if undo { history_undo(hh, page, &mut d) } else { history_redo(hh, page, &mut d) }) {
@@ -5314,7 +6566,7 @@ fn undo_redo_link(a: &mut App, ih: usize, ip: usize, undo: bool) {
     s.boxes.stale = true;
     ok = ok && nav_save_links(s.nb.id.as_str(), &mut s.nav, &s.nb) == 0;
     if !ok {
-        if clearing {
+        if clearing || lasso {
             // A failed sidecar save must also reverse the tentative ink change, preserving
             // the original Clear action so a later retry remains possible.
             let (h,page)=hist_page(&mut s.hist,ih,ip);
@@ -5325,15 +6577,15 @@ fn undo_redo_link(a: &mut App, ih: usize, ip: usize, undo: bool) {
         migration_reset(s);
         let h = &mut s.hist[ih].h;
         if undo {
-            if !clearing {history_drop_last_redo(h);}
+            if !clearing && !lasso {history_drop_last_redo(h);}
             // TRANSLATORS: a toast (about 1700 px at 44 px in bold, or two lines): Undo of a link change
             // could not save links.ini, so the change is still there.
-            app_toast(a, tr("Could not save the links: that change was not undone."), 3000,
+            app_toast(a, tr("Couldn't save links: undo unsuccessful."), 3000,
             );
         } else {
-            if !clearing {history_drop_last_undo(h);}
+            if !clearing && !lasso {history_drop_last_undo(h);}
             // TRANSLATORS: the same toast for Redo.
-            app_toast(a, tr("Could not save the links: that change was not redone."), 3000,
+            app_toast(a, tr("Couldn't save links: redo unsuccessful."), 3000,
             );
         }
         repaint_panel(a, RefreshMode::Ui);
@@ -5341,29 +6593,75 @@ fn undo_redo_link(a: &mut App, ih: usize, ip: usize, undo: bool) {
     }
     s.links_dirty = false;
     s.changed = true; // (the notebook changed: the PDF mirror runs at close)
+    if lasso {
+        if !base_valid(s) {
+            base_reset(s);
+        }
+        let swapped = base_valid(s) && !s.picture_missing && history_swap_patch(&mut s.hist[ih].h, undo, &mut s.page_canvas, &mut s.base).is_some();
+        if swapped {
+            s.undo_patched += 1;
+        } else {
+            draw_page(a, d);
+        }
+        let u = if a.settings.link_areas { rect_union(page_to_screen(a, d), rect_union(before, eye_bounds(a))) } else { page_to_screen(a, d) };
+        compose(a, u);
+        app_invalidate(a, u, RefreshMode::Ui);
+        mark_changed(ed(a));
+        repaint_panel(a, RefreshMode::Ui);
+        return;
+    }
     if clearing {
         mark_changed(s);
         bar_rebuild(a);render_page_full(a);compose_all(a,RefreshMode::Full);repaint_panel(a,RefreshMode::Ui);
         return;
     }
+    // (with the eye off a link change shows nowhere on the page: Undo and Redo say nothing, the owner,
+    // 2026-11-04; a toast still up about the change, "Linked to ...", would now be wrong, so it goes)
+    app_toast_dismiss(a);
     if a.settings.link_areas {
         let u = rect_union(before, eye_bounds(a));
         compose(a, u);
         app_invalidate(a, u, RefreshMode::Ui);
-    } else if undo {
-        // TRANSLATORS: a toast (about 1700 px at 44 px in bold, or two lines): Undo took back a link change
-        // (a link made, deleted or changed), which shows nowhere on the page while the eye is off.
-        app_toast(a, tr("Link change undone."), 2000);
-    } else {
-        // TRANSLATORS: the same toast for Redo.
-        app_toast(a, tr("Link change redone."), 2000);
     }
     repaint_panel(a, RefreshMode::Ui);
 }
 
 fn pages_event(a: &mut App, ph: i32, ev: &InEvent) {
-    match with_pv(a, |pv, a, nb, nav| {
-        pagesview_pointer(pv, a, nb, nav, ph, ev)}) {
+    let r = with_pv(a, |pv, a, nb, nav| pagesview_pointer(pv, a, nb, nav, ph, ev));
+    pages_result(a, r);
+}
+
+/// A hardware keyboard's key while the editor has a modal that types (the Pages view's count pad, for a
+/// batch of new pages): true when it took the key, which then goes to no shortcut.
+pub fn editor_modal_key(a: &mut App, ev: &InEvent) -> bool {
+    if a.scr != ScreenId::Editor {
+        return false;
+    }
+    // The toolbar's count pad: its keys type, Enter is Done and Esc Cancel; no other key reaches the page.
+    if ed_ref(a).open && ed_ref(a).add_kb.open {
+        if let Some(key) = count_pad_key(ev.value) {
+            let mut kb = std::mem::take(&mut ed(a).add_kb);
+            let r = app_keyboard_press(a, &mut kb, key);
+            ed(a).add_kb = kb;
+            add_pad_result(a, r);
+        }
+        return true;
+    }
+    if !ed_ref(a).pv.open {
+        return false;
+    }
+    match with_pv(a, |pv, a, nb, nav| pagesview_key(pv, a, nb, nav, ev.value)) {
+        Some(r) => {
+            pages_result(a, r);
+            true
+        }
+        None => false,
+    }
+}
+
+// What the Pages view asked for (PvResult), from a pointer event or a key.
+fn pages_result(a: &mut App, r: PvResult) {
+    match r {
         PvResult::Close => {
             let s = ed(a);
             if s.pv.picking && s.lm.state == LmState::Pick && s.lt.open {
@@ -5371,7 +6669,7 @@ fn pages_event(a: &mut App, ph: i32, ev: &InEvent) {
                 s.lt.hidden = false;
                 pages_hide(a, -1);
             } else if s.pv.picking {
-                link_cancel(a, true);
+                link_cancel(a);
             } else {
                 pages_hide(a, -1);
             }
@@ -5409,20 +6707,27 @@ fn pages_event(a: &mut App, ph: i32, ev: &InEvent) {
             }
         }
         PvResult::GoTo => {
-            // Go to page...: the view closes and the Find sheet opens over the page, in one Full.
-            pagesview_close(&mut ed(a).pv);
-            find_open(a);
-            compose_all(a, RefreshMode::Full);
+            // Go to page...: the Find sheet over the view, which stays behind it: a row picked goes to that page,
+            // Cancel leaves the view as it was.
+            find_show(a);
         }
         PvResult::Delete => pages_delete(a),
-        PvResult::New => {
-            let to = ed(a).pv.target;
-            pages_new(a, to);
-        }
         PvResult::Copy => {
             let to = ed(a).pv.target;
             pages_copy(a, to);
         }
+        PvResult::Move => {
+            let to = ed(a).pv.target;
+            pages_move(a, to);
+        }
+        PvResult::CopyTo => pages_copy_to_pick(a),
+        PvResult::UndoMove => pages_undo_move(a),
+        PvResult::AddPages => {
+            let (at, n) = (ed(a).pv.target, ed(a).pv.add_count);
+            pages_add_batch(a, at, n);
+        }
+        PvResult::UndoAdd => pages_undo_add(a),
+        PvResult::Redo => pages_redo(a),
         PvResult::Name => {
             // (the open page, or the held tile's after its card's Rename)
             let s = ed(a);
@@ -5432,7 +6737,7 @@ fn pages_event(a: &mut App, ph: i32, ev: &InEvent) {
             let text = s.pv.kb.text;
             if nav_set_name(&mut s.nav, pid, text.as_str()) != 0 || nav_save(s.nb.id.as_str(), &mut s.nav, &s.nb) != 0 {
                 nav_set_name(&mut s.nav, pid, &old);
-                app_toast(a, tr("Could not save the page name."), 3000);
+                app_toast(a, tr("Couldn't save page name."), 3000);
             } else {
                 s.changed = true;
             }
@@ -5458,10 +6763,34 @@ fn link_under(a: &App, x: f32, y: f32, out: &mut NavLink) -> bool {
     )
 }
 
-// A finger's tap at (x, y): a link there goes to its page, or opens the Index.
+// The document link under (x, y) on screen, on the open page (D9: its exact area first, then the finger's
+// growth). Only asked where no link of the user's is: theirs come first.
+fn doc_link_under(a: &App, x: f32, y: f32) -> Option<DocLink> {
+    let s = ed_ref(a);
+    let page = s.open_page()?;
+    if s.dl.links.is_empty() || s.page_ix().is_none() {
+        return None;
+    }
+    let (mut px, mut py) = (0.0, 0.0);
+    to_page(s, x, y, &mut px, &mut py);
+    doclinks_at(&s.dl, page, s.nb.page_ids[s.index as usize], px, py, NAV_LINK_MIN_MM * a.dpi / 25.4)
+}
+
+// A finger's tap at (x, y): a link there goes to its page, or opens the Index. The user's links first, then a
+// document link (a planner's tab).
 fn link_follow(a: &mut App, x: f32, y: f32) {
     let mut l = NavLink::default();
     if !link_under(a, x, y, &mut l) {
+        if let Some(d) = doc_link_under(a, x, y) {
+            follow_target(a, &format!("p{}", d.target));
+        }
+        return;
+    }
+    if ed_ref(a).nav.links_writable && nav_target_state(l.target.as_str()).is_some_and(|t| nav_target_broken(&t)) {
+        // A link to a page or notebook that was deleted: its card (titled "... / Page gone" or "Notebook
+        // gone"), to change where it goes or delete it, instead of a toast and nothing.
+        link_off(a);
+        card_show(a, &[l.seed]);
         return;
     }
     follow_target(a,l.target.as_str());
@@ -5557,7 +6886,7 @@ fn card_show(a: &mut App, seeds: &[u32]) {
     let (w, h) = linkcard_size(&s.card);
     let screen = Rect { x: 0, y: top_of_page(a), w: a.w, h: a.h - top_of_page(a) ,
     };
-    let rect = linkcard_place(w, h, s.card.band, screen, s.panel, status_zone(a));
+    let rect = popout_place(w, h, s.card.band, screen, &[s.panel, status_zone(a)]);
     ed(a).card.rect = rect;
     compose(a, rect);
     app_invalidate(a, rect, RefreshMode::Ui);
@@ -5579,6 +6908,25 @@ fn card_set(a: &mut App, seeds: &[u32], from_bar: bool) {
     ed(a).card.band = band;
 }
 
+/// The card of the document-link chip i (a group of the page's document links to one target): read only, its
+/// heavy border around their exact boxes, one row, Rename the page. False for a chip with no page here.
+fn card_set_doc(a: &mut App, i: i32) -> bool {
+    let s = ed_ref(a);
+    let Some(e) = linkbar_entry(&s.lb, i).copied() else { return false };
+    let Some(&target) = (e.page >= 0).then(|| s.nb.page_ids.get(e.page as usize)).flatten() else { return false };
+    let pid = s.open_pid();
+    let Some(page) = s.open_page() else { return false };
+    let mut boxes: Vec<Rect> = doclinks_targets(&s.dl, page, pid).into_iter().filter(|&(t, _)| t == target).map(|(_, r)| r).collect();
+    boxes.sort_by_key(|r| (r.y, r.x));
+    with_card(a, |c, _a, nb, nav| linkcard_set_doc(c, pid, target, nb, nav, true));
+    let s = ed(a);
+    s.card.boxes = boxes;
+    s.card.border = true;
+    let band = card_band(a);
+    ed(a).card.band = band;
+    true
+}
+
 /// A press held on chip `chip` of the Links bar (entry i, 8.10, D1): the long-press card for all the entry's
 /// links on the page, above the bar in the chip's column, the bar staying under it. While the bar looks at
 /// another page it looks at its own again first (the links are there), and the borders come with the page area's
@@ -5592,20 +6940,25 @@ fn bar_hold(a: &mut App, i: i32, chip: Rect) {
         s.peek = Peek { count: s.peek.count, ..Peek::default() };
         s.lb.selected = -1;
     }
-    // The entry's links, in reading order: those whose box carries its number.
+    // The entry's links, in reading order: those whose box carries its number. Inside the document links, the
+    // chip's document links (read only: Rename the page).
     boxes_get(a);
+    let is_doc = ed_ref(a).lb.in_docs;
     let s = ed_ref(a);
     let mut ks: Vec<usize> = (0..s.boxes.n).filter(|&k| s.boxes.entry[k] as i32 == i + 1).collect();
     ks.sort_by_key(|&k| (s.boxes.area[k].y, s.boxes.area[k].x, k));
-    let seeds: Vec<u32> = ks.iter().map(|&k| s.boxes.link[k].seed).collect();
-    if seeds.is_empty() {
+    let seeds: Vec<u32> = if is_doc { Vec::new() } else { ks.iter().map(|&k| s.boxes.link[k].seed).collect() };
+    let shown = if is_doc { card_set_doc(a, i) } else { !seeds.is_empty() };
+    if !shown {
         if peeking {
             bar_back_drawn(a);
         }
         app_invalidate(a, d, RefreshMode::Ui);
         return;
     }
-    card_set(a, &seeds, true);
+    if !is_doc {
+        card_set(a, &seeds, true);
+    }
     let s = ed_ref(a);
     let (aw, bar) = (a.w, s.lb.rect);
     if peeking {
@@ -5646,7 +6999,7 @@ fn top_of_page(a: &App) -> i32 {
     status_reserved(a)
 }
 
-/// A finger held still on a link (LINK_HOLD_MS, editor_tick): its border and the long-press card, over the
+/// A finger held still on a link (HOLD_MS, editor_tick): its border and the long-press card, over the
 /// page (R2: no Pages view, no full refresh). A link being made is not made, silently.
 fn card_open_link(a: &mut App) {
     ed(a).link_held = true;
@@ -5756,11 +7109,16 @@ fn rename_end(a: &mut App, done: bool) {
     let u = rect_union(s.card.kb.area, s.card.rect);
     keyboard_close(&mut s.card.kb);
     let (pid, readonly, from_bar) = (s.card.pid, s.card.readonly, s.card.from_bar);
+    let (doc, doc_target) = (s.card.doc, s.card.doc_target);
     let seeds = s.card.seeds.clone();
     let (rect, boxes, band, border) = (s.card.rect, std::mem::take(&mut s.card.boxes), s.card.band, s.card.border,
     );
     with_card(a, |c, _a, nb, nav| {
-        linkcard_set(c, pid, &seeds, nb, nav, readonly, from_bar)});
+        if doc {
+            linkcard_set_doc(c, pid, doc_target, nb, nav, from_bar)
+        } else {
+            linkcard_set(c, pid, &seeds, nb, nav, readonly, from_bar)
+        }});
     let c = &mut ed(a).card;
     c.rect = rect;
     c.boxes = boxes;
@@ -5772,11 +7130,10 @@ fn rename_end(a: &mut App, done: bool) {
 }
 
 /// Rename's Done: the target page's Index name is `name` (empty takes it out of the Index), saved; not an undo
-/// step (a notebook-wide name).
+/// step (a notebook-wide name). Only a failure says so (the owner, 2026-11-04).
 fn rename_done(a: &mut App, name: &str) {
     let s = ed(a);
     let pid = card_target_pid(s);
-    let number = s.card.page + 1;
     let mut old = String::new();
     i18n_copy(&mut old, nav_name(&s.nav, pid), NAV_NAME_LEN);
     let failed = pid == 0 || nav_set_name(&mut s.nav, pid, name) != 0 || nav_save(s.nb.id.as_str(), &mut s.nav, &s.nb) != 0;
@@ -5788,19 +7145,9 @@ fn rename_done(a: &mut App, name: &str) {
     }
     rename_end(a, true);
     if failed {
-        app_toast(a, tr("Could not save the page name."), 3000);
-    } else if !name.is_empty() {
-        let mut msg = String::new();
-        // TRANSLATORS: a toast (about 1700 px at 44 px in bold, or two lines): the long-press card's Rename
-        // gave page %d the name %s.
-        csnprintf!(&mut msg, 200, tr("Page %d is named %s."), number, name);
-        app_toast(a, &msg, 3000);
-    } else if !old.is_empty() {
-        let mut msg = String::new();
-        // TRANSLATORS: a toast (about 1700 px at 44 px in bold, or two lines): the long-press card's Rename
-        // emptied page %d's name.
-        csnprintf!(&mut msg, 200, tr("Page %d has no name now."), number);
-        app_toast(a, &msg, 3000);
+        app_toast(a, tr("Couldn't save page name."), 3000);
+    } else {
+        app_toast_dismiss(a); // (a toast left up from before, a failed try's, goes)
     }
 }
 
@@ -5887,10 +7234,9 @@ fn card_delete(a: &mut App) {
         nav_load(s.nb.id.as_str(), &mut s.nav);
         migration_reset(s);
         card_close(a);
-        app_toast(a, tr("Could not save the link."), 3000);
+        app_toast(a, tr("Couldn't save link."), 3000);
         return;
     }
-    let n = records.len();
     if let Some(h) = s.cur_hist() {
         history_push_link(&mut s.hist[h].h, LinkEdit { pid, records });
     }
@@ -5898,17 +7244,9 @@ fn card_delete(a: &mut App) {
     s.changed = true;
     s.panel_stale = true;
     card_close(a);
-    repaint_panel(a, RefreshMode::Ui);
+    repaint_panel(a, RefreshMode::Ui); // (Undo, which brings them back, is enabled now; no toast)
     bar_rebuild(a);
-    if n > 1 {
-        // TRANSLATORS: a toast (about 1700 px at 44 px in bold, or two lines): the long-press card of a Links bar
-        // row deleted its links; Undo brings them back (the ink around them stays).
-        app_toast(a, tr("Links deleted. Undo brings them back."), 2500);
-    } else {
-        // TRANSLATORS: a toast (about 1700 px at 44 px in bold, or two lines): the long-press card deleted the
-        // link; Undo brings it back (the ink around it stays).
-        app_toast(a, tr("Link deleted. Undo brings it back."), 2500);
-    }
+    app_toast_dismiss(a); // (a "Linked to ..." still up would be wrong now)
 }
 
 /// The bar under a card, built again after the card changed its links or their names (the same origin and
@@ -5923,12 +7261,18 @@ fn bar_rebuild(a: &mut App) {
     let s = ed(a);
     let Some(page) = s.open_page() else { return };
     let old = s.lb.rect;
-    let (hint, label, back_to) = (s.lb.header_hint, s.lb.back_label, s.lb.back_to);
+    let (hint, label, back_to, back_graph) = (s.lb.header_hint, s.lb.back_label, s.lb.back_to, s.lb.back_graph);
     let mut lb = LinkBar::default();
     linkbar_build(&mut lb, &s.nb, &s.nav, page, s.index, dpi);
+    let docs = doclinks_targets(&s.dl, page, s.open_pid());
+    linkbar_set_docs(&mut lb, &s.nb, &docs, dpi, s.lb.in_docs);
     lb.header_hint = hint;
     lb.back_label = label;
     lb.back_to = back_to;
+    lb.back_graph = back_graph;
+    lb.screen = s.lb.screen; // (the pager stays where it was: a row the owner was at stays in view)
+    let from = bar_from_rows(s);
+    linkbar_set_from(&mut lb, from, backlinks_generation());
     linkbar_layout(&mut lb, aw, ah);
     let u = rect_union(old, lb.rect);
     s.lb = lb;
@@ -6007,8 +7351,8 @@ fn toggle_pin(a: &mut App, t: ToolKind) {
         // TRANSLATORS: a toast when the tool picker's Pin mode is asked for one more pen than the
         // toolbar holds: %d is how many it holds, 3 in this version. About 1700 px at 44 px in bold,
         // or two lines.
-        csnprintf!(&mut msg, 200, ng_("The toolbar holds up to %d pen. Unpin one first.",
-                                      "The toolbar holds up to %d pens. Unpin one first.", PANEL_PINS_MAX as i64),
+        csnprintf!(&mut msg, 200, ng_("Toolbar full (%d pen). Unpin one first.",
+                                      "Toolbar full (%d pens). Unpin one first.", PANEL_PINS_MAX as i64),
                    PANEL_PINS_MAX as i32);
         app_toast(a, &msg, 2500);
         return;
@@ -6036,6 +7380,12 @@ fn tools_tap(a: &mut App) {
         return;
     }
     match h.id {
+        P_PICK_SELECT => {
+            close_tools(a);
+            if ed_ref(a).sel.state == SelState::Off {
+                sel_toggle(a);
+            }
+        }
         P_PIN_MODE => {
             let s = ed(a);
             s.pin_mode = !s.pin_mode;
@@ -6078,6 +7428,7 @@ fn tools_tap(a: &mut App) {
                 toggle_pin(a, t); // (the panel and the picker drawn again, or a toast at the cap)
                 return;
             }
+            sel_off(a); // (choosing a pen leaves Select mode)
             // A pinned pen picked is the one in use; the tool button keeps the pen it shows.
             let st = &mut a.settings;
             st.current_tool = t;
@@ -6166,19 +7517,31 @@ fn find_close(a: &mut App) {
     }
     let mut r = rect_union(s.find.rect, s.find.kb.area);
     let pick = s.find.mode == FindMode::Pick;
+    let over_pv = s.pv.open && !s.pv.overlay;
     find_drop(s);
     if pick && s.lt.open {
         s.lt.hidden = false;
         r = rect_union(r, s.lt.rect);
+    }
+    // Over the Pages view: previews that came while the sheet was up (previews_repaint draws none under it) are
+    // drawn in their tiles, which are refreshed in the same Ui. Before the compose below: it draws the view whole,
+    // and the tiles to refresh are the ones that show something else now than the panel does.
+    if over_pv {
+        r = rect_union(r, with_pv(a, pagesview_repaint_tiles));
     }
     compose(a, r);
     app_invalidate(a, r, RefreshMode::Ui);
 }
 
 // A row, or Done on the first one: the sheet closes, the page it was asked on goes on the back list and the page
-// asked for opens (go_to_page's own Full).
+// asked for opens (go_to_page's own draw of the screen).
 fn find_go(a: &mut App, index: i32) {
     find_drop(ed(a));
+    if ed_ref(a).pv.open {
+        // (opened over the Pages view: it closes on that page, as its Go to page did)
+        // (a page that does not open: go_to_page drew the screen whole without the view, in its own draw)
+        pagesview_close(&mut ed(a).pv);
+    }
     go_to_page_pushing(a, index);
 }
 
@@ -6217,15 +7580,16 @@ fn shape_hold_label(ms: i32) -> &'static str {
 fn shape_hold_nearest(ms: i32) -> i32 {
     [400,550,900].into_iter().min_by_key(|&v| (v-ms).abs()).unwrap()
 }
+// (no toast for either: the owner, 2026-11-04; the Shapes menu shows both, the panel's Shapes button the first)
 pub fn editor_shapes_toggle(a: &mut App) {
     a.settings.shapes = !a.settings.shapes; settings_save(&a.settings);
     repaint_panel(a,RefreshMode::Ui);
-    app_toast(a,tr(if a.settings.shapes {n_("Smart shapes on. Hold the pen still at the end of a shape.")} else {n_("Smart shapes off.")}),3000);
+    app_toast_dismiss(a); // (a toast left up from before goes)
 }
 pub fn editor_shape_hold_cycle(a: &mut App) {
     a.settings.shape_hold_ms = match shape_hold_nearest(a.settings.shape_hold_ms) {400=>550,550=>900,_=>400};
     settings_save(&a.settings);
-    app_toast(a,tr(match a.settings.shape_hold_ms {400=>n_("Shape hold: Quick (0.4 s)"),900=>n_("Shape hold: Slow (0.9 s)"),_=>n_("Shape hold: Normal (0.55 s)")}),3000);
+    app_toast_dismiss(a);
 }
 pub fn editor_shape_last(a: &mut App) {
     let min_mm = a.settings.shape_min_mm;
@@ -6268,6 +7632,46 @@ fn bar_open(a: &mut App) {
     bar_show(a, true);
 }
 
+/// The Links bar's Linked from rows for the open page: its notebook's pages whose links go to it (from the
+/// open Nav: always current), then other notebooks' pages (the backlinks cache, as far as it has checked),
+/// each labelled with its notebook's name and the page's Index name or number (backlinks_book: each other
+/// notebook's notebook.ini and nav.ini, kept between builds and read again only when they change; never its
+/// links.ini).
+fn bar_from_rows(s: &EditorState) -> Vec<LbFrom> {
+    let pid = s.open_pid();
+    if pid == 0 || !s.nav.links_writable {
+        return Vec::new();
+    }
+    let mut books: Vec<(FixedStr<STORE_ID_LEN>, Option<std::rc::Rc<BlBook>>)> = Vec::new();
+    let mut out = Vec::new();
+    for f in backlinks_for_page(&s.nb, &s.nav, pid) {
+        if out.len() >= LB_FROM_MAX || out.try_reserve(1).is_err() {
+            break;
+        }
+        if f.id == s.nb.id {
+            let page = s.nb.page_ids.iter().position(|&p| p == f.pid).map_or(-1, |i| i as i32);
+            let name = nav_name(&s.nav, f.pid);
+            let (label, named) = if name.is_empty() { (cformat!(tr("Page %d"), page + 1), false) } else { (name.to_string(), true) };
+            out.push(LbFrom { target: FixedStr::from_str(&format!("p{}", f.pid)), page, count: f.count, label, named });
+            continue;
+        }
+        if !books.iter().any(|(id, _)| *id == f.id) {
+            if books.try_reserve(1).is_err() {
+                break;
+            }
+            books.push((f.id, backlinks_book(f.id.as_str())));
+        }
+        // (a notebook that does not read now, or a page it no longer lists: the cache is behind; left out)
+        let Some((nb, nav)) = books.iter().find(|(id, _)| *id == f.id).and_then(|(_, b)| b.as_deref()).map(|b| (&b.info, &b.names)) else { continue };
+        let Some(i) = nb.page_ids.iter().position(|&p| p == f.pid) else { continue };
+        let Some(target) = nav_notebook_target(f.id.as_str(), f.pid) else { continue };
+        let name = nav_name(nav, f.pid);
+        let page = if name.is_empty() { cformat!(tr("Page %d"), i as i32 + 1) } else { name.to_string() };
+        out.push(LbFrom { target: FixedStr::from_str(&target), page: -1, count: f.count, label: format!("{} / {}", nb.name.as_str(), page), named: true });
+    }
+    out
+}
+
 fn bar_show(a: &mut App, count_open: bool) {
     link_off(a);
     let (dpi, aw, ah) = (a.dpi, a.w, a.h);
@@ -6281,15 +7685,21 @@ fn bar_show(a: &mut App, count_open: bool) {
     let Some(page) = s.open_page() else { return };
     let mut lb = LinkBar::default();
     linkbar_build(&mut lb, &s.nb, &s.nav, page, s.index, dpi);
+    let docs = doclinks_targets(&s.dl, page, s.open_pid());
+    linkbar_set_docs(&mut lb, &s.nb, &docs, dpi, false);
     lb.header_hint = shown < HINT_BAR_MASK;
     lb.back_label = s.index + 1;
     if let Some((_, label)) = s.back_top() {
         lb.back_to.set_cut(&label);
-    } else if let Some((id,pid))=s.notebook_back.last() {
-        if let Some(label)=nav_target_label(&nav_notebook_target(id.as_str(),*pid).unwrap_or_default()) {
+    } else if let Some(b)=s.notebook_back.last() {
+        if let Some(label)=nav_target_label(&nav_notebook_target(b.id.as_str(),b.pid).unwrap_or_default()) {
             lb.back_to.set_cut(&label);
         }
+    } else if s.from_graph {
+        lb.back_graph = true; // ("Back to Graph": the Library's, which opened this notebook)
     }
+    let from = bar_from_rows(s);
+    linkbar_set_from(&mut lb, from, backlinks_generation());
     linkbar_layout(&mut lb, aw, ah);
     let rect = lb.rect;
     s.lb = lb;
@@ -6406,8 +7816,10 @@ fn bar_commit(a: &mut App) {
         if s.open_page().is_some_and(|p| paper_is_image(p.paper)) {
             s.paper_stale = true;
         }
+        s.picture_missing = false; // (ready: the bar's canvas drew no picture white)
+        retire_kept_before(s); // (drawn whole from its strokes, as render_page_full draws it)
     } else {
-        render_page_full(a);
+        render_page_open(a);
     }
     let s = ed(a);
     if pk.from_back {
@@ -6583,6 +7995,8 @@ fn bar_back(a: &mut App) {
         peek_page(a, t, -1, true);
     } else if !s.notebook_back.is_empty() {
         return_to_notebook(a);
+    } else if s.from_graph {
+        back_to_graph(a);
     }
 }
 
@@ -6598,6 +8012,11 @@ fn prefetch_step(a: &mut App) {
     for e in linkbar_visible(&s.lb) {
         if e.page >= 0 && e.page != s.index && !want.contains(&e.page) {
             want.push(e.page);
+        }
+    }
+    for f in linkbar_visible_from(&s.lb) {
+        if f.page >= 0 && f.page != s.index && !want.contains(&f.page) {
+            want.push(f.page);
         }
     }
     if let Some((t, _)) = s.back_top() {
@@ -6638,8 +8057,22 @@ fn bar_result(a: &mut App, r: LbResult, d: Rect) {
         LbResult::NamePage => {bar_stay(a);pages_name(a);}
         LbResult::Cancel => bar_cancel(a),
         LbResult::Peek(i) => {
-            let Some(e) = ed_ref(a).lb.entries.get(i as usize).copied() else { return ;
+            if let Some(f) = linkbar_from_row(&ed_ref(a).lb, i).cloned() {
+                // Linked from: a page here is looked at as an entry's page is; another notebook's is followed
+                // (Back returns).
+                if f.page >= 0 {
+                    if f.page != ed_ref(a).index {peek_page(a, f.page, i, false);}
+                } else {bar_stay(a);follow_target(a, f.target.as_str());}
+                return;
+            }
+            let Some(e) = linkbar_entry(&ed_ref(a).lb, i).copied() else { return ;
             };
+            if ed(a).lb.links_ok && linkbar_entry_broken(&mut ed(a).lb, i) {
+                // A link to a page or notebook that was deleted: its card at once, to change where it goes or
+                // delete it (the card's title says what is gone).
+                if let Some(chip) = linkbar_chip_rect(&ed_ref(a).lb, i) {bar_hold(a, i, chip);}
+                return;
+            }
             if nav_external_target(e.target.as_str()).is_some() {bar_stay(a);follow_target(a,e.target.as_str());}
             else if e.page == NAV_TO_INDEX {
                 // The link target "index" keeps its list meaning; only the bar's Index button is the map.
@@ -6648,7 +8081,7 @@ fn bar_result(a: &mut App, r: LbResult, d: Rect) {
             } else if e.page < 0 {
                 // TRANSLATORS: a toast (about 1700 px at 44 px in bold, or two lines): a finger tapped a link
                 // whose page was deleted (or that a newer Grimoire made, to a place this one cannot open).
-                app_toast(a, tr("That link's page is not in this notebook."), 3000);
+                app_toast(a, tr("Linked page isn't in this notebook."), 3000);
             } else if e.page != ed_ref(a).index {
                 peek_page(a, e.page, i, false);
             }
@@ -6670,7 +8103,7 @@ fn bar_result(a: &mut App, r: LbResult, d: Rect) {
             } else if !s.lb.links_ok {
                 // TRANSLATORS: a toast (about 1700 px at 44 px in bold, or two lines): links.ini could not be
                 // read, so the Links bar lists none and cannot make one.
-                app_toast(a, tr("Links could not be read."), 3000);
+                app_toast(a, tr("Couldn't read links."), 3000);
             } else {
                 // The new link goes on the page that shows: commit to it first, then the strip; the bar comes
                 // back once it is made or cancelled.
@@ -6681,7 +8114,7 @@ fn bar_result(a: &mut App, r: LbResult, d: Rect) {
         LbResult::Eye => {
             let s = ed(a);
             if !s.lb.links_ok {
-                app_toast(a, tr("Links could not be read."), 3000);
+                app_toast(a, tr("Couldn't read links."), 3000);
             } else {
                 let button = s.lb.eye_button;
                 areas_toggle(a, button);
@@ -6703,11 +8136,28 @@ fn bar_result(a: &mut App, r: LbResult, d: Rect) {
             compose(a, g);
             app_invalidate(a, g, RefreshMode::Ui);
         }
+        LbResult::Docs | LbResult::DocsBack => bar_relayout(a),
         _ => {}
     }
 }
 
+// The bar's chips changed (into the document links or back out): its card is laid out again, which can make it
+// taller or shorter, and drawn where it was and where it is.
+fn bar_relayout(a: &mut App) {
+    let (aw, ah) = (a.w, a.h);
+    let s = ed(a);
+    let old = s.lb.rect;
+    linkbar_layout(&mut s.lb, aw, ah);
+    let u = rect_union(old, s.lb.rect);
+    compose(a, u);
+    app_invalidate(a, u, RefreshMode::Ui);
+}
+
 fn panel_act(a: &mut App, h: Hit) {
+    // Choosing a pen leaves Select mode.
+    if h.id == P_TOOL || (h.id == P_PICK_TOOL && !ed_ref(a).pin_mode) {
+        sel_off(a);
+    }
     match h.id {
         P_TOOLPICK => {
             // From any other tool, including the fixed eraser, the tool button's pen is one tap away; a tap
@@ -6715,6 +8165,7 @@ fn panel_act(a: &mut App, h: Hit) {
             let cur = a.settings.current_tool;
             let dt = button_tool(&a.settings);
             if cur != dt && !settings_pinned(&a.settings, dt) {
+                sel_off(a);
                 a.settings.current_tool = dt;
                 settings_save(&a.settings);
                 repaint_panel(a, RefreshMode::Ui);
@@ -6758,7 +8209,7 @@ fn panel_act(a: &mut App, h: Hit) {
                 let paper = s.open_page().map_or(s.nb.paper, |p| p.paper);
                 let n = s.nb.npages();
                 if store_add_page(&mut s.nb, n, paper) != 0 {
-                    app_toast(a, tr("Could not add a page"), 3000);
+                    app_toast(a, tr("Couldn't add page"), 3000);
                     return;
                 }
                 s.changed = true;
@@ -6775,12 +8226,14 @@ fn panel_act(a: &mut App, h: Hit) {
             let r = ed(a).paper_rect;
             app_invalidate(a, r, RefreshMode::Ui);
         }
-        P_CLEAR => clear_page(a),
+        P_CLEAR => {
+            clear_page(a);
+        }
         P_SHAPES => open_shape_menu(a),
         P_PAGES => pages_show(a),
         // The dedicated toolbar button creates a link; the upward swipe opens the Links bar.
         P_LINKS => {
-            if ed_ref(a).lm.state != LmState::Off { link_cancel(a,true); }
+            if ed_ref(a).lm.state != LmState::Off { link_cancel(a); }
             else { link_arm(a,false,None); }
         }
         P_DISPLAY => {
@@ -6791,20 +8244,38 @@ fn panel_act(a: &mut App, h: Hit) {
         P_PENSET => {
             let t = a.settings.current_tool;
             pensettings_open(a, t);
+            // The first time Pen feel opens from the toolbar, once (hints bit 9): where a user looks for a width,
+            // the way to a quicker one.
+            if a.settings.hints & HINT_QUICK_SIZE == 0 {
+                a.settings.hints |= HINT_QUICK_SIZE;
+                settings_save(&a.settings);
+                // TRANSLATORS: a toast, once, the first time Pen feel is opened from the toolbar (about 1300
+                // px at 44 px in bold, or two lines): a pen button on the toolbar, held for a moment, opens a
+                // card of that pen's widths.
+                app_toast(a, tr("Hold a pen on the toolbar for its sizes."), 4000);
+            }
         }
         P_SETTINGS => {
             fs_abort_view(a,FsAbortView::Screen);settle_now(a);
             if save_page(a){links_flush(a);pb_reset(ed(a));close_sheets(ed(a));crate::library::library_settings_from_notebook(a);}
         }
         P_LIBRARY => {
-            app_toast(a, tr("Saving..."), 8000);
+            // (no "Saving..." or "Saved" toast: the owner, 2026-11-04; a page that cannot be saved says so)
             app_flush(a);
             if !save_page(a) {
                 return; // stay with the unsaved page rather than drop it
             }
+            // (a toast left up from the page does not follow to the Library; one the Library raises as it opens,
+            // its Graph's, stays)
+            app_toast_dismiss(a);
+            // (a notebook the Library's Graph opened goes back to that Graph: the Library as it was left)
+            let to_graph = ed_ref(a).from_graph;
             close_notebook(a);
+            ed(a).from_graph = false;
+            if to_graph {
+                crate::library::library_return_to_graph(a);
+            }
             app_switch(a, ScreenId::Library);
-            app_toast(a, tr("Saved"), 1200);
         }
         P_COLLAPSE => set_collapsed(a, true),
         P_EXPAND => set_collapsed(a, false),
@@ -6880,7 +8351,7 @@ fn close_front(a: &mut App, draw: bool) {
     }
     if s.pv.open {
         if s.pv.picking {
-            link_cancel(a, true);
+            link_cancel(a);
         } else if draw {
             pages_hide(a, -1);
         } else {
@@ -6889,6 +8360,9 @@ fn close_front(a: &mut App, draw: bool) {
         return;
     }
     let mut r = if s.tools_open { rect_union(s.tools_rect, s.panel) } else { RECT_EMPTY };
+    if s.qs.open {
+        r = rect_union(r, s.qs.rect);
+    }
     if s.paper_open {
         r = rect_union(r, s.paper_rect);
     }
@@ -6926,7 +8400,7 @@ fn open_menu(a: &mut App, action: i32) {
         SHORTCUT_LIBRARY => panel_act(a, Hit { id: P_LIBRARY, ..Default::default() },
         ),
         // Nothing in front: a link being made is not made.
-        SHORTCUT_CLOSE_MENU if ed(a).lm.state != LmState::Off => link_cancel(a, true),
+        SHORTCUT_CLOSE_MENU if ed(a).lm.state != LmState::Off => link_cancel(a),
         _ => {}
     }
 }
@@ -6947,6 +8421,33 @@ pub fn editor_hold_eraser(a: &mut App, held: bool) {
 // move the open tool picker's choice. Next and previous tool go through the panel's pens alone, so
 // they leave the picker as it is: pressed again and again they never move the highlight from the
 // panel to the picker and back.
+/// The open on-screen keyboard over the notebook (the Pages view's, Find's, the Graph's Rename, New
+/// page..., the card's Rename), None for none: where a hardware key's input goes (app_type_text).
+pub fn editor_keyboard_area(a: &App) -> Option<Rect> {
+    if crate::library::library_settings_active(a) {
+        return crate::library::library_keyboard_area(a);
+    }
+    let s = a.ed.as_deref()?;
+    if !s.open {
+        return None;
+    }
+    [&s.map_kb, &s.pv.kb, &s.find.kb, &s.lm.kb, &s.card.kb, &s.add_kb].into_iter().find(|k| k.open && !rect_is_empty(k.area)).map(|k| k.area)
+}
+
+/// Where a key pressed on the notebook acts (actions.rs app_place): its Graph, its Pages view, else the page.
+pub fn editor_place(a: &App) -> u8 {
+    match a.ed.as_deref() {
+        Some(s) if s.open && s.map.open => PL_GRAPH,
+        Some(s) if s.open && s.pv.open => PL_PAGES,
+        _ => PL_PAGE,
+    }
+}
+
+/// The notebook's Graph is up (its keys are the Graph's).
+pub fn editor_graph_up(a: &App) -> bool {
+    a.ed.as_deref().is_some_and(|s| s.open && s.map.open)
+}
+
 pub fn editor_shortcut(a: &mut App, action: i32) -> bool {
     let (x, y) = (a.w as f32 * 0.5, a.h as f32 * 0.5);
     editor_shortcut_at(a, action, x, y, ActionSrc::Key)
@@ -6964,6 +8465,14 @@ pub fn editor_shortcut_at(a: &mut App, action: i32, x: f32, y: f32, src: ActionS
 
 fn editor_shortcut_in(a: &mut App, action: i32, x: f32, y: f32, src: ActionSrc) -> bool {
     if crate::library::library_settings_active(a) {
+        if action == SHORTCUT_BACK {
+            return crate::library::library_back(a);
+        }
+        if action == SHORTCUT_SAVE {
+            settings_save(&a.settings);
+            app_toast_dismiss(a); // (no "Saved": the owner, 2026-11-04; a toast left up from before goes)
+            return true;
+        }
         if action==SHORTCUT_GO_BACK || action==SHORTCUT_CLOSE_MENU {crate::library::library_settings_back(a);return true;}
         return app_global_action(a,action,src);
     }
@@ -6975,7 +8484,7 @@ fn editor_shortcut_in(a: &mut App, action: i32, x: f32, y: f32, src: ActionSrc) 
         return false;
     }
     if s.destination.open {
-        if action==SHORTCUT_GO_BACK||action==SHORTCUT_CLOSE_MENU {s.destination.open=false;s.lt.hidden=false;compose_all(a,RefreshMode::Full);return true;}
+        if action==SHORTCUT_GO_BACK||action==SHORTCUT_CLOSE_MENU||action==SHORTCUT_BACK {s.destination.open=false;s.lt.hidden=false;compose_all(a,RefreshMode::Full);return true;}
         return false;
     }
     if action == SHORTCUT_HOLD_ERASER {
@@ -6983,7 +8492,37 @@ fn editor_shortcut_in(a: &mut App, action: i32, x: f32, y: f32, src: ActionSrc) 
         s.hold_eraser = true;
         return true;
     }
+    // A drag in the Pages view (a held tile moved): Esc cancels it, the pages where they were; nothing else is
+    // done while it lasts.
+    if (action == SHORTCUT_CLOSE_MENU || action == SHORTCUT_BACK) && pagesview_dragging(&s.pv) {
+        return with_pv(a, pagesview_cancel_drag);
+    }
     if s.owner != Owner::None || s.pinching {
+        return false;
+    }
+    // Ctrl+S: the page and its notebook written now, whatever is in front (nothing is lost by it). No toast
+    // (the owner, 2026-11-04): a page that cannot be saved says so.
+    if action == SHORTCUT_SAVE {
+        settings_save(&a.settings);
+        if save_page(a) {
+            app_toast_dismiss(a); // (a toast left up from before, a failed save's, goes)
+        }
+        return true;
+    }
+    // Esc with a name, a number or Find being typed: Cancel, as the keyboard's own (5.2, layer 1).
+    if action == SHORTCUT_BACK && editor_keyboard_area(a).is_some() {
+        if !app_type_text(a, KbInput::Cancel) {
+            close_front(a, true);
+        }
+        return true;
+    }
+    let Some(s) = a.ed.as_deref_mut() else { return false };
+    // The toolbar's count pad: Close menu and Back close it with nothing added; nothing else is done under it.
+    if s.add_kb.open {
+        if action == SHORTCUT_CLOSE_MENU || action == SHORTCUT_GO_BACK || action == SHORTCUT_BACK {
+            add_pad_cancel(a);
+            return true;
+        }
         return false;
     }
     // An armed link selection leaves the page visible but is still an active operation.
@@ -6991,16 +8530,25 @@ fn editor_shortcut_in(a: &mut App, action: i32, x: f32, y: f32, src: ActionSrc) 
     if action == SHORTCUT_CLEAR_PAGE && s.lm.state != LmState::Off {
         return false;
     }
+    // The Graph's own keys first: pans, zoom, Fit, its view, Select all, Enter, and Esc's
+    // card-then-selection (not with its naming keyboard up).
+    if s.map.open && !s.map_kb.open {
+        if let Some(r) = with_map(a, |map, a, _, nav| mapview_action(map, a, nav, action)) {
+            map_result(a, r);
+            return true;
+        }
+    }
+    let Some(s) = a.ed.as_deref_mut() else { return false };
     if s.map.open {
         if s.map_kb.open {
-            if action == SHORTCUT_CLOSE_MENU || action == SHORTCUT_GO_BACK {
+            if action == SHORTCUT_CLOSE_MENU || action == SHORTCUT_GO_BACK || action == SHORTCUT_BACK {
                 keyboard_close(&mut s.map_kb);
                 compose_all(a, RefreshMode::Ui);
                 return true;
             }
             return false;
         }
-        if action == SHORTCUT_GO_BACK {
+        if action == SHORTCUT_GO_BACK || action == SHORTCUT_BACK {
             map_hide(a, true);
             return true;
         }
@@ -7012,7 +8560,7 @@ fn editor_shortcut_in(a: &mut App, action: i32, x: f32, y: f32, src: ActionSrc) 
         if s.card.kb.open {
             return false;
         }
-        if action == SHORTCUT_CLOSE_MENU || action == SHORTCUT_GO_BACK {
+        if action == SHORTCUT_CLOSE_MENU || action == SHORTCUT_GO_BACK || action == SHORTCUT_BACK {
             card_close(a);
             return true;
         }
@@ -7021,11 +8569,24 @@ fn editor_shortcut_in(a: &mut App, action: i32, x: f32, y: f32, src: ActionSrc) 
         }
         card_close(a);
     }
+    // The quick sizes card: Close menu and Back close it, one layer; another menu's button closes it and goes on;
+    // anything else is refused.
+    if ed_ref(a).qs.open {
+        let action_closes = action == SHORTCUT_CLOSE_MENU || action == SHORTCUT_GO_BACK || action == SHORTCUT_BACK;
+        if action_closes {
+            qs_close(a);
+            return true;
+        }
+        if !menu_action(action) {
+            return false;
+        }
+        qs_close(a);
+    }
     let Some(s) = a.ed.as_deref_mut() else { return false ;
     };
     // New page...'s keyboard: Close menu and Back go back to Link to...; nothing else throws the typing away.
     if s.lm.state == LmState::Naming && s.lm.kb.open {
-        if action == SHORTCUT_CLOSE_MENU || action == SHORTCUT_GO_BACK {
+        if action == SHORTCUT_CLOSE_MENU || action == SHORTCUT_GO_BACK || action == SHORTCUT_BACK {
             naming_back(a);
             return true;
         }
@@ -7034,8 +8595,8 @@ fn editor_shortcut_in(a: &mut App, action: i32, x: f32, y: f32, src: ActionSrc) 
     // Link to... in front: Close menu, Back and add-link again make no link (6.10); another menu's button
     // ends the making silently and opens its menu (8.11).
     if s.lt.open && !s.lt.hidden {
-        if action == SHORTCUT_CLOSE_MENU || action == SHORTCUT_GO_BACK || action == SHORTCUT_ADD_LINK {
-            link_cancel(a, true);
+        if action == SHORTCUT_CLOSE_MENU || action == SHORTCUT_GO_BACK || action == SHORTCUT_BACK || action == SHORTCUT_ADD_LINK {
+            link_cancel(a);
             return true;
         }
         if menu_action(action) {
@@ -7045,7 +8606,54 @@ fn editor_shortcut_in(a: &mut App, action: i32, x: f32, y: f32, src: ActionSrc) 
         }
         return false;
     }
+    // The Find sheet over the Pages view: Close menu, Back (Esc) and Go to page close it,
+    // the view behind it as it was (its screen, its ticks); another menu's action closes it unseen and goes on with
+    // the view in front.
+    if s.find.open && s.find.mode == FindMode::Go && s.pv.open && !s.pv.picking {
+        if action == SHORTCUT_GO_TO_PAGE || action == SHORTCUT_CLOSE_MENU || action == SHORTCUT_BACK {
+            find_close(a);
+            return true;
+        }
+        if !menu_action(action) {
+            return false;
+        }
+        find_drop(s);
+    }
+    let Some(s) = a.ed.as_deref_mut() else { return false };
+    if action == SHORTCUT_BACK {
+        return editor_back(a);
+    }
+    if action == SHORTCUT_TWO_FINGER_UP {
+        return editor_two_finger_up(a);
+    }
     let mut action = action;
+    if s.pv.open && !s.pv.picking && !s.pv.kb.open {
+        // (Esc's `back` in the Pages view went to editor_back above: pagesview_back takes its drag, its card, then
+        // its ticks, then the view closes.)
+        if action == SHORTCUT_CLOSE_MENU && with_pv(a, pagesview_close_card) {
+            // Close menu (Esc in a shortcuts.ini that keeps `key.Escape=close-menu`): the card alone, as its Cancel
+            // (layer 3, which close-menu keeps; the ticks, layer 6, are back's alone).
+            return true;
+        }
+        let s = ed(a);
+        let grid = s.pv.unified && !s.pv.index_tab && !s.pv.overlay && !s.pv.name_only && s.pv.drag_free();
+        // Go to page (Ctrl+F): the Find sheet over the view, which stays behind it, its card closed first.
+        if action == SHORTCUT_GO_TO_PAGE && grid {
+            with_pv(a, pagesview_close_card);
+            find_show(a);
+            return true;
+        }
+        if pagesview_grid_ready(&ed_ref(a).pv) {
+            match action {
+                // New page (Ctrl+N): the count pad at once, at 1
+                SHORTCUT_NEW_PAGE | SHORTCUT_NEW_PAGES => return with_pv(a, pagesview_open_add),
+                // Select all (Ctrl+A): every page ticked
+                SHORTCUT_SELECT_ALL => return with_pv(a, pagesview_select_all),
+                _ => {}
+            }
+        }
+    }
+    let s = ed(a);
     let mut front = front_menu(s);
     // The Index's Pages view is Pages' own menu as well: pages there closes it, as index-map does.
     if action == SHORTCUT_PAGES && front == SHORTCUT_INDEX_MAP && s.pv.open {
@@ -7081,6 +8689,10 @@ fn editor_shortcut_in(a: &mut App, action: i32, x: f32, y: f32, src: ActionSrc) 
         let next = action == SHORTCUT_NEXT_PAGE;
         with_pv(a, |pv, a, nb, nav| pagesview_turn(pv, a, nb, nav, next));
         return true;
+    }
+    // The Pages view in front: undo and redo are its own (a page move, a batch of new pages), never the page's.
+    if (action == SHORTCUT_UNDO || action == SHORTCUT_REDO) && s.pv.open {
+        return pages_history_action(a, action);
     }
     let picker_move = action == SHORTCUT_PICKER_NEXT || action == SHORTCUT_PICKER_PREV;
     if picker_move && s.tools_open && !s.pv.open {
@@ -7135,6 +8747,7 @@ fn editor_shortcut_in(a: &mut App, action: i32, x: f32, y: f32, src: ActionSrc) 
         action = SHORTCUT_TOOL_BASE + picker_step(&a.settings, action == SHORTCUT_PICKER_NEXT).0;
     }
     if action >= SHORTCUT_TOOL_BASE && action < SHORTCUT_TOOL_BASE + TOOL_COUNT as i32 {
+        sel_off(a);
         let t = ToolKind(action - SHORTCUT_TOOL_BASE);
         if t != TOOL_ERASER && !settings_pinned(&a.settings, t) {
             a.settings.draw_tool = t;
@@ -7146,20 +8759,15 @@ fn editor_shortcut_in(a: &mut App, action: i32, x: f32, y: f32, src: ActionSrc) 
         );
     } else if action == SHORTCUT_PREV_PAGE || action == SHORTCUT_NEXT_PAGE {
         // The panel's arrows: next page on the last page adds one, as its + does. So does a gesture's turn
-        // (settings.gesture_new_page, on by default); with it off, a gesture says where it stopped.
+        // (settings.gesture_new_page, on by default); with it off, a gesture stops at the last page, as one
+        // stops at the first: the page stays, with no toast (the owner, 2026-11-04).
         let (index, npages, may_add) = (ed(a).index, ed(a).nb.npages(), src == ActionSrc::Touch && a.settings.gesture_new_page,
         );
         if src != ActionSrc::Key && src != ActionSrc::Pad {
             if action == SHORTCUT_NEXT_PAGE && index >= npages - 1 && !may_add {
-                // TRANSLATORS: a toast (about 1700 px at 44 px in bold, or two lines): two fingers swiped
-                // to the next page on the last one, with adding a page by swiping turned off.
-                app_toast(a, tr("This is the last page."), 1500);
                 return true;
             }
             if action == SHORTCUT_PREV_PAGE && index <= 0 {
-                // TRANSLATORS: a toast (about 1700 px at 44 px in bold, or two lines): two fingers swiped
-                // to the previous page on the first one.
-                app_toast(a, tr("This is the first page."), 1500);
                 return true;
             }
         }
@@ -7171,19 +8779,28 @@ fn editor_shortcut_in(a: &mut App, action: i32, x: f32, y: f32, src: ActionSrc) 
         if to != s.index {
             go_to_page(a, to);
         }
+    } else if action == SHORTCUT_SELECT {
+        sel_toggle(a);
+    } else if action == SHORTCUT_SELECT_EXACT {
+        sel_exact_action(a);
     } else if action == SHORTCUT_ADD_LINK {
         // The Index's Add a link from the page; pressed again while the strip is up, the link is not made,
         // as a menu's own button closes it.
         if ed(a).lm.state != LmState::Off {
-            link_cancel(a, true);
+            link_cancel(a);
         } else {
             link_arm(a, false, None);
         }
     } else if action == SHORTCUT_NAME_PAGE {
         pages_name(a);
     } else if action == SHORTCUT_GO_BACK {
+        ed(a).back_prune();
+        ed(a).back_trim();
         if ed_ref(a).back.is_empty() && !ed_ref(a).notebook_back.is_empty() {
             return return_to_notebook(a);
+        }
+        if ed_ref(a).back.is_empty() && ed_ref(a).from_graph {
+            return back_to_graph(a);
         }
         // Back to the page the last link, Find or Pages view left: the newest on the list that is still
         // in the notebook and is not the page on show, which is not pushed again.
@@ -7204,31 +8821,32 @@ fn editor_shortcut_in(a: &mut App, action: i32, x: f32, y: f32, src: ActionSrc) 
             }
         }
     } else if action == SHORTCUT_GESTURE_NEW_PAGE {
+        // (no toast: the owner, 2026-11-04; one left up from before goes)
         a.settings.gesture_new_page = !a.settings.gesture_new_page;
         settings_save(&a.settings);
-        if a.settings.gesture_new_page {
-            // TRANSLATORS: a toast (about 1700 px at 44 px in bold, or two lines): two fingers swiped to the
-            // next page on the last one now add a page.
-            app_toast(a, tr("Swiping past the last page adds a page."), 2000);
-        } else {
-            // TRANSLATORS: a toast (about 1700 px at 44 px in bold, or two lines): two fingers swiped to the
-            // next page on the last one no longer add a page.
-            app_toast(a, tr("Swiping past the last page adds no page."), 2000);
-        }
+        app_toast_dismiss(a);
     } else if action == SHORTCUT_LANDSCAPE_FIT {
         a.settings.landscape_fit = !a.settings.landscape_fit;
         settings_save(&a.settings);
         editor_fit_changed(a, true);
-        editor_fit_toast(a);
+        app_toast_dismiss(a); // (no toast: the owner, 2026-11-04; one left up from before goes)
     } else if action == SHORTCUT_LINK_AREAS {
         areas_toggle(a, RECT_EMPTY);
     } else if action == SHORTCUT_NEW_PAGE {
         let i = ed(a).index;
         pages_new(a, i + 1); // the Pages view's New page, after the open one
+    } else if action == SHORTCUT_NEW_PAGES {
+        add_pad_open(a); // the toolbar's + held: the count pad, the pages after the open one, which stays
     } else if action == SHORTCUT_CLEAR_PAGE {
-        clear_page(a); // the panel's broom: no question, one undo step
+        // As the panel's broom (no question, one undo step), but a gesture or a key is not in sight as the
+        // broom is (a pen button's hold fires with the pen hovering, a finger resting on the button: issues
+        // #36, #39), so it says the page was cleared and that Undo brings it back.
+        if clear_page(a) {
+            app_toast(a, tr(PAGE_CLEARED), 4000);
+        }
     } else if action == SHORTCUT_ZOOM_OUT || action == SHORTCUT_ZOOM_IN {
         let s = ed(a);
+        let was = (s.zoom, s.ox, s.oy);
         let (mut px, mut py) = (0.0, 0.0);
         to_page(s, x, y, &mut px, &mut py);
         let factor = if action == SHORTCUT_ZOOM_IN { 1.25 } else { 0.8 };
@@ -7236,7 +8854,10 @@ fn editor_shortcut_in(a: &mut App, action: i32, x: f32, y: f32, src: ActionSrc) 
         s.ox = px - x / s.zoom;
         s.oy = py - y / s.zoom;
         view_clamp(a);
-        compose_all(a, RefreshMode::Ui);
+        // (at the most zoom, or the least, the view stays: nothing to draw)
+        if view_moved(ed_ref(a), was) {
+            compose_all(a, RefreshMode::Ui);
+        }
     } else if action == SHORTCUT_SCROLL_UP || action == SHORTCUT_SCROLL_DOWN {
         let top = status_reserved(a) as f32;
         let step = a.h as f32 * 0.75;
@@ -7255,13 +8876,18 @@ fn editor_shortcut_in(a: &mut App, action: i32, x: f32, y: f32, src: ActionSrc) 
                 s.ox = ox;
                 s.oy = if down { 0.0 } else { (s.pgh as f32 - height / zoom).max(0.0) } - top / zoom;
                 view_clamp(a);
-                // go_to_page's pending GC16 also carries this view at the preserved zoom.
-                compose_all(a, RefreshMode::Ui);
+                // go_to_page's draw carries the page at the fitted view; the view restored over it is composed
+                // again here, flashed whole unless it is that same fitted view.
+                compose_all(a, if view_identity(a) { RefreshMode::Ui } else { RefreshMode::Full });
             }
         } else {
+            let was = (zoom, ox, ed_ref(a).oy);
             ed(a).oy = next - top / zoom;
             view_clamp(a);
-            compose_all(a, RefreshMode::Ui);
+            // (at the end of the first or the last page the view stays: nothing to draw)
+            if view_moved(ed_ref(a), was) {
+                compose_all(a, RefreshMode::Ui);
+            }
         }
     } else if action == SHORTCUT_FIT_PAGE {
         if !zoomed(a) {
@@ -7297,6 +8923,89 @@ fn editor_shortcut_in(a: &mut App, action: i32, x: f32, y: f32, src: ActionSrc) 
     true
 }
 
+/// Esc (`back`) on a notebook, once the layers editor_shortcut_in answers first are passed (a keyboard, the
+/// count pad, the Graph's Rename, the long-press card, New page...'s keyboard, Link to...): the first layer in
+/// front eats it. The Pages view's card, then its ticks, then the view; the lasso's
+/// selection, then Select mode; a menu or sheet, one level a press (the Templates sheet back to Paper); a link
+/// being placed; and with nothing above the page, back to the Library as the toolbar's Library button goes
+/// (saving first; to the Graph a notebook was opened from).
+fn editor_back(a: &mut App) -> bool {
+    let s = ed_ref(a);
+    if s.pv.open {
+        if !s.pv.picking && with_pv(a, |pv, a, nb, nav| pagesview_back(pv, a, nb, nav)) {
+            return true;
+        }
+        close_front(a, true);
+        return true;
+    }
+    match s.sel.state {
+        SelState::Off => {}
+        SelState::Selected | SelState::Dragging => {
+            sel_deselect(a);
+            return true;
+        }
+        _ => {
+            sel_off(a);
+            return true;
+        }
+    }
+    if s.ts.open {
+        // (as its own Back: the Paper sheet again, in the same place)
+        let d = ed_ref(a).ts.rect;
+        tplsheet_close(&mut ed(a).ts);
+        compose(a, d);
+        ed(a).paper_open = true;
+        draw_paper_sheet(a);
+        let p = ed(a).paper_rect;
+        app_invalidate(a, rect_union(d, p), RefreshMode::Ui);
+        return true;
+    }
+    if front_menu(s) != 0 {
+        close_front(a, true);
+        return true;
+    }
+    if s.lm.state != LmState::Off {
+        link_cancel(a);
+        return true;
+    }
+    if sheet_open(s) {
+        close_front(a, true);
+        return true;
+    }
+    panel_act(a, Hit { id: P_LIBRARY, ..Default::default() });
+    true
+}
+
+/// Space (`two-finger-up`): what two fingers swiped up do on the page (gestures.ini touch.2.up; built in, and
+/// with gestures off, the Links bar), as that swipe would do it there now.
+fn editor_two_finger_up(a: &mut App) -> bool {
+    // (refused where the swipe is, gestures on or off: with them off the Links bar would close Find)
+    if gestures_refused(ed_ref(a)) {
+        return false;
+    }
+    let key = GestureKey::Touch { fingers: 2, kind: TouchKind::Up };
+    if !a.settings.gestures {
+        return editor_shortcut_at(a, SHORTCUT_LINKS, a.w as f32 * 0.5, a.h as f32 * 0.5, ActionSrc::Touch);
+    }
+    match gesturemap_action(&a.gestures, key) {
+        0 => return false,
+        // (a file binding the swipe to Space's own action: the built-in, never Space again and again)
+        SHORTCUT_TWO_FINGER_UP => {
+            return editor_shortcut_at(a, SHORTCUT_LINKS, a.w as f32 * 0.5, a.h as f32 * 0.5, ActionSrc::Touch);
+        }
+        _ => {}
+    }
+    let ev = InEvent {
+        type_: InType::Gesture,
+        value: G_2_UP,
+        x2: a.w as f32 * 0.5,
+        y2: a.h as f32 * 0.5,
+        ..Default::default()
+    };
+    editor_gesture(a, &ev);
+    true
+}
+
 fn apply_paper(a: &mut App, k: PaperKind) {
     if refuse_readonly(a) {
         return;
@@ -7307,9 +9016,10 @@ fn apply_paper(a: &mut App, k: PaperKind) {
         history_push_paper(&mut s.hist[hi].h, old, k);
     }
     s.open_page_mut().unwrap().paper = k;
+    mark_changed(s); // (before it is drawn: page_is_its_file)
     render_page_full(a);
     compose_all(a, RefreshMode::Full);
-    mark_changed(ed(a));
+    ed(a).last_up = now_ms(); // (the idle save 2 s after the drawing, seconds on a dense page, as before)
 }
 
 // A template picked on the Templates sheet becomes this page's paper, as any paper does (one undo
@@ -7322,17 +9032,30 @@ fn apply_template(a: &mut App, path: &str) {
     let s = ed(a);
     if template_install(&s.nb, path, &mut k, &mut why) != 0 {
         qlog!("editor: %s: a template could not be used: %s", s.nb.id.as_str(), why);
+        if why == PREVIEW_NOT_MADE {
+            app_toast(a, not_ready_yet(), 4000);
+            return;
+        }
         let mut msg = String::new();
         // TRANSLATORS: in a toast (about 1700 px at 44 px in bold, or two lines): a template picked
         // on the Templates sheet could not become the page's paper (or the new notebook's); %s is
         // the log file that says why.
-        csnprintf!(&mut msg, 256, tr("Could not use that template (see %s)."), "grimoire.log");
+        csnprintf!(&mut msg, 256, tr("Couldn't use template (see %s)."), "grimoire.log");
         app_toast(a, &msg, 4000);
         return;
     }
     if s.open_page().unwrap().paper != k {
         apply_paper(a, k);
     }
+}
+
+// A template or photo picked a moment after it was copied in: its preview (and the check that it is a picture
+// Grimoire takes) is still being made in the background.
+fn not_ready_yet() -> &'static str {
+    // TRANSLATORS: in a toast (about 1700 px at 44 px in bold, or two lines): a template or photo was picked on
+    // its sheet while Grimoire is still making its preview in the background (its tile shows the hourglass);
+    // picking it again works once the tile shows its picture.
+    tr("Not ready yet. Try again in a moment.")
 }
 
 // A photo picked on the Photos sheet becomes the open page's paper, as a template does (templates.h:
@@ -7343,10 +9066,14 @@ fn apply_photo(a: &mut App, path: &str) {
     let s = ed(a);
     if photo_install(&s.nb, path, &mut k, &mut why) != 0 {
         qlog!("editor: %s: a photo could not be used: %s", s.nb.id.as_str(), why);
+        if why == PREVIEW_NOT_MADE {
+            app_toast(a, not_ready_yet(), 4000);
+            return;
+        }
         let mut msg = String::new();
         // TRANSLATORS: in a toast (about 1700 px at 44 px in bold, or two lines): a photo picked on the
         // Photos sheet could not become the page's paper; %s is the log file that says why.
-        csnprintf!(&mut msg, 256, tr("Could not use that photo (see %s)."), "grimoire.log");
+        csnprintf!(&mut msg, 256, tr("Couldn't use photo (see %s)."), "grimoire.log");
         app_toast(a, &msg, 4000);
         return;
     }
@@ -7396,6 +9123,7 @@ fn ui_pointer(a: &mut App, ph: i32, ev: &InEvent, modal: bool) {
     let s = ed(a);
     if ph == 0 {
         press_begin(&mut s.press, ev.x, ev.y, ev.t_ms);
+        s.panel_down_k = in_sample_ms(ev);
         let h = if modal { hits_find(&s.modal_hits, ev.x, ev.y).copied() } else { panel_hit_at(s, ev.x, ev.y) };
         s.has_pressed = h.is_some();
         s.dragging = false;
@@ -7404,6 +9132,7 @@ fn ui_pointer(a: &mut App, ph: i32, ev: &InEvent, modal: bool) {
             s.grab_dx = ev.x - s.panel.x as f32;
             s.grab_dy = ev.y - s.panel.y as f32;
             s.drag_start_rect = s.panel;
+            s.drag_trail = s.panel;
             // Drag handles do not invert; buttons do.
             if h.id != P_GRIP && h.id != P_EXPAND {
                 app_press_feedback(a, h.r);
@@ -7423,6 +9152,8 @@ fn ui_pointer(a: &mut App, ph: i32, ev: &InEvent, modal: bool) {
                 s.last_drag_paint = ev.t_ms;
                 let (x, y) = ((ev.x - s.grab_dx) as i32, (ev.y - s.grab_dy) as i32);
                 move_panel_to(a, x, y, RefreshMode::Fast);
+                let s = ed(a);
+                s.drag_trail = rect_union(s.drag_trail, s.panel);
             }
         }
         return;
@@ -7440,11 +9171,22 @@ fn ui_pointer(a: &mut App, ph: i32, ev: &InEvent, modal: bool) {
             ((ev.x - s.grab_dx) as i32, (ev.y - s.grab_dy) as i32)
         };
         move_panel_to(a, x, y, RefreshMode::Ui);
-        // Also clean up wherever the panel passed through.
+        // Also clean up wherever the panel passed through: every place a fast frame drew it, not only
+        // where it began and ended (issue #11: a drag that went round left the page between them
+        // dithered). DU left a trace of the panel at each of those places that a grayscale refresh
+        // does not reach (display.rs, DuWear), so they are cleaned with one flash of the trail alone;
+        // with the pen coming (it cancelled the drag, or it is near) grayscale now, and the clean at
+        // the next pause.
         let s = ed(a);
-        let trail = rect_union(s.drag_start_rect, s.panel);
+        let trail = rect_union(rect_union(s.drag_start_rect, s.drag_trail), s.panel);
+        s.drag_trail = RECT_EMPTY;
         compose(a, trail);
-        app_invalidate(a, trail, RefreshMode::Ui);
+        if touch_cancelled(ev) || ed_ref(a).pen_near {
+            app_invalidate(a, trail, RefreshMode::Ui);
+            du_wear_owe(&mut a.du_wear, trail, now_ms());
+        } else {
+            app_invalidate(a, trail, RefreshMode::Clean);
+        }
         persist_panel(a);
         return;
     }
@@ -7463,9 +9205,25 @@ fn ui_pointer(a: &mut App, ph: i32, ev: &InEvent, modal: bool) {
     }
     if modal {
         modal_act(a, h);
+    } else if h.id == P_NEXT && next_adds(ed_ref(a)) && add_pad_allowed(ed_ref(a))
+        && (ev.key_mods & ADD_MODS != 0 || in_sample_ms(ev).wrapping_sub(ed_ref(a).panel_down_k) >= HOLD_MS) {
+        // The toolbar's + held (the tick may not have seen it yet), or clicked with a modifier key held: the
+        // count pad, as the Pages view's New page.
+        add_pad_open(a);
+    } else if let Some(tool) = qs_target(ed_ref(a), h).filter(|_| {
+        qs_allowed(ed_ref(a)) && !p.moved && !touch_cancelled(ev) && in_sample_ms(ev).wrapping_sub(ed_ref(a).panel_down_k) >= HOLD_MS
+    }) {
+        // A pen button held (the tick may not have seen it yet): its pen picked and the sizes card up, and the
+        // lift is never also the tap.
+        qs_hold(a, h, tool, true);
     } else {
         panel_act(a, h);
     }
+}
+
+// Whether the panel's next-page button is its + now: on the last page, where a tap adds a page and goes to it.
+fn next_adds(s: &EditorState) -> bool {
+    s.index >= s.nb.npages() - 1
 }
 
 // ---- screen interface ----
@@ -7529,6 +9287,7 @@ fn close_sheets(s: &mut EditorState) {
     card_drop(s);
     bar_drop(s);
     find_drop(s);
+    s.qs = QuickSize::default();
     s.paper_open = false;
     s.dm.open = false;
     s.mb.open = false;
@@ -7605,20 +9364,13 @@ pub fn editor_enter(a: &mut App) {
     if !a.relayout {
         close_sheets(ed(a));
     }
+    // (the quick sizes card was placed for the screen it was opened on: a turn or a wake closes it, silently, in
+    // this redraw)
+    ed(a).qs = QuickSize::default();
     compose(a, Rect { x: 0, y: 0, w: a.w, h: a.h ,
         },
     );
     touch_context(a);
-    // The first time the page comes up sideways whole, for the owner who had it filling the width: why
-    // (hints bit 8). Not for a fresh install or an owner who has seen it.
-    let st = &a.settings;
-    if turned && ed_ref(a).open && a.w > a.h && st.landscape_fit && st.upgraded && st.hints & HINT_SIDEWAYS == 0 {
-        a.settings.hints |= HINT_SIDEWAYS;
-        settings_save(&a.settings);
-        // TRANSLATORS: a toast (about 1700 px at 44 px in bold, or two lines), shown once after an update:
-        // the editor now shows the whole page when the Kindle is sideways, which two-finger swipes need.
-        app_toast(a, tr("Sideways now shows the whole page, so two-finger swipes work. Pinch to zoom in; Display changes this."), 6000);
-    }
 }
 
 /// a stroke / drag / pinch is in progress
@@ -7703,16 +9455,13 @@ fn pinch(a: &mut App, ev: &InEvent) {
         // legacy one's, with the zoom setting).
         let classified = ev.value == 1;
         // (The bar does not pan or zoom the page behind it.)
-        if s.owner != Owner::None || s.paper_open || s.mb.open || s.ts.open || s.lb.open || s.find.open || s.lt.open || s.card.open || (!classified && !pinch_zoom) {
+        if s.owner != Owner::None || s.paper_open || s.mb.open || s.ts.open || s.lb.open || s.find.open || s.lt.open || s.card.open || s.qs.open || (!classified && !pinch_zoom) {
             return;
         }
         let regrab = s.pinching;
         s.pinching = true;
         s.pinch_committed = regrab && s.pinch_committed;
         s.pinch_classified = classified;
-        if !regrab {
-            s.pinch_panned = false;
-        }
         s.pinch_mx0 = mx;
         s.pinch_my0 = my;
         s.pinch_d0 = if d > 10.0 { d } else { 10.0 };
@@ -7749,7 +9498,6 @@ fn pinch(a: &mut App, ev: &InEvent) {
                 s.zoom = clampf(s.zoom, s.zoom_min, s.zoom_max);
             } else {
                 s.zoom = s.pinch_z0; // a pan holds the zoom: no drift
-                s.pinch_panned = true;
             }
         } else {
             // Nothing happens until the fingers clearly spread/close or travel: resting fingers
@@ -7789,25 +9537,6 @@ fn pinch(a: &mut App, ev: &InEvent) {
         compose_all(a, RefreshMode::Ui);
     }
     fs_pending_cleanup(a, RefreshMode::Ui);
-    // A pan that moved the page, while two fingers up or down are gestures: say once that here two
-    // fingers move the page, and where Pages and Links are instead (hints bit 6).
-    let s = ed(a);
-    let panned = s.pinch_classified && s.pinch_panned;
-    s.pinch_panned = false;
-    if panned && a.settings.hints & HINT_PAN == 0 {
-        let up = GestureKey::Touch { fingers: 2, kind: TouchKind::Up ,
-        };
-        let down = GestureKey::Touch { fingers: 2, kind: TouchKind::Down ,
-        };
-        if gesturemap_action(&a.gestures, up) != 0 || gesturemap_action(&a.gestures, down) != 0 {
-            a.settings.hints |= HINT_PAN;
-            settings_save(&a.settings);
-            // TRANSLATORS: a toast (about 1700 px at 44 px in bold, or two lines), shown once: two
-            // fingers dragged the zoomed page, where two fingers up and down would open Links and Pages.
-            app_toast(a, tr("Here two fingers move the page. Zoom out for page and link swipes."), 4000,
-            );
-        }
-    }
 }
 
 pub fn editor_leave(a: &mut App) {
@@ -7851,6 +9580,12 @@ pub fn editor_suspend(a: &mut App) -> bool {
     if ed(a).owner == Owner::Erase {
         erase_end(a);
     }
+    if ed(a).owner == Owner::Select {
+        // (a drag of the selection ends as a cancel, as owner_cancel ends it: its lift is lost, and waking
+        // to a box with no bar while the bar's buttons still answered where it was is how a tap on nothing
+        // deleted it; a lasso being drawn is dropped)
+        sel_cancel(a);
+    }
     let s = ed(a);
     card_drop(s); // (the Kindle sleeps: it is not there on waking)
     bar_drop(s);
@@ -7893,29 +9628,33 @@ fn corner_sheet_open(s: &EditorState) -> bool {
         || (s.find.open && s.find.mode != FindMode::Pick)
 }
 
-/// Whether a keyboard the card, New page... or Find PICK opened lies over the clock corner's square (one docked at the
-/// bottom, with the corner at the bottom).
+/// Whether a keyboard the card, New page... or Find PICK opened, or the toolbar's count pad, lies over the clock
+/// corner's square (one docked at the bottom, with the corner at the bottom).
 fn keyboard_over_corner(a: &App, s: &EditorState) -> bool {
     let sq = status_square(a);
-    [&s.card.kb, &s.lm.kb, &s.find.kb].iter().any(|kb| kb.open && rect_overlaps(kb.area, sq))
+    [&s.card.kb, &s.lm.kb, &s.find.kb, &s.add_kb].iter().any(|kb| kb.open && rect_overlaps(kb.area, sq))
 }
 
 /// Whether (x, y) is on a surface of the card, Link to..., Find PICK or the strip: a control, never the corner's.
 fn phase2_surface_at(s: &EditorState, x: i32, y: i32) -> bool {
     let kb_at = |kb: &Keyboard| kb.open && rect_contains(kb.area, x, y);
     (s.card.open && rect_contains(s.card.rect, x, y))
+        || (s.qs.open && rect_contains(s.qs.rect, x, y))
         || (s.lt.open && !s.lt.hidden && rect_contains(s.lt.rect, x, y))
         || (s.find.open && rect_contains(s.find.rect, x, y))
         || ((s.lm.state == LmState::Armed || s.lm.state == LmState::Lasso) && rect_contains(s.lm.strip, x, y))
         || kb_at(&s.card.kb)
         || kb_at(&s.lm.kb)
         || kb_at(&s.find.kb)
+        || kb_at(&s.add_kb)
 }
 
 /// Whether the editor has a control at (x, y) for a finger on the page: the panel, or a link there. (A sheet, a
 /// menu or the Pages view that is up takes every tap: the clock and battery is not shown then, and asks no
-/// more.) The clock and battery corner leaves a tap on a control to it, but for a link in its own corner,
-/// which is not one there: the corner's tap is the clock's, over a link too.
+/// more.) The clock and battery corner leaves a tap on a control to it, but for the user's own link in its
+/// corner, which is not a control there: the corner's tap is the clock's, over such a link too. A document
+/// link (a planner's tab: D7a, taps follow document links) is the other way round: a tab under the corner
+/// takes the tap, and the corner's toggle works where none lies (the shortcut and Settings toggle it too).
 pub fn editor_control_at(a: &App, x: f32, y: f32) -> bool {
     if crate::library::library_settings_active(a) {return true;}
     let s = ed_ref(a);
@@ -7926,10 +9665,10 @@ pub fn editor_control_at(a: &App, x: f32, y: f32) -> bool {
         return true;
     }
     if status_hit(a, x, y) {
-        return false;
+        return doc_link_under(a, x, y).is_some();
     }
     let mut l = NavLink::default();
-    link_under(a, x, y, &mut l)
+    link_under(a, x, y, &mut l) || doc_link_under(a, x, y).is_some()
 }
 
 /// Whether the finger lift being handled was a tap in the corner, which the clock took (status.rs
@@ -7962,8 +9701,8 @@ fn fs_can_arm(a: &App, in_links_bar: bool) -> bool {
     if gesturemap_shapes(&a.gestures).is_empty() && !gesturemap_has_onefinger(&a.gestures) {
         return false;
     }
-    if s.pv.open || s.tools_open || s.mb.open || s.dm.open || s.paper_open || s.ts.open || s.find.open || s.lt.open || s.card.open
-        || s.lm.state != LmState::Off || s.pv.kb.open || s.find.kb.open || s.lm.kb.open || s.card.kb.open
+    if s.pv.open || s.tools_open || s.mb.open || s.dm.open || s.paper_open || s.ts.open || s.find.open || s.lt.open || s.card.open || s.qs.open
+        || s.lm.state != LmState::Off || s.pv.kb.open || s.find.kb.open || s.lm.kb.open || s.card.kb.open || s.add_kb.open
     {
         return false;
     }
@@ -8276,7 +10015,7 @@ fn fs_fade_tick(a: &mut App, now: u32) {
         settings_save(&a.settings);
         // TRANSLATORS: a one-time toast after a finger drawing does not match any recorded shape;
         // about 1700 px at 44 px bold or two lines. Settings > Gestures lists the recorded shapes.
-        app_toast(a, tr("That is not one of your finger shapes. Settings > Gestures lists them."), 4000);
+        app_toast(a, tr("Unknown finger shape. See Settings > Gestures."), 4000);
     }
     app_flush(a);
 }
@@ -8335,6 +10074,12 @@ fn fs_fire(a: &mut App, action: i32, anchor: (f32, f32), m: FsMatch, t: u32) -> 
     // the same pending refresh. If the action refuses, fs_reject paints its sparse trail again.
     let pending = (a.dirty, a.dirty_mode);
     fs_fire_cleanup(a, trail);
+    // What the app has changed so far, and its settings: the action's name shows only if the action changes
+    // either (2.0.0-beta.2, the owner: "Show the action's name only when the action actually did something").
+    // Whatever an action does reaches one or the other (a page turned, ink drawn or taken back, a sheet or the
+    // view changed, the panel drawn again, a setting), so Next page on the last page, Previous page on page 1,
+    // Clear page on an empty page, and Undo or Redo with nothing to undo or redo fire with nothing said.
+    let (changes, settings) = (a.changes, a.settings);
     let ran = editor_shortcut_at(a, action, anchor.0, anchor.1, ActionSrc::Shape);
     if !ran {
         (a.dirty, a.dirty_mode) = pending;
@@ -8344,7 +10089,8 @@ fn fs_fire(a: &mut App, action: i32, anchor: (f32, f32), m: FsMatch, t: u32) -> 
     let name = shortcut_action_name(action).unwrap_or("unknown");
     fs_trace(a, "fired", name, m.d1, m.thr, m.d2);
     let full_view = a.scr != screen_before || a.asleep || (!pages_before && a.ed.as_deref().is_some_and(|s| s.pv.open));
-    if !full_view && a.toast_until == toast_before {
+    let did = a.changes != changes || a.settings != settings;
+    if did && !full_view && a.toast_until == toast_before {
         app_toast(a, action_label(action), 1200);
     }
     ed(a).fs_trail = RECT_EMPTY;
@@ -8434,17 +10180,6 @@ fn fs_finish_event(a: &mut App, ev: &InEvent) -> bool {
     }
 }
 
-/// A page whose whole drawing takes this long or longer keeps it (store_save_page_render), ms. (The
-/// simulator takes GRIMOIRE_KEEP_RENDER_MS instead, so scenarios can keep pages that draw quickly.)
-const KEEP_RENDER_MS: u32 = 1000;
-fn keep_render_ms() -> u32 {
-    #[cfg(feature = "sim")]
-    if let Some(ms) = std::env::var("GRIMOIRE_KEEP_RENDER_MS").ok().and_then(|v| v.parse().ok()) {
-        return ms;
-    }
-    KEEP_RENDER_MS
-}
-
 pub fn editor_event(a: &mut App, ev: &InEvent) {
     if crate::library::library_settings_active(a) {
         crate::library::library_event(a,ev);touch_context(a);return;
@@ -8459,9 +10194,15 @@ pub fn editor_event(a: &mut App, ev: &InEvent) {
 // does the opposite gesture (two fingers down opened Pages, two fingers up close them: the same swipe
 // the other way takes back what the first did). Any other gesture does its own action, which a menu in
 // front refuses or swaps for its own (editor_shortcut_at).
+/// Whether a gesture on the page (or Space, which does what two fingers up do) is refused now: no page open, or
+/// a keyboard of the Pages view, Find, New page..., the long-press card or the count pad being typed on.
+fn gestures_refused(s: &EditorState) -> bool {
+    !s.open || s.pv.kb.open || s.find.open || s.lm.kb.open || s.card.kb.open || s.add_kb.open
+}
+
 fn editor_gesture(a: &mut App, ev: &InEvent) {
     let s = ed_ref(a);
-    if !s.open || s.pv.kb.open || s.find.open || s.lm.kb.open || s.card.kb.open {
+    if gestures_refused(s) {
         return;
     }
     let Some(key) = gesturemap_key_of_id(ev.value) else { return ;
@@ -8499,6 +10240,8 @@ fn editor_event_in(a: &mut App, ev: &InEvent) {
         let ph=app_pointer_phase(ev);
         if ph>=0 {let r=with_modal(a,|s|&mut s.destination,|p,a|p.pointer(a,ph,ev));match r {
             NotebookPick::Cancel=>{ed(a).lt.hidden=false;compose_all(a,RefreshMode::Full);},
+            NotebookPick::Place(id,at)=>{let pids=std::mem::take(&mut ed(a).copy_pids);pages_copy_to(a,&id,at,&pids);},
+            NotebookPick::Notebook(_)=>compose_all(a,RefreshMode::Full),
             NotebookPick::Target(t)=>{ed(a).lt.hidden=false;let target=if let Some((id,pid))=nav_external_target(t.as_str()){if ed_ref(a).nb.id==id{format!("p{pid}")}else{t.as_str().to_string()}}else{t.as_str().to_string()};link_pick(a,&target);compose_all(a,RefreshMode::Full);},
             NotebookPick::None=>{}
         }}
@@ -8618,6 +10361,29 @@ fn editor_event_in(a: &mut App, ev: &InEvent) {
         }
         let s = ed(a);
         s.owner_is_pen = pen;
+        // A contact made while the toolbar's batch was being written: let go, down to its lift. Then the
+        // toolbar's count pad: a contact on it is its own; one outside closes it with nothing added (a finger
+        // at the lift, a pen at its down, its stroke swallowed).
+        let quiet = s.add_quiet_until.is_some_and(|until| until.wrapping_sub(ev.t_ms) as i32 >= 0);
+        s.add_quiet_until = None;
+        if quiet {
+            s.owner = Owner::AddPad;
+            return;
+        }
+        if s.add_kb.open {
+            if rect_contains(s.add_kb.area, ev.x as i32, ev.y as i32) {
+                s.owner = Owner::AddPad;
+                add_pad_pointer(a, 0, ev);
+            } else {
+                s.owner = Owner::Outside;
+                if pen {
+                    add_pad_cancel(a);
+                } else {
+                    press_begin(&mut s.link_press, ev.x, ev.y, ev.t_ms);
+                }
+            }
+            return;
+        }
         // The Find sheet: its rows and keyboard take the contact, a contact outside it is swallowed (a finger
         // decides at the lift, a pen at its down) and closes it.
         if s.find.open {
@@ -8661,6 +10427,25 @@ fn editor_event_in(a: &mut App, ev: &InEvent) {
             }
             return;
         }
+        // The quick sizes card: a contact on it is its own; one outside it (the toolbar included) closes it with
+        // nothing else done, a finger at the lift (the clock's corner keeps its tap), a pen at its down, its
+        // stroke swallowed.
+        if s.qs.open {
+            if rect_contains(s.qs.rect, ev.x as i32, ev.y as i32) {
+                s.owner = Owner::QuickSize;
+                let mut d = RECT_EMPTY;
+                let r = with_qs(a, |q, a| quicksize_pointer(q, a, 0, ev, &mut d));
+                qs_result(a, r, d);
+            } else {
+                s.owner = Owner::Outside;
+                if pen {
+                    qs_close(a);
+                } else {
+                    press_begin(&mut s.link_press, ev.x, ev.y, ev.t_ms);
+                }
+            }
+            return;
+        }
         // New page...'s keyboard takes a contact on it; one outside it goes back to Link to... (a finger at the
         // lift, a pen at its down, its stroke swallowed).
         if s.lm.state == LmState::Naming && s.lm.kb.open {
@@ -8687,7 +10472,7 @@ fn editor_event_in(a: &mut App, ev: &InEvent) {
             } else {
                 s.owner = Owner::Outside;
                 if pen {
-                    link_cancel(a, true);
+                    link_cancel(a);
                 } else {
                     press_begin(&mut s.link_press, ev.x, ev.y, ev.t_ms);
                 }
@@ -8780,6 +10565,9 @@ fn editor_event_in(a: &mut App, ev: &InEvent) {
                 settle_now(a);
             }
             ui_pointer(a, 0, ev, false);
+        } else if s.lm.state == LmState::Off && sel_takes(s, pen, ev.x, ev.y) {
+            // Select mode: the bar, a drag of the selection, or the pen's lasso (never ink).
+            sel_down(a, ev, pen);
         } else if pen && s.lm.state == LmState::Armed {
             // While a link is made the next pen contact on the page is its lasso, whatever the tool (the
             // eraser end, the side button and Erase while held too): never ink.
@@ -8790,12 +10578,21 @@ fn editor_event_in(a: &mut App, ev: &InEvent) {
                 draw_sample(a, ev);
             }
         } else {
-            // A finger on the page: a tap follows a link there, a hold opens it (editor_tick).
+            // A finger on the page: a tap follows a link there, a hold opens it, and a hold anywhere else
+            // arms the finger lasso (editor_tick). Outside a selection it ends the selection first, and then
+            // only its hold does anything.
+            let quiet = sel_finger_outside(a);
+            let s = ed(a);
             s.owner = Owner::Link;
             press_begin(&mut s.link_press, ev.x, ev.y, ev.t_ms);
             s.link_down_at = now_ms();
             s.link_held = false;
-            fs_begin_event(a, ev, false);
+            s.link_quiet = quiet;
+            let pen_recent = s.pen_left != 0 && ev.t_ms.wrapping_sub(s.pen_left) < FHOLD_PEN_MS;
+            s.link_spoiled = s.pen_near || pen_recent || ev.value & TOUCH_F_BROAD != 0;
+            if !quiet {
+                fs_begin_event(a, ev, false);
+            }
         }
         return;
     }
@@ -8832,6 +10629,7 @@ fn owner_cancel(a: &mut App) {
         Owner::Draw => draw_end(a),
         Owner::Erase => erase_end(a),
         Owner::Lasso => lasso_cancel(a),
+        Owner::Select => sel_cancel(a),
         Owner::Map if !ed_ref(a).map.open => {}
         _ => {
             if !pen {
@@ -8871,7 +10669,24 @@ fn owner_pointer(a: &mut App, ph: i32, ev: &InEvent, pen: bool) {
             }
         }
         Owner::Strip => strip_pointer(a, ph, ev),
+        Owner::AddPad => {
+            if ed_ref(a).add_kb.open {
+                add_pad_pointer(a, ph, ev);
+            }
+            if ph == 2 {
+                ed(a).owner = Owner::None;
+            }
+        }
+        Owner::Select => sel_pointer(a, ph, ev),
         Owner::Map => map_pointer(a, ph, ev),
+        Owner::QuickSize => {
+            let mut d = RECT_EMPTY;
+            let r = with_qs(a, |q, a| quicksize_pointer(q, a, ph, ev, &mut d));
+            if ph == 2 {
+                ed(a).owner = Owner::None;
+            }
+            qs_result(a, r, d);
+        }
         Owner::Card => {
             if ed_ref(a).card.kb.open {
                 card_kb_pointer(a, ph, ev);
@@ -8919,6 +10734,9 @@ fn owner_pointer(a: &mut App, ph: i32, ev: &InEvent, pen: bool) {
         }
         Owner::Link => {
             press_move(&mut s.link_press, ev.x, ev.y);
+            if ev.value & TOUCH_F_BROAD != 0 {
+                s.link_spoiled = true; // (palm-sized now: its hold arms nothing)
+            }
             if ph != 2 {
                 return;
             }
@@ -8930,7 +10748,7 @@ fn owner_pointer(a: &mut App, ph: i32, ev: &InEvent, pen: bool) {
             let (x0, y0) = (lp.x0, lp.y0);
             let slop = mm_to_px(TAP_SLOP_MM, a.dpi);
             let rolled = (lp.x - x0).abs() > slop || (lp.y - y0).abs() > slop;
-            if touch_cancelled(ev) || fs_finish_event(a, ev) || corner_tap(false) {
+            if touch_cancelled(ev) || fs_finish_event(a, ev) || ed_ref(a).link_quiet || corner_tap(false) {
                 return;
             }
             if !ed_ref(a).link_held && !rolled {
@@ -8993,6 +10811,20 @@ fn owner_pointer(a: &mut App, ph: i32, ev: &InEvent, pen: bool) {
                 }
                 return;
             }
+            // The quick sizes card closes with nothing picked (the clock's corner keeps its tap).
+            if ed_ref(a).qs.open {
+                if !corner_tap(false) {
+                    qs_close(a);
+                }
+                return;
+            }
+            // The toolbar's count pad goes with nothing added (the clock's corner keeps its tap).
+            if ed_ref(a).add_kb.open {
+                if !corner_tap(false) {
+                    add_pad_cancel(a);
+                }
+                return;
+            }
             // New page...'s keyboard and Link to... leave the clock's corner its tap (rule 12).
             if ed_ref(a).lm.state == LmState::Naming && ed_ref(a).lm.kb.open {
                 if !corner_tap(false) {
@@ -9002,7 +10834,7 @@ fn owner_pointer(a: &mut App, ph: i32, ev: &InEvent, pen: bool) {
             }
             if ed_ref(a).lt.open && !ed_ref(a).lt.hidden {
                 if !corner_tap(false) {
-                    link_cancel(a, true);
+                    link_cancel(a);
                 }
                 return;
             }
@@ -9130,12 +10962,12 @@ fn owner_pointer(a: &mut App, ph: i32, ev: &InEvent, pen: bool) {
             } else if r == DmResult::Refit {
                 editor_fit_changed(a, true);
                 // The card was redrawn with its row flipped: presented, upright (sideways the Full of the
-                // view laid out again takes it in).
+                // view laid out again takes it in). No toast (the owner, 2026-11-04); one left up goes.
                 if !rect_is_empty(d) {
                     app_invalidate(a, d, RefreshMode::Ui);
                 }
-                editor_fit_toast(a);
-            } else if r == DmResult::Closed {
+                app_toast_dismiss(a);
+            } else if r == DmResult::Closed || r == DmResult::ClosedAll {
                 compose(a, d);
                 app_invalidate(a, d, RefreshMode::Ui);
             } else if !rect_is_empty(d) {
@@ -9157,8 +10989,47 @@ fn owner_pointer(a: &mut App, ph: i32, ev: &InEvent, pen: bool) {
     }
 }
 
-// The deferred settle: one GL16 refresh for everything written since the last pause.
+// DU's traces (display.rs, DuWear): past a quarter of the screen, or owed by a toolbar drag, one Clean
+// refresh of where they are, at a pause as the settle's (the pen gone SETTLE_LEFT_MS, or nothing added and
+// no stroke ended for SETTLE_NEAR_MS with it near), never under a stroke, a gesture or the Pages view. With a settle due
+// in the same tick both go out as one refresh.
+fn du_wear_tick(a: &mut App, now: u32) {
+    // (never with input still queued: the pen coming near cancels a toolbar drag, and its hover may still be
+    // waiting behind the cancel)
+    if !du_wear_due(&a.du_wear, a.w, a.h) || a.pen_action_down || !a.input_drained {
+        return;
+    }
+    let s = ed_ref(a);
+    // (with the pen near: nothing added, and no stroke ended, for SETTLE_NEAR_MS; with it gone, SETTLE_LEFT_MS
+    // since then and since the last was added, which gives a pen that is arriving the time to say so)
+    let since_added = now.wrapping_sub(a.du_wear.at) as i32;
+    let paused = (since_added >= SETTLE_NEAR_MS as i32 && (now.wrapping_sub(s.settle_at) as i32) >= 0)
+        || (!s.pen_near && (now.wrapping_sub(s.pen_left) as i32) >= SETTLE_LEFT_MS && since_added >= SETTLE_LEFT_MS);
+    if !s.open || s.owner != Owner::None || s.pinching || s.pv.open || s.map.open || s.destination.open || !paused {
+        return;
+    }
+    // (on the screen as it is now: a flush clipped to it would never cover a rect reaching past it)
+    let r = rect_intersect(a.du_wear.rect, Rect { x: 0, y: 0, w: a.w, h: a.h });
+    if rect_is_empty(r) {
+        a.du_wear = DuWear::default();
+        return;
+    }
+    a.du_wear.rect = r;
+    qlog!("display: cleaning fast refreshes' traces at %d,%d %dx%d (%lld px worn%s)", r.x, r.y, r.w, r.h, a.du_wear.area,
+        if a.du_wear.owed { ", owed" } else { "" });
+    compose(a, r);
+    app_invalidate(a, r, RefreshMode::Clean);
+}
+
+// The deferred settle: one GL16 refresh for everything written since the last pause. It is no change of the
+// app's (App.changes): what it draws is on the panel already, from the writing's fast refreshes, and an action
+// that settles first and then finds nothing to do did nothing (Undo with nothing to undo, fs_fire).
 fn settle_now(a: &mut App) {
+    let changes = a.changes;
+    settle_now_in(a);
+    a.changes = changes;
+}
+fn settle_now_in(a: &mut App) {
     // Under the Pages view the page is not on screen: the view's opening refreshed the whole screen
     // and its closing composes it all again, so nothing is due. Settling now would draw the whole view
     // again (compose) under its keyboard, and the panel over both.
@@ -9185,7 +11056,6 @@ fn write_thumb_if_needed(a: &mut App) {
         return;
     }
     save_thumb_from_canvas(s);
-    s.thumb_dirty = false;
 }
 
 // A background job ended since the open page (page), or a cache (caches: note_white), drew a
@@ -9249,9 +11119,17 @@ pub fn editor_tick(a: &mut App, now: u32) {
         let (current,dpi)=(ed_ref(a).index,a.dpi);
         with_pv(a,|pv,_,nb,_|pagesview_prefetch(pv,nb,current,dpi));
     }
-    if now.wrapping_sub(ed_ref(a).previews_checked)>500 && (ed_ref(a).pv.open||ed_ref(a).destination.open) {
-        ed(a).previews_checked=now;
-        previews_repaint(a);
+    if ed_ref(a).pv.open||ed_ref(a).destination.open {
+        // A batch for the notebook shown being made: its previews are looked for often, and each tile is drawn as
+        // its preview lands (only the tiles that changed: previews_repaint).
+        let pending=previews_shown(ed_ref(a)).is_some_and(|(id,_)|bg_pending(BgKind::PagePreviews,id.as_str()));
+        // The last of them gone: the tiles still waiting are drawn again, even when no child's end said so (a
+        // batch dropped unstarted: a fork that failed, a full queue), so no loading mark stays.
+        let ended=std::mem::replace(&mut ed(a).previews_pending,pending) && !pending;
+        if ended || now.wrapping_sub(ed_ref(a).previews_checked)>=if pending {PREVIEWS_POLL_MS} else {PREVIEWS_IDLE_POLL_MS} {
+            ed(a).previews_checked=now;
+            previews_repaint(a,ended);
+        }
     }
     if ed_ref(a).destination.open {return;}
     if ed_ref(a).map.open {
@@ -9260,7 +11138,13 @@ pub fn editor_tick(a: &mut App, now: u32) {
             app_keyboard_tick(a, &mut kb, now);
             ed(a).map_kb = kb;
         } else {
-            with_map(a, |map, a, _, _| mapview_tick(map, a, now));
+            with_map(a, |map, a, nb, nav| {
+                mapview_tick(map, a, now);
+                // Other notebooks' links here found since it opened: its anchors made again (no dot moves).
+                mapview_anchors_refresh(map, nb, nav);
+                // The Graph of all notebooks: what the library index learned since, its new nodes placed.
+                mapview_library_refresh(map, a, nb, nav, now);
+            });
             if ed_ref(a).map.needs_redraw {
                 compose_all(a, RefreshMode::Ui);
             }
@@ -9268,13 +11152,6 @@ pub fn editor_tick(a: &mut App, now: u32) {
     }
     shape_hold_tick(a, now);
     link_shape_tick(a, now);
-    if ed_ref(a).sh.tip_pending && !ed_ref(a).pen_near && rect_is_empty(ed_ref(a).settle) {
-        ed(a).sh.tip_pending = false;
-        if a.settings.hints & (1 << 5) == 0 {
-            a.settings.hints |= 1 << 5; settings_save(&a.settings);
-            app_toast(a,tr("Shape made. Undo takes it away; the toolbar's Shapes menu has the options."),4000);
-        }
-    }
     if ed_ref(a).open && a.input_drained {
         let state = fs_tick(&mut ed(a).fs, now);
         if state == FsState::Dead {
@@ -9293,6 +11170,7 @@ pub fn editor_tick(a: &mut App, now: u32) {
     if s.open && s.owner == Owner::None && (!rect_is_empty(s.settle) || s.panel_stale) && stopped {
         settle_now(a);
     }
+    du_wear_tick(a, now);
     // (Never under a stroke: an erase stroke restores toward S->paper as it goes.)
     let s = ed(a);
     if s.open && s.owner == Owner::None && !s.pinching {
@@ -9313,16 +11191,65 @@ pub fn editor_tick(a: &mut App, now: u32) {
     let s = ed(a);
     if s.open && s.owner == Owner::Link && !s.link_held && !s.link_press.moved && s.fs.state != FsState::Drawing
         && s.fs.state != FsState::Dead
-        && now.wrapping_sub(s.link_down_at) >= LINK_HOLD_MS {
+        && now.wrapping_sub(s.link_down_at) >= HOLD_MS {
         fs_kill(&mut ed(a).fs, FsReason::Held);
-        card_open_link(a);
+        // On a link, its card; anywhere else on the page the finger lasso arms (owner ruling 2026-11-02):
+        // drawn on it selects, lifted where it is it pastes (select.rs)
+        // (a hold the pen or a palm spoiled arms nothing: it is only held)
+        let (x0, y0) = (ed(a).link_press.x0, ed(a).link_press.y0);
+        let mut l = NavLink::default();
+        let spoiled = ed_ref(a).link_spoiled || ed_ref(a).pen_near;
+        if link_under(a, x0, y0, &mut l) || spoiled || !sel_finger_arm(a, x0, y0) {
+            card_open_link(a);
+        }
+    }
+    // A pen held still in Select mode: a paste there (select.rs).
+    if ed(a).open {
+        sel_tick(a, now);
     }
     // A press held on a chip of the Links bar (a finger or the pen): the long-press card for its entry (8.10).
     let s = ed(a);
-    if s.open && s.owner == Owner::Bar && !s.card.open && now.wrapping_sub(s.lb.down_at) >= LINK_HOLD_MS {
+    if s.open && s.owner == Owner::Bar && !s.card.open && now.wrapping_sub(s.lb.down_at) >= HOLD_MS {
         if let Some((i, chip)) = linkbar_pressed_chip(&s.lb) {
             bar_hold(a, i, chip);
         }
+    }
+    // The toolbar's + held still (HOLD_MS): its press let go, and the count pad.
+    let s = ed(a);
+    if s.open && s.owner == Owner::Panel && s.has_pressed && s.pressed.id == P_NEXT && !s.press.moved
+        && next_adds(s) && add_pad_allowed(s) && now.wrapping_sub(s.press.t0) >= HOLD_MS {
+        let r = s.pressed.r;
+        s.has_pressed = false;
+        canvas_invert(&mut a.screen, r);
+        app_invalidate(a, r, RefreshMode::Ui);
+        add_pad_open(a);
+    }
+    // A pen button held still (HOLD_MS), by a finger or the nib: its pen is the pen in use, and the sizes card opens
+    // beside it; the contact stays the card's (it may slide to a chip).
+    let s = ed(a);
+    if s.open && s.owner == Owner::Panel && s.has_pressed && !s.press.moved && now.wrapping_sub(s.press.t0) >= HOLD_MS {
+        let h = s.pressed;
+        if let Some(tool) = qs_target(s, h).filter(|_| qs_allowed(s)) {
+            qs_hold(a, h, tool, false);
+        }
+    }
+    // The sizes card's save, a pass of the loop after its close was presented.
+    let drained = a.input_drained;
+    let s = ed(a);
+    if s.open && s.qs_save != 0 && s.owner == Owner::None {
+        if s.qs_save == 1 {
+            s.qs_save = 2;
+        } else if drained {
+            s.qs_save = 0;
+            settings_save(&a.settings);
+        }
+    }
+    // Typing on the toolbar's count pad pauses: its grayscale refresh.
+    let s = ed(a);
+    if s.open && s.add_kb.open {
+        let mut kb = std::mem::take(&mut s.add_kb);
+        app_keyboard_tick(a, &mut kb, now);
+        ed(a).add_kb = kb;
     }
     // Typing on New page...'s keyboard pauses: its grayscale refresh.
     let s = ed(a);
@@ -9331,10 +11258,19 @@ pub fn editor_tick(a: &mut App, now: u32) {
         app_keyboard_tick(a, &mut kb, now);
         ed(a).lm.kb = kb;
     }
-    // Typing on the Find sheet pauses: its keyboard's grayscale refresh, the card of rows with it.
+    // Typing on the Find sheet pauses: its keyboard's grayscale refresh, the card of rows with it. Or delete held
+    // down deletes again: the rows the text finds now, after the text line's refresh, as for a key.
     let s = ed(a);
-    if s.open && s.find.open {
-        with_find(a, |f, a, _nb, _nav| findsheet_tick(f, a, now));
+    if s.open && s.find.open && with_find(a, |f, a, nb, nav| findsheet_tick(f, a, nb, nav, now)) == FsResult::Changed {
+        find_result(a, FsResult::Changed, RECT_EMPTY);
+    }
+    // Rename's keyboard on a link's card (its typing through the keyboard host, as every keyboard's): a held
+    // delete's repeats, and its grayscale refresh once typing pauses.
+    let s = ed(a);
+    if s.open && s.card.open && s.card.kb.open {
+        let mut kb = std::mem::take(&mut s.card.kb);
+        app_keyboard_tick(a, &mut kb, now);
+        ed(a).card.kb = kb;
     }
     // The Links bar gets the pages it goes to ready while nothing is touching: a page or a band a tick.
     let drained = a.input_drained;
@@ -9353,7 +11289,8 @@ pub fn editor_tick(a: &mut App, now: u32) {
     // Autosave after a real pause (and never while the pen is down). One that fails (a full store)
     // tries again 2 s later, not at every tick: each try says so with a toast.
     let s = ed(a);
-    if s.open && s.page_dirty && s.owner == Owner::None && now.wrapping_sub(s.last_up) > 2000 && !autosave(a) {
+    if s.open && (s.page_dirty || caches_due(s, now))
+        && s.owner == Owner::None && now.wrapping_sub(s.last_up) > 2000 && !autosave(a) {
         ed(a).last_up = now;
     }
     // beta.5's links on pages not visited yet: one page a tick, only while nothing is touching or open
@@ -9362,6 +11299,27 @@ pub fn editor_tick(a: &mut App, now: u32) {
     let s = ed(a);
     if s.open && drained && s.owner == Owner::None && !s.pinching && !sheet_open(s) && s.lm.state == LmState::Off && s.nav.links_writable && s.migrate_room() {
         migrate_step(a);
+    }
+    // The backlinks cache (other notebooks' links here): a few stamps a tick, at most one links.ini read, only
+    // while nothing touches or is open over the page. A bar up when what it knows changed is built again.
+    let s = ed(a);
+    if s.open && drained && s.owner == Owner::None && !s.pinching && s.lm.state == LmState::Off && !s.find.open {
+        // (one cache's work a tick: the Graph of all notebooks' index waits for backlinks.ini's check)
+        if !backlinks_step() {
+            libindex_step();
+        }
+    }
+    let s = ed_ref(a);
+    let gen = backlinks_generation();
+    if s.open && s.lb.open && s.lb.mode == LbMode::List && !s.lb.hidden && !s.peek.active && s.owner == Owner::None
+        && !s.card.open && s.lb.from_gen != gen {
+        // (drawn again only when its rows changed: a check that found nothing new here redraws nothing)
+        let rows = bar_from_rows(s);
+        if rows == s.lb.from {
+            ed(a).lb.from_gen = gen;
+        } else {
+            bar_rebuild(a);
+        }
     }
     // Migrated areas are saved after a pause (and again 2 s after a failed save), apart from the
     // page's own save: a migrated page is not page_dirty.
@@ -9416,10 +11374,92 @@ fn newest(s: &EditorState) -> Option<&Stroke> {
     s.open_page()?.strokes.last().map(|x| &**x)
 }
 
+// For the probes editor.kept_matches_render, editor.preview_matches_render and editor.card_matches_render: the
+// open page's kept drawing (.page-previews/pN.full) or its Pages preview (pN.pgm), when current for its file,
+// against the open page drawn afresh (the preview as shrunk from it); or the Library card (thumb.pgm) against
+// page 1 drawn afresh (the page in memory, else its file), shrunk as the editor shrinks its canvas for the card or
+// as a closing notebook shrinks page 1's file. Some(true) the same, Some(false) not, None with no such cache.
+// A cache is of the page file, the fresh drawing of the page in memory: asked with the page saved
+// (editor.unsaved 0). Each draws a whole page.
+fn cache_matches_render(s: &EditorState, key: &str, dpi: f32) -> Option<bool> {
+    let fresh = |p: &Page| {
+        let mut c = Canvas::default();
+        (canvas_init(&mut c, p.w, p.h) == 0).then(|| {
+            page_render(&mut c, p, Rect { x: 0, y: 0, w: p.w, h: p.h }, dpi);
+            c
+        })
+    };
+    let same = |x: &Canvas, y: &Canvas| x.w == y.w && x.h == y.h && x.px[..(x.w * x.h) as usize] == y.px[..(y.w * y.h) as usize];
+    let pid = s.open_pid();
+    match key {
+        "kept_matches_render" => {
+            let p = s.open_page()?;
+            let mut kept = Canvas::default();
+            if canvas_init(&mut kept, s.pgw, s.pgh) != 0 || !store_load_page_render(&s.nb, pid, s.pgw, s.pgh, &mut kept, page_layered(p)) {
+                return None;
+            }
+            Some(same(&kept, &fresh(p)?))
+        }
+        "preview_matches_render" => {
+            let p = s.open_page()?;
+            let mut shown = Canvas::default();
+            if !store_load_page_preview(&s.nb, pid, &mut shown) {
+                return None;
+            }
+            let mut small = Canvas::default();
+            Some(store_page_preview_image(&fresh(p)?, &mut small) && same(&shown, &small))
+        }
+        _ => {
+            let mut card = Canvas::default();
+            if store_load_thumb(s.nb.id.as_str(), &mut card) != 0 {
+                return None;
+            }
+            let first = *s.nb.page_ids.first()?;
+            let mut read = None;
+            let p = match s.hist.iter().find(|e| e.page_id == first).and_then(|e| e.page.as_deref()) {
+                Some(p) => p,
+                None if store_read_page(&s.nb, 0, &mut read) == 0 => read.as_deref()?,
+                None => return None,
+            };
+            let full = fresh(p)?;
+            let (mut lines, mut plain) = (Canvas::default(), Canvas::default());
+            if canvas_init(&mut lines, s.pgw / 3, s.pgh / 3) != 0 || canvas_init(&mut plain, s.pgw / 3, s.pgh / 3) != 0 {
+                return None;
+            }
+            canvas_downsample_keep_lines(&mut lines, &full, 0.35); // (save_thumb_from_canvas)
+            canvas_downsample(&mut plain, &full); // (close_notebook's page_render_thumb)
+            Some(same(&card, &lines) || same(&card, &plain))
+        }
+    }
+}
+
 /// The headless runner's "editor.*" keys, asked without the prefix (app_probe's contract);
 /// "templates.*" keys reach it whole (docs/SIM.md).
 pub fn editor_probe(a: &mut App, key: &str, out: &mut String, cap: usize) -> i32 {
+    if a.ed.is_some() {
+        if let Some(v) = sel_probe(a, key) {
+            csnprintf!(out, cap, "%s", v.as_str());
+            return 0;
+        }
+    }
     if key=="pages.screen" {let pv=&ed_ref(a).pv;csnprintf!(out,cap,"%d",if !pv.open {0} else if pv.index_tab {pv.index_screen+1} else {pv.screen+1});return 0;}
+    // Where `tap panel NAME` taps, "X Y" (empty for none): a script holds the toolbar's + there (editor.at.next).
+    if let Some(name)=key.strip_prefix("at.") {
+        out.clear();
+        if let Some((x,y))=editor_panel_point(a,name) {csnprintf!(out,cap,"%d %d",x as i32,y as i32);}
+        return 0;
+    }
+    // The toolbar's count pad: 1 while it is up; "addpad.done" its Done's label, "addpad.done.on" 1 when Done can
+    // be pressed (a count of 1 or more); both empty while it is not up.
+    if key=="addpad" {csnprintf!(out,cap,"%d",a.ed.as_deref().is_some_and(|s|s.add_kb.open) as i32);return 0;}
+    if key=="addpad.done" || key=="addpad.done.on" {
+        out.clear();
+        if let Some(kb)=a.ed.as_deref().map(|s|&s.add_kb).filter(|kb|kb.open) {
+            let n=keyboard_count(kb);
+            if key=="addpad.done" {csnprintf!(out,cap,"%s",&add_label(n));} else {csnprintf!(out,cap,"%d",(n>=1) as i32);}
+        }
+        return 0;
+    }
     if key=="pages.grid" {let (cols,rows)=crate::pagesview::pagesview_grid(&ed_ref(a).pv,a);csnprintf!(out,cap,"%d %d",cols,rows);return 0;}
     if let Some(k)=key.strip_prefix("pages.") {return with_pv(a,|pv,_,nb,nav|pagesview_probe(pv,nb,nav,k,out,cap));}
     if key=="screen_composed" {
@@ -9511,6 +11551,14 @@ pub fn editor_probe(a: &mut App, key: &str, out: &mut String, cap: usize) -> i32
         csnprintf!(out, cap, "%s", &name);
         return 0;
     }
+    if key == "wear" {
+        // DU's traces not cleaned yet (display.rs, DuWear): the area worn in thousandths of the screen,
+        // with " owed" while a toolbar drag owes a clean; "0" once a clean or a Full wiped them.
+        let w = a.du_wear;
+        let screen = (a.w as i64 * a.h as i64).max(1);
+        csnprintf!(out, cap, "%lld%s", w.area * 1000 / screen, if w.owed { " owed" } else { "" });
+        return 0;
+    }
     if key == "layers" {
         // Whether the screen is what its layers make of it: the page, the panel and then each menu that is up, in
         // their order. The screen is composed again whole and compared with what it held: "ok", or the first pixel
@@ -9542,6 +11590,28 @@ pub fn editor_probe(a: &mut App, key: &str, out: &mut String, cap: usize) -> i32
         csnprintf!(out, cap, "%d", ed_ref(a).boxes.drawn as i32);
         return 0;
     }
+    if key == "eye_docs" {
+        // How many document-link boxes the eye's last paint drew.
+        if a.ed.is_none() {
+            return -1;
+        }
+        csnprintf!(out, cap, "%d", ed_ref(a).boxes.doc_drawn as i32);
+        return 0;
+    }
+    if key == "doc_areas" {
+        // How many document-link boxes the eye would draw now (0 while it is off).
+        if a.ed.is_none() {
+            return -1;
+        }
+        let n = if a.settings.link_areas && ed_ref(a).open && a.scr == ScreenId::Editor {
+            boxes_get(a);
+            ed_ref(a).boxes.doc.len() as i32
+        } else {
+            0
+        };
+        csnprintf!(out, cap, "%d", n);
+        return 0;
+    }
     if key == "areas" {
         // How many link boxes the eye draws now, 0 while it is off.
         if a.ed.is_none() {
@@ -9565,6 +11635,13 @@ pub fn editor_probe(a: &mut App, key: &str, out: &mut String, cap: usize) -> i32
     else if key=="destination.folder" {csnprintf!(out,cap,"%s",s.destination.folder.as_str());}
     else if key=="destination.notebook" {csnprintf!(out,cap,"%s",s.destination.selected.as_ref().map_or("",|b|b.id.as_str()));}
     else if key=="destination.cached" {csnprintf!(out,cap,"%d",s.destination.cached());}
+    else if key=="destination.shows" {csnprintf!(out,cap,"%s",&s.destination.shows(a));}
+    else if key=="destination.copying" {csnprintf!(out,cap,"%d",(s.destination.open&&s.destination.copying) as i32);}
+    else if key=="page_ids" {
+        // The open notebook's page order, its page ids comma-separated (Move to..., Copy to notebook...).
+        let ids:Vec<String>=s.nb.page_ids.iter().map(|p|p.to_string()).collect();
+        csnprintf!(out,cap,"%s",&ids.join(","));
+    }
     else if key == "page" {
         csnprintf!(out, cap, "%d", if s.open { s.index + 1 } else { 0 });
     } else if key == "loaded_pages" {
@@ -9586,6 +11663,17 @@ pub fn editor_probe(a: &mut App, key: &str, out: &mut String, cap: usize) -> i32
         // The strip: 0, or new while it is up for a new link, redraw for the card's Redraw the area.
         let on = s.open && (s.lm.state == LmState::Armed || s.lm.state == LmState::Lasso);
         csnprintf!(out, cap, "%s", if !on { "0" } else if s.lm.redraw.is_some() { "redraw" } else { "new" });
+    } else if key == "quicksize" {
+        // The quick sizes card: the tool's name while it is up, 0 closed.
+        if s.open && s.qs.open {
+            csnprintf!(out, cap, "%s", app_probe_tool(s.qs.tool).unwrap_or("?"));
+        } else {
+            csnprintf!(out, cap, "%s", "0");
+        }
+    } else if let Some(k) = key.strip_prefix("quicksize.") {
+        if !quicksize_probe(&s.qs, &a.settings, k, out, cap) {
+            return -1;
+        }
     } else if key == "link_card" {
         // The long-press card: 0, or 1 while it is up.
         csnprintf!(out, cap, "%d", if s.open && s.card.open { 1 } else { 0 });
@@ -9628,6 +11716,7 @@ pub fn editor_probe(a: &mut App, key: &str, out: &mut String, cap: usize) -> i32
             Some(ActKind::Clear) => "clear",
             Some(ActKind::Link) => "link",
             Some(ActKind::Replace) => "replace",
+            Some(ActKind::Lasso) => "lasso",
             None => "",
         };
         csnprintf!(out, cap, "%s", name);
@@ -9707,6 +11796,24 @@ pub fn editor_probe(a: &mut App, key: &str, out: &mut String, cap: usize) -> i32
             Some(l) => csnprintf!(out, cap, "%d %d %d %d", l.area.x, l.area.y, l.area.w, l.area.h),
             None => csnprintf!(out, cap, "%s", ""),
         };
+    } else if key == "doclinks" {
+        // The open page's document links, and all of the notebook's: `page notebook`.
+        let pid = if has_page { s.nb.page_ids[s.index as usize] } else { 0 };
+        csnprintf!(out, cap, "%d %d", if has_page { doclinks_of(&s.dl, pid).len() as i32 } else { 0 }, s.dl.links.len() as i32);
+    } else if let Some(n) = key.strip_prefix("doclink.") {
+        // The open page's document link N (from 1, annotation order): its target's page number from 1 and its
+        // area, `p<number> x y w h`; empty past the last.
+        let pid = if has_page { s.nb.page_ids[s.index as usize] } else { 0 };
+        let mine = doclinks_of(&s.dl, pid);
+        let i = atoi(n) - 1;
+        match (i >= 0).then(|| mine.get(i as usize)).flatten() {
+            Some(l) => {
+                let r = l.area();
+                let at = s.nb.page_ids.iter().position(|&p| p == l.target).map_or(0, |i| i + 1);
+                csnprintf!(out, cap, "p%d %d %d %d %d", at as i32, r.x, r.y, r.w, r.h)
+            }
+            None => csnprintf!(out, cap, "%s", ""),
+        };
     } else if key == "migrate_left" {
         // Pages of the open notebook with a link that has no area, not tried this session.
         let left = if s.open {
@@ -9731,6 +11838,15 @@ pub fn editor_probe(a: &mut App, key: &str, out: &mut String, cap: usize) -> i32
         };
     } else if key == "zoom" {
         csnprintf!(out, cap, "%.2f", s.zoom / s.zoom_default); // 1.00 = fitted page view
+    } else if key == "view" {
+        // The view: its zoom (as editor.zoom) and the page point at the screen's top left, "1.00 0 0".
+        csnprintf!(out, cap, "%.2f %.0f %.0f", s.zoom / s.zoom_default, s.ox, s.oy);
+    } else if key == "notebook_back" {
+        // How many notebooks Back returns through, and the newest one's id ("1 A"), "0" for none.
+        match s.notebook_back.last() {
+            Some(b) => csnprintf!(out, cap, "%d %s", s.notebook_back.len() as i32, b.id.as_str()),
+            None => csnprintf!(out, cap, "%s", "0"),
+        };
     } else if key == "page_size" {
         // The open page's own size: its notebook's, whatever the screen (a page that came at the
         // screen's size instead would show here).
@@ -9759,17 +11875,29 @@ pub fn editor_probe(a: &mut App, key: &str, out: &mut String, cap: usize) -> i32
         if !findsheet_probe(&s.find, k, out, cap) {
             return -1;
         }
-    } else if (key == "keyboard" || key == "text") && s.map_kb.open {
-        csnprintf!(out, cap, "%s", if key == "keyboard" { s.map_kb.title.as_str() } else { s.map_kb.text.as_str() });
-    } else if (key == "keyboard" || key == "text") && s.find.open {
-        // Its keyboard's title and what the field holds (the Pages view's, otherwise).
-        csnprintf!(out, cap, "%s", if key == "keyboard" { s.find.kb.title.as_str() } else { s.find.kb.text.as_str() });
-    } else if (key == "keyboard" || key == "text") && s.card.kb.open {
-        // Rename's (the card's).
-        csnprintf!(out, cap, "%s", if key == "keyboard" { s.card.kb.title.as_str() } else { s.card.kb.text.as_str() });
-    } else if (key == "keyboard" || key == "text") && s.lm.kb.open {
-        // New page...'s.
-        csnprintf!(out, cap, "%s", if key == "keyboard" { s.lm.kb.title.as_str() } else { s.lm.kb.text.as_str() });
+    } else if (key == "keyboard" || key == "text" || key == "caret")
+        && (s.map_kb.open || s.find.open || s.card.kb.open || s.add_kb.open || s.lm.kb.open)
+    {
+        // The keyboard up over the page: the Graph's Rename, Find's (the Pages view's, otherwise), the card's Rename,
+        // the toolbar's count pad, New page...'s. Its title, what the field holds, or that with its caret (and a
+        // selection) drawn in (keyboard_caret_probe).
+        let kb = if s.map_kb.open {
+            &s.map_kb
+        } else if s.find.open {
+            &s.find.kb
+        } else if s.card.kb.open {
+            &s.card.kb
+        } else if s.add_kb.open {
+            &s.add_kb
+        } else {
+            &s.lm.kb
+        };
+        let shown = match key {
+            "keyboard" => kb.title.as_str().to_string(),
+            "text" => kb.text.as_str().to_string(),
+            _ => keyboard_caret_probe(kb),
+        };
+        csnprintf!(out, cap, "%s", &shown);
     } else if key == "bar" {
         // The Links bar: closed (0), open, or looking at another page (peek).
         csnprintf!(out, cap, "%s", if !s.lb.open { "0" } else if s.peek.active { "peek" } else { "open" });
@@ -9823,10 +11951,14 @@ pub fn editor_probe(a: &mut App, key: &str, out: &mut String, cap: usize) -> i32
         // What is in front (input goes to the first one open, in this order).
         let m = if crate::library::library_settings_active(a) {"settings"} else if s.map.open {
             "map"
+        } else if s.add_kb.open {
+            "add-pad"
         } else if s.find.open {
             "find"
         } else if s.card.open {
             "card"
+        } else if s.qs.open {
+            "quick-size"
         } else if s.lt.open && !s.pv.open {
             "linkto"
         } else if s.lb.open {
@@ -9875,9 +12007,23 @@ pub fn editor_probe(a: &mut App, key: &str, out: &mut String, cap: usize) -> i32
     } else if key == "erase_strokes" {
         let n = if has_page { s.open_page().unwrap().strokes.iter().filter(|x| stroke_is_erase(x)).count() as i32 } else { 0 };
         csnprintf!(out, cap, "%d", n);
+    } else if key == "page_in_memory" {
+        // Whether the open page's drawing is among those kept in memory this session (PageView), for the
+        // page file as it is now: a page turned back to came up from it.
+        let pid = if has_page { s.open_pid() } else { 0 };
+        let stamp = if pid != 0 { store_page_source_identity(&s.nb, pid) } else { None };
+        let on = stamp.is_some_and(|st| s.page_views.iter().any(|v| v.pid == pid && v.stamp == st));
+        csnprintf!(out, cap, "%d", on as i32);
     } else if key == "page_kept" {
         // Whether the open page came up from its kept drawing instead of being drawn stroke by stroke.
         csnprintf!(out, cap, "%d", s.page_kept as i32);
+    } else if key == "loading_toasts" {
+        // How many times "Loading page..." went up before a slow page was drawn as it opened.
+        csnprintf!(out, cap, "%d", s.loading_toasts as i32);
+    } else if key == "add_notices" {
+        // How many times "Adding N pages..." reached the panel before a batch of new pages was written, or a
+        // batch's Redo wrote them again.
+        csnprintf!(out, cap, "%d", s.add_notices as i32);
     } else if key == "erase_tiles" {
         // The stroke eraser's tiles drawn again since the editor began, and the tiles of the boxes of
         // what it took off (all it drew before 2.0.0-rc.12).
@@ -9915,6 +12061,11 @@ pub fn editor_probe(a: &mut App, key: &str, out: &mut String, cap: usize) -> i32
             }
         }
         csnprintf!(out, cap, "%d", if same { 1 } else { 0 });
+    } else if key == "kept_matches_render" || key == "preview_matches_render" || key == "card_matches_render" {
+        // What the caches beside the pages show, against the page drawn afresh: 1 the same, 0 not, none with no
+        // such cache (cache_matches_render).
+        let v = if has_page { cache_matches_render(s, key, dpi) } else { None };
+        csnprintf!(out, cap, "%s", match v { None => "none", Some(true) => "1", Some(false) => "0" });
     } else if key == "stroke_screen_mm" {
         // The newest stroke's widest, as the screen shows it at the zoom now (the precise eraser's
         // keeps its setting at any zoom); empty with no stroke.
@@ -10023,7 +12174,7 @@ pub fn editor_probe(a: &mut App, key: &str, out: &mut String, cap: usize) -> i32
         } else {
             csnprintf!(out, cap, "%s", "");
         }
-    } else if key == "pages_tab" || key == "picking" || key == "keyboard" || key == "text" || key.starts_with("tile.") {
+    } else if key == "pages_tab" || key == "picking" || key == "keyboard" || key == "text" || key == "caret" || key.starts_with("tile.") {
         return pagesview_probe(&s.pv, &s.nb, &s.nav, key, out, cap); // the Pages view's
     } else if let Some(k) = key.strip_prefix("templates.") {
         return tplsheet_probe(&s.ts, k, out, cap); // the Templates sheet over the page
@@ -10046,10 +12197,10 @@ pub fn editor_probe(a: &mut App, key: &str, out: &mut String, cap: usize) -> i32
         csnprintf!(out, cap, "%s", name.unwrap_or("?"));
     } else if key == "tool_button" {
         // What the tool button showed as the panel was last drawn: its pen, "grid" while that pen
-        // is pinned, empty while the panel is collapsed.
+        // is pinned, "select" while Select mode is on, empty while the panel is collapsed.
         let t = s.tool_button_shows;
         let name = if t >= 0 { app_probe_tool(ToolKind(t)) } else { None };
-        csnprintf!(out, cap, "%s", if t == TB_GRID { "grid" } else if t == TB_NONE { "" } else { name.unwrap_or("?") });
+        csnprintf!(out, cap, "%s", if t == TB_GRID { "grid" } else if t == TB_SELECT { "select" } else if t == TB_NONE { "" } else { name.unwrap_or("?") });
     } else if key == "pin_mode" {
         csnprintf!(out, cap, "%d", if s.tools_open && s.pin_mode { 1 } else { 0 });
     } else if key == "shapes_menu" {
@@ -10107,24 +12258,360 @@ mod tests {
         a
     }
 
+    // Generated ink with STRESS TEST 3's counts and long stroke; no owner's drawing is stored here.
+    fn stress_ink() -> Box<Page> {
+        let mut p = page_new(1000, 1400, PAPER_BLANK);
+        for k in 0..698 {
+            let n = if k == 0 { 6648 } else { 225 + usize::from(k <= 477) };
+            let tool = if k < 75 { TOOL_HIGHLIGHTER } else { TOOL_FOUNTAIN };
+            let mut prm = ToolParams::default();
+            tool_params_default(tool, &mut prm);
+            let mut ink = stroke_new(tool, &prm, 19 + k as u32);
+            for j in 0..n {
+                stroke_append(&mut ink, &PenSample { x: 100.0 + (j % 200) as f32 * 3.0,
+                    y: 200.0 + (k % 60) as f32 * 12.0, pressure: 0.6, t_ms: j as u32 * 3,
+                    ..Default::default() }, 300.0);
+            }
+            page_add(&mut p, ink);
+        }
+        assert_eq!(p.strokes.iter().map(|s| s.pts.len()).sum::<usize>(), 163950);
+        p
+    }
+
+    // A file's identity as the cache writes show it: its inode (a cache file is written aside and renamed over),
+    // its size and its mtime.
+    #[cfg(unix)]
+    fn file_stamp(p: &std::path::Path) -> Option<(u64, u64, i64, i64)> {
+        use std::os::unix::fs::MetadataExt;
+        let m = p.metadata().ok()?;
+        Some((m.ino(), m.len(), m.mtime(), m.mtime_nsec()))
+    }
+
+    // The window and the quiet time both over, as they are 30 s after the last save and the last change.
+    fn caches_window_over(s: &mut EditorState) {
+        s.preview_saved_ms = now_ms().wrapping_sub(cache_window_ms());
+        s.last_up = now_ms().wrapping_sub(cache_window_ms());
+    }
+
+    // An open dense page written from blank: a quick open (full_ms 0), STRESS TEST 3's ink on it, changed.
+    fn dense_app_page(root_name: &str) -> (std::path::PathBuf, App) {
+        let root = fhold_root(root_name);
+        let mut nb = NotebookInfo::default();
+        assert_eq!(store_create("Dense", "", PAPER_BLANK, &mut nb), 0);
+        let mut a = fshape_app();
+        let s = ed(&mut a);
+        s.nb = nb;
+        s.hist[0].page = Some(stress_ink());
+        s.page = Some(1);
+        s.full_ms = (1, 0);
+        draw_page(&mut a, Rect::new(0, 0, 1000, 1400));
+        let s = ed(&mut a);
+        s.canvas_page = s.open_page_ref();
+        assert!(s.page_canvas.px.iter().any(|&v| v < 255));
+        s.preview_saved_ms = now_ms().wrapping_sub(30_000);
+        mark_changed(s);
+        (root, a)
+    }
+
+    // A page turned back to is the drawing it was left with, not every stroke drawn again (seconds on a dense
+    // page): the canvas is kept in memory while the page file is the one it was drawn from.
     #[test]
-    fn the_live_toolbar_stays_beside_the_tool_picker_but_not_under_a_menu_over_it() {
+    fn a_page_turned_back_to_shows_its_drawing_from_memory() {
+        let root = std::env::temp_dir().join(format!("grimoire-page-views-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        store_init(root.to_str().unwrap());
+        let mut nb = NotebookInfo::default();
+        assert_eq!(store_create("Views", "", PAPER_BLANK, &mut nb), 0);
+        assert_eq!(store_add_page(&mut nb, 1, PAPER_BLANK), 0);
+        assert_eq!(store_add_page(&mut nb, 2, PAPER_BLANK), 0);
+        assert_eq!(store_add_page(&mut nb, 3, PAPER_BLANK), 0);
+        let mut a = fshape_app();
+        let s = ed(&mut a);
+        s.nb = nb;
+        let ids = s.nb.page_ids.clone();
+        for pid in ids {
+            let e = s.entry_for(pid).unwrap();
+            if s.hist[e].page.is_none() {
+                s.hist[e].page = Some(page_new(s.pgw, s.pgh, PAPER_BLANK));
+            }
+        }
+        s.index = 0;
+        s.page = Some(s.nb.page_ids[0]);
+        s.page_dirty = false;
+        assert_eq!(store_save_page(&s.nb, 0, s.open_page().unwrap()), 0);
+        render_page_full(&mut a);
+        view_reset(&mut a);
+        let s = ed(&mut a);
+        s.page_canvas.px[0] = 0; // a mark no stroke of this page draws
+        assert!(go_to_page(&mut a, 1));
+        assert_eq!(ed_ref(&a).page_views.len(), 1);
+        assert_eq!(ed_ref(&a).page_views[0].pid, 1);
+        assert!(go_to_page(&mut a, 0));
+        assert_eq!(ed_ref(&a).page_canvas.px[0], 0, "the drawing kept in memory came back, not a fresh render");
+        // The page left again, then back: still kept, and still whole for the page.
+        assert!(go_to_page(&mut a, 1));
+        assert!(go_to_page(&mut a, 0));
+        assert_eq!(ed_ref(&a).page_canvas.px[0], 0);
+        // A jump to the oldest kept page (issue #60): with every slot full, the page left takes another
+        // slot, never the one of the page come to, which the load would otherwise find empty and draw again.
+        page_views_clear(ed(&mut a));
+        for i in 0..4 {
+            if i != 0 {
+                assert!(go_to_page(&mut a, i));
+            }
+            ed(&mut a).page_canvas.px[0] = 100 + i as u8; // a mark of this page alone
+        }
+        assert_eq!(ed_ref(&a).page_views.len(), PAGE_VIEWS_MAX);
+        assert_eq!(ed_ref(&a).page_views.iter().map(|v| v.pid).collect::<Vec<_>>(), vec![1, 2, 3]);
+        assert!(go_to_page(&mut a, 0));
+        assert_eq!(ed_ref(&a).page_canvas.px[0], 100, "the oldest kept page came back, not a fresh render");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dense_written_from_blank_keeps_its_drawing_once_quiet_or_left_and_never_twice_in_a_window() {
+        let (root, mut a) = dense_app_page("dense-saves");
+        // The idle save: the page and its preview now; the drawing waits for a quiet page (a page written in
+        // bursts would write 3.4 MB at every pause)
+        assert!(autosave(&mut a));
+        let s = ed_ref(&a);
+        assert!(store_page_dense(&s.nb, 1));
+        assert!(store_page_preview_ok(&s.nb, 1));
+        assert!(!store_page_render_kept(&s.nb, 1, 1000, 1400, false), "no drawing at the first idle save");
+        assert!(s.caches_pending);
+        let dir = root.join("notebooks").join(s.nb.id.as_str());
+        let files = [dir.join("p1.qpg"), dir.join(".page-previews/p1.pgm"), dir.join(".page-previews/p1.full")];
+        let stamps = || files.iter().map(|p| file_stamp(p)).collect::<Vec<_>>();
+        // Not due before the window and the quiet time are over (editor_tick would run autosave at each pass)
+        let now = now_ms();
+        assert!(!caches_due(ed_ref(&a), now.wrapping_add(10_000)));
+        assert!(caches_due(ed_ref(&a), now.wrapping_add(31_000)));
+        caches_window_over(ed(&mut a));
+        assert!(autosave(&mut a));
+        assert!(store_page_render_kept(&ed_ref(&a).nb, 1, 1000, 1400, false));
+        assert!(!ed_ref(&a).caches_pending);
+        let first = stamps();
+        assert!(first.iter().all(|f| f.is_some()));
+        // Nothing changed: no save of any kind writes anything again
+        caches_window_over(ed(&mut a));
+        assert!(autosave(&mut a));
+        assert!(save_page(&mut a));
+        assert!(save_page_leaving(&mut a));
+        assert_eq!(first, stamps(), "unchanged saves write nothing again");
+        // A change: Ctrl+S, the Pages view, Settings and a sleep (save_page) write the page file and no cache,
+        // however often and even with the window over
+        let s = ed(&mut a);
+        s.open_page_mut().unwrap().strokes.pop();
+        mark_changed(s);
+        caches_window_over(s);
+        assert!(save_page(&mut a));
+        assert!(save_page(&mut a));
+        let second = stamps();
+        assert_ne!(first[0], second[0]);
+        assert_eq!(first[1..], second[1..], "an explicit save makes no cache");
+        assert!(ed_ref(&a).caches_pending);
+        // An idle save inside the window makes none either (written a moment ago)
+        let s = ed(&mut a);
+        s.preview_saved_ms = now_ms();
+        s.last_up = now_ms().wrapping_sub(cache_window_ms());
+        assert!(autosave(&mut a));
+        assert_eq!(second, stamps(), "no idle write inside the window");
+        // Leaving writes the drawing at once, inside the window, and no preview; a second time, nothing
+        assert!(save_page_leaving(&mut a));
+        assert!(store_page_render_kept(&ed_ref(&a).nb, 1, 1000, 1400, false));
+        let leaving = stamps();
+        assert_ne!(leaving[2], second[2]);
+        assert_eq!(leaving[..2], second[..2]);
+        assert!(save_page_leaving(&mut a));
+        assert_eq!(leaving, stamps());
+        // The preview that waited finishes at a later idle save, without writing the page or the drawing again
+        caches_window_over(ed(&mut a));
+        assert!(autosave(&mut a));
+        let last = stamps();
+        assert_eq!(leaving[0], last[0]);
+        assert_eq!(leaving[2], last[2]);
+        assert_ne!(leaving[1], last[1]);
+        assert!(!ed_ref(&a).caches_pending);
+        // Neither a partial canvas nor one missing its picture can become a kept drawing
+        for missing in [false, true] {
+            let s = ed(&mut a);
+            s.open_page_mut().unwrap().strokes.pop();
+            mark_changed(s);
+            s.picture_missing = missing;
+            s.canvas_page = if missing { s.open_page_ref() } else { 0 };
+            assert!(save_page_leaving(&mut a));
+            assert!(!store_page_render_kept(&ed_ref(&a).nb, 1, 1000, 1400, false));
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pending_caches_run_no_autosave_while_they_cannot_be_made() {
+        // 2.1.0 review: the flag set by a save outlived a canvas that was not whole (an image paper's picture
+        // still being made) or a read-only page, and editor_tick ran the autosave at every pass of the main loop.
+        let (root, mut a) = dense_app_page("dense-pending");
+        assert!(save_page(&mut a));
+        let later = now_ms().wrapping_add(120_000);
+        let s = ed(&mut a);
+        s.last_up = now_ms().wrapping_sub(120_000);
+        s.preview_saved_ms = now_ms().wrapping_sub(120_000);
+        assert!(s.caches_pending);
+        assert!(caches_due(s, later), "due when they can be made");
+        s.picture_missing = true;
+        assert!(!caches_due(s, later), "not while the picture is white");
+        s.picture_missing = false;
+        s.canvas_page = 0;
+        assert!(!caches_due(s, later), "not while the canvas is another page's");
+        s.canvas_page = s.open_page_ref();
+        assert!(caches_due(s, later));
+        s.page_dirty = true;
+        assert!(!caches_due(s, later), "a changed page is saved first (page_dirty)");
+        s.page_dirty = false;
+        // A read-only page is never written: nothing is left pending for it
+        s.open_page_mut().unwrap().readonly = true;
+        assert!(autosave(&mut a));
+        assert!(!ed_ref(&a).caches_pending);
+        assert!(!caches_due(ed_ref(&a), later));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn closing_keeps_an_unchanged_library_card_and_reuses_current_first_page_caches() {
+        let root = fhold_root("dense-card");
+        let mut nb = NotebookInfo::default();
+        assert_eq!(store_create("Card", "", PAPER_BLANK, &mut nb), 0);
+        let mut a = fshape_app();
+        let s = ed(&mut a);
+        s.nb = nb;
+        let mut c = Canvas::default();
+        canvas_init(&mut c, 1000, 1400);
+        c.px.fill(23);
+        store_save_thumb(s.nb.id.as_str(), &c);
+        // A card nothing says what it was drawn from (one of an older version, a stale one at the open) is drawn
+        // again: the open does not take it for page 1's as it is (2.1.0 review)
+        let before = store_thumb_stamp(s.nb.id.as_str());
+        let mut stale = Canvas::default();
+        refresh_library_thumb(s, 300.0);
+        assert_ne!(before, store_thumb_stamp(s.nb.id.as_str()), "a card of unknown source is drawn again");
+        assert_eq!(store_load_thumb(s.nb.id.as_str(), &mut stale), 0);
+        assert!(stale.px.iter().all(|&v| v == 255), "a blank page 1: the card is blank, not the stale grey");
+        store_save_thumb(s.nb.id.as_str(), &c);
+        // (the card now is another file: a source noted for the one before does not hold for it)
+        refresh_library_thumb(s, 300.0);
+        assert_eq!(store_load_thumb(s.nb.id.as_str(), &mut stale), 0);
+        assert!(stale.px.iter().all(|&v| v == 255));
+        c.px.fill(23);
+        store_save_thumb(s.nb.id.as_str(), &c);
+        store_note_thumb_source(s.nb.id.as_str(), &first_page_source(&s.nb));
+        let before = store_thumb_stamp(s.nb.id.as_str());
+        refresh_library_thumb(s, 300.0);
+        assert_eq!(before, store_thumb_stamp(s.nb.id.as_str()), "other-page edits leave the card alone");
+        // A changed first page: a sentinel kept drawing proves there is no stroke redraw.
+        assert_eq!(store_save_page(&s.nb, 0, &stress_ink()), 0);
+        assert!(store_save_page_render(&s.nb, 1, &c, false));
+        refresh_library_thumb(s, 300.0);
+        let mut card = Canvas::default();
+        assert_eq!(store_load_thumb(s.nb.id.as_str(), &mut card), 0);
+        assert!(card.px.iter().all(|&v| v == 23));
+        let current = store_thumb_stamp(s.nb.id.as_str());
+        refresh_library_thumb(s, 300.0);
+        assert_eq!(current, store_thumb_stamp(s.nb.id.as_str()));
+        // With no kept drawing, a current preview also avoids a stroke redraw.
+        let mut p = stress_ink(); p.strokes.pop();
+        assert_eq!(store_save_page(&s.nb, 0, &p), 0);
+        c.px.fill(71);
+        store_save_page_preview(&s.nb, 1, &c);
+        refresh_library_thumb(s, 300.0);
+        assert_eq!(store_load_thumb(s.nb.id.as_str(), &mut card), 0);
+        assert!(card.px.iter().all(|&v| v == 71));
+        // A new first page must replace the card, even if its file was never edited here.
+        assert_eq!(store_add_page(&mut s.nb, 0, PAPER_BLANK), 0);
+        refresh_library_thumb(s, 300.0);
+        assert_eq!(store_load_thumb(s.nb.id.as_str(), &mut card), 0);
+        assert!(card.px.iter().all(|&v| v == 255));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The quick sizes card is a sheet in every check that asks whether something is in front, and Live view's fast
+    /// ink never previews a pen contact on it (the card keeps the clock corner, as the long-press card does).
+    #[test]
+    fn the_quick_sizes_card_is_a_sheet_and_makes_no_fast_ink() {
         let mut a = app(1860, 2480, 1860, 2480);
         let s = ed(&mut a);
+        s.open = true;
+        assert!(!sheet_open(ed_ref(&a)) && !editor_pen_not_ink(&a));
+        ed(&mut a).qs.open = true;
+        assert!(sheet_open(ed_ref(&a)));
+        assert!(editor_pen_not_ink(&a));
+        // (so the browser's live style is off for any pen contact while it is up)
+        let ev = InEvent { type_: InType::PenDown, x: 900.0, y: 900.0, pressure: 0.5, ..Default::default() };
+        let mut out = LiveStyle::default();
+        editor_live_style(&a, &ev, &mut out);
+        assert_eq!(out.enabled, 0);
+        assert!(!corner_sheet_open(ed_ref(&a)));
+        assert!(!qs_allowed(ed_ref(&a)), "no second card over the first");
+        let s = ed(&mut a);
+        s.qs.open = false;
+        s.qs = QuickSize::default();
+        assert!(qs_allowed(ed_ref(&a)));
+        // a hold targets a pinned pen, the eraser and the tool button while it shows a pen, nothing else
+        let hit = |id: i32, arg: i32| Hit { r: RECT_EMPTY, id, arg };
+        let s = ed(&mut a);
+        s.tool_button_shows = TOOL_PENCIL.0;
+        assert_eq!(qs_target(s, hit(P_TOOLPICK, 0)), Some(TOOL_PENCIL));
+        assert_eq!(qs_target(s, hit(P_TOOL, TOOL_ERASER.0)), Some(TOOL_ERASER));
+        s.tool_button_shows = TB_GRID;
+        assert_eq!(qs_target(s, hit(P_TOOLPICK, 0)), None);
+        s.tool_button_shows = TB_SELECT;
+        assert_eq!(qs_target(s, hit(P_TOOLPICK, 0)), None);
+        assert_eq!(qs_target(s, hit(P_UNDO, 0)), None);
+        assert_eq!(qs_target(s, hit(P_EXPAND, 0)), None);
+    }
+
+    #[test]
+    fn the_live_toolbar_layer_stays_where_the_panel_is_under_any_menu() {
+        // 2.0.0, issue #16: the layer was empty while any menu was up, so the browser lost the toolbar beside the
+        // Display sheet (and the Paper sheet, ...) while the Kindle still showed it. The layer is where the panel is
+        // with a menu beside it or over it: it holds the screen there (live_push_screen), the menu's part over the
+        // panel too, as the Kindle shows it.
+        let mut a = app(1860, 2480, 1860, 2480);
+        let s = ed(&mut a);
+        s.open = true;
         s.panel = Rect { x: 1700, y: 300, w: 140, h: 900 };
-        assert_eq!(editor_live_panel(&a), ed_ref(&a).panel);
-        // The tool picker and its Pin mode open beside the panel: the browser keeps the toolbar.
-        let s = ed(&mut a);
-        s.tools_open = true;
-        s.pin_mode = true;
-        s.tools_rect = Rect { x: 500, y: 300, w: 1180, h: 900 };
-        assert_eq!(editor_live_panel(&a), ed_ref(&a).panel);
-        // A menu over the panel, or any other sheet, takes the layer away (it would be over them).
-        ed(&mut a).tools_rect = Rect { x: 600, y: 300, w: 1180, h: 900 };
-        assert!(rect_is_empty(editor_live_panel(&a)));
-        let s = ed(&mut a);
-        s.tools_rect = Rect { x: 500, y: 300, w: 1180, h: 900 };
-        s.paper_open = true;
+        let panel = s.panel;
+        assert_eq!(editor_live_panel(&a), panel);
+        for open in [
+            // the tool picker and its Pin mode beside the panel, and over it
+            |s: &mut EditorState, on: bool| { s.tools_open = on; s.pin_mode = on; s.tools_rect = Rect { x: 500, y: 300, w: 1180, h: 900 }; },
+            |s: &mut EditorState, on: bool| { s.tools_open = on; s.tools_rect = Rect { x: 600, y: 300, w: 1180, h: 900 }; },
+            |s: &mut EditorState, on: bool| s.dm.open = on,
+            |s: &mut EditorState, on: bool| s.paper_open = on,
+            |s: &mut EditorState, on: bool| s.ts.open = on,
+            |s: &mut EditorState, on: bool| s.mb.open = on,
+            |s: &mut EditorState, on: bool| s.lb.open = on,
+            |s: &mut EditorState, on: bool| s.lt.open = on,
+            |s: &mut EditorState, on: bool| s.find.open = on,
+            |s: &mut EditorState, on: bool| s.card.open = on,
+            |s: &mut EditorState, on: bool| s.qs.open = on,
+        ] {
+            open(ed(&mut a), true);
+            assert_eq!(editor_live_panel(&a), panel);
+            assert_eq!(editor_live_hole(&a), panel); // (the tiles there hold the page and the menu, not the panel)
+            open(ed(&mut a), false);
+        }
+        // A view over the whole screen draws no panel: no layer (the Pages view's frame has no hole either).
+        for open in [
+            |s: &mut EditorState, on: bool| s.pv.open = on,
+            |s: &mut EditorState, on: bool| s.map.open = on,
+            |s: &mut EditorState, on: bool| s.destination.open = on,
+        ] {
+            open(ed(&mut a), true);
+            assert!(rect_is_empty(editor_live_panel(&a)));
+            open(ed(&mut a), false);
+            assert_eq!(editor_live_panel(&a), panel);
+        }
+        ed(&mut a).open = false;
         assert!(rect_is_empty(editor_live_panel(&a)));
     }
     fn fshape_app() -> App {
@@ -10158,6 +12645,84 @@ mod tests {
         compose_all(&mut a, RefreshMode::Ui);
         app_flush(&mut a);
         a
+    }
+
+    #[test]
+    fn adding_pages_says_so_only_for_a_big_batch() {
+        // About 40 ms a page on a Kindle (ADD_PAGE_MS), on any paper: over 2 s from 51 pages, and always from 100.
+        let mut a = App::default();
+        for (n, due) in [(1, false), (10, false), (25, false), (50, false), (51, true), (99, true), (100, true), (2000, true)] {
+            assert_eq!(add_notice_due(&a, n), due, "{n} pages");
+        }
+        // A pen held on an action holds the panel: no notice could show before the writing.
+        a.pen_action_down = true;
+        assert!(!add_notice_due(&a, 2000));
+    }
+
+    #[test]
+    fn space_does_nothing_under_find_with_gestures_on_or_off() {
+        for gestures in [false, true] {
+            let mut a = fshape_app();
+            a.settings.gestures = gestures;
+            find_open(&mut a);
+            assert!(ed_ref(&a).find.open);
+            assert!(!editor_shortcut(&mut a, SHORTCUT_TWO_FINGER_UP));
+            assert!(ed_ref(&a).find.open && !ed_ref(&a).lb.open, "gestures {gestures}");
+        }
+        // With nothing in front, Space with gestures off opens the Links bar, as before.
+        let mut a = fshape_app();
+        a.settings.gestures = false;
+        assert!(editor_shortcut(&mut a, SHORTCUT_TWO_FINGER_UP));
+        assert!(ed_ref(&a).lb.open);
+    }
+
+    // Clear page from a gesture or a key (issues #36, #39: a pen button held over the page cleared it) says
+    // so in a toast that points at Undo, and Undo takes the whole clear back in one step. The toolbar's broom,
+    // in sight as it is tapped, says nothing (the owner, 2026-11-04); an empty page clears nothing and says
+    // nothing.
+    #[test]
+    fn clear_page_from_a_gesture_or_a_key_says_so_and_undo_takes_it_back() {
+        let mut a = fshape_app();
+        let draw = |a: &mut App, t: u32| {
+            pen_event(a, InType::PenDown, false, 300.0, 600.0, t);
+            for k in 1..10 {
+                pen_event(a, InType::PenMove, false, 300.0 + 30.0 * k as f32, 600.0, t + 10 * k);
+            }
+            pen_event(a, InType::PenUp, false, 570.0, 600.0, t + 100);
+            pen_event(a, InType::PenLeave, false, 570.0, 600.0, t + 110);
+            ed(a).pen_left = now_ms().wrapping_sub(5000);
+            assert_eq!(ed_ref(a).open_page().unwrap().strokes.len(), 1);
+        };
+        let toast = |a: &App| a.toast_visible.then(|| a.toast.as_str().to_string());
+        draw(&mut a, 1000);
+        app_toast_dismiss(&mut a);
+        let depth = undo_depth(&mut a);
+        for src in [ActionSrc::Pen, ActionSrc::Key] {
+            assert!(editor_shortcut_at(&mut a, SHORTCUT_CLEAR_PAGE, 500.0, 700.0, src));
+            assert!(ed_ref(&a).open_page().unwrap().strokes.is_empty());
+            assert_eq!(toast(&a).as_deref(), Some("Page cleared. Undo brings it back."));
+            assert_eq!(undo_depth(&mut a), depth + 1, "the clear is one step");
+            undo_redo(&mut a, true);
+            assert_eq!(ed_ref(&a).open_page().unwrap().strokes.len(), 1, "Undo brings the page back");
+            assert_eq!(undo_depth(&mut a), depth);
+            app_toast_dismiss(&mut a);
+        }
+        // the broom: cleared, nothing said
+        panel_act(&mut a, Hit { id: P_CLEAR, ..Default::default() });
+        assert!(ed_ref(&a).open_page().unwrap().strokes.is_empty());
+        assert_eq!(toast(&a), None);
+        // an empty page: nothing cleared, nothing said, no step
+        let depth = undo_depth(&mut a);
+        assert!(editor_shortcut_at(&mut a, SHORTCUT_CLEAR_PAGE, 500.0, 700.0, ActionSrc::Pen));
+        assert_eq!(toast(&a), None);
+        assert_eq!(undo_depth(&mut a), depth);
+        // Spanish says it in Spanish
+        i18n_set("es");
+        undo_redo(&mut a, true);
+        assert!(editor_shortcut_at(&mut a, SHORTCUT_CLEAR_PAGE, 500.0, 700.0, ActionSrc::Key));
+        assert_eq!(toast(&a).as_deref(), Some(tr(PAGE_CLEARED)));
+        assert_ne!(tr(PAGE_CLEARED), PAGE_CLEARED);
+        i18n_set("en");
     }
 
     #[test]
@@ -10215,6 +12780,222 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    // The open page drawn afresh from its strokes, pixel for pixel what the page canvas holds.
+    fn canvas_is_the_page(a: &App) -> bool {
+        let s = ed_ref(a);
+        let mut c = Canvas::default();
+        assert_eq!(canvas_init(&mut c, s.pgw, s.pgh), 0);
+        page_render(&mut c, s.open_page().unwrap(), Rect { x: 0, y: 0, w: s.pgw, h: s.pgh }, a.dpi);
+        c.px == s.page_canvas.px
+    }
+
+    #[test]
+    fn a_kept_drawing_stands_for_the_page_only_while_the_page_is_its_file() {
+        // 2.0.0 to 2.0.1: Clear page and a new paper drew the page again before they marked it changed, and read
+        // the drawing kept of its file back, the old ink and paper; a page with a change not yet written read it
+        // back too wherever it was drawn whole.
+        let root = std::env::temp_dir().join(format!("grimoire-kept-file-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        store_init(root.to_str().unwrap());
+        let mut nb = NotebookInfo::default();
+        assert_eq!(store_create("Kept", "", PAPER_BLANK, &mut nb), 0);
+        let mut a = fshape_app();
+        let s = ed(&mut a);
+        s.nb = nb;
+        // Page 1 with enough ink to say "Loading page..." as it opens (store_page_slow: a file of 256 KB or more)
+        let mut prm = ToolParams::default();
+        tool_params_default(TOOL_BALLPOINT, &mut prm);
+        for k in 0..160u32 {
+            let mut ink = stroke_new(TOOL_BALLPOINT, &prm, 0x900 + k);
+            for i in 0..100 {
+                let t = i as f32 / 99.0;
+                stroke_append(&mut ink, &PenSample { x: 60.0 + 880.0 * t, y: 40.0 + 8.0 * k as f32 + 6.0 * (t * 17.0).sin(), pressure: 0.6, t_ms: i * 5, ..Default::default() }, 300.0);
+            }
+            page_add(s.open_page_mut().unwrap(), ink);
+        }
+        let keep = |a: &mut App| {
+            let s = ed(a);
+            assert_eq!(store_save_page(&s.nb, 0, s.open_page().unwrap()), 0);
+            s.page_dirty = false;
+            render_page_full(a);
+            let s = ed(a);
+            assert!(store_save_page_render(&s.nb, 1, &s.page_canvas, false));
+            assert!(store_page_slow(&s.nb, 1) && store_page_render_kept(&s.nb, 1, s.pgw, s.pgh, false));
+        };
+        keep(&mut a);
+        // The page as its file is comes up from the drawing kept of it, with no "Loading page..."
+        assert!(!loading_toast_due(&a));
+        render_page_full(&mut a);
+        assert!(ed_ref(&a).page_kept && canvas_is_the_page(&a));
+        // A change not yet written: drawn from the strokes, and "Loading page..." would go up
+        let s = ed(&mut a);
+        let gone = s.open_page_mut().unwrap().strokes.pop().unwrap();
+        stroke_free(gone);
+        mark_changed(s);
+        assert!(loading_toast_due(&a));
+        render_page_full(&mut a);
+        assert!(!ed_ref(&a).page_kept && canvas_is_the_page(&a));
+        // A new paper
+        keep(&mut a);
+        apply_paper(&mut a, PAPER_NARROW);
+        assert_eq!(ed_ref(&a).open_page().unwrap().paper, PAPER_NARROW);
+        assert!(!ed_ref(&a).page_kept && canvas_is_the_page(&a));
+        // Clear page
+        keep(&mut a);
+        clear_page(&mut a);
+        assert!(ed_ref(&a).open_page().unwrap().strokes.is_empty());
+        assert!(!ed_ref(&a).page_kept && canvas_is_the_page(&a));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // What 2.0.0 and 2.0.1 may have left of a cleared page pid: its old ink kept under the cleared file's stamp (their
+    // tag, with no "|k2") and the Pages preview made from it. The old ink (the Library card was made from it) and the
+    // drawing's stamp.
+    fn ghost_of_2_0_1(s: &mut EditorState, pid: u32) -> (Canvas, String) {
+        let mut ghost = Canvas::default();
+        assert_eq!(canvas_init(&mut ghost, s.pgw, s.pgh), 0);
+        ghost.px.iter_mut().enumerate().for_each(|(i, v)| *v = if i % 7 == 0 { 40 } else { 255 });
+        assert!(store_save_page_render(&s.nb, pid, &ghost, false));
+        store_save_page_preview(&s.nb, pid, &ghost);
+        let mut dir = String::new();
+        assert_eq!(store_notebook_dir(s.nb.id.as_str(), &mut dir, 600), 0);
+        let stamp = format!("{dir}/.page-previews/p{pid}.full.stamp");
+        let tag = std::fs::read_to_string(&stamp).unwrap();
+        std::fs::write(&stamp, tag.replace("|k2", "")).unwrap(); // (2.0.1's tag)
+        (ghost, stamp)
+    }
+
+    // The open page's Pages preview on disk is the one made from the page canvas.
+    fn preview_is_the_canvas(s: &EditorState) -> bool {
+        let mut shown = Canvas::default();
+        let mut made = Canvas::default();
+        store_load_page_preview(&s.nb, s.open_pid(), &mut shown) && store_page_preview_image(&s.page_canvas, &mut made) && shown.px == made.px
+    }
+
+    #[test]
+    fn a_drawing_kept_by_2_0_1_goes_with_the_preview_and_card_made_beside_it() {
+        // A cleared page's ghost from 2.0.1, current for the page file: the page is drawn from its strokes, the
+        // drawing goes, and the preview and the card are made again from the page drawn. (The Pages view decodes the
+        // preview again, its page file as it was: bgjob.rs a_preview_written_again_is_decoded_again.)
+        let root = std::env::temp_dir().join(format!("grimoire-kept-before-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        store_init(root.to_str().unwrap());
+        let mut nb = NotebookInfo::default();
+        assert_eq!(store_create("Before", "", PAPER_BLANK, &mut nb), 0);
+        let mut a = fshape_app();
+        let s = ed(&mut a);
+        s.nb = nb;
+        assert_eq!(store_save_page(&s.nb, 0, s.open_page().unwrap()), 0); // (blank: cleared)
+        let (ghost, stamp) = ghost_of_2_0_1(s, 1);
+        let mut card = Canvas::default();
+        assert_eq!(canvas_init(&mut card, s.pgw / 3, s.pgh / 3), 0);
+        canvas_downsample_keep_lines(&mut card, &ghost, 0.35);
+        assert_eq!(store_save_thumb(s.nb.id.as_str(), &card), 0);
+        render_page_full(&mut a);
+        assert!(!ed_ref(&a).page_kept && canvas_is_the_page(&a));
+        let s = ed(&mut a);
+        assert!(!std::path::Path::new(&stamp).exists() && !store_retire_page_render(&s.nb, 1));
+        assert!(preview_is_the_canvas(s));
+        assert!(s.thumb_dirty);
+        write_thumb_if_needed(&mut a);
+        let s = ed(&mut a);
+        let mut shown = Canvas::default();
+        assert_eq!(store_load_thumb(s.nb.id.as_str(), &mut shown), 0);
+        canvas_downsample_keep_lines(&mut card, &s.page_canvas, 0.35);
+        assert!(shown.px == card.px);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_stale_drawing_kept_by_2_0_1_goes_with_the_preview_and_card_made_beside_it() {
+        // The same ghost, then a word written: 2.0.1's idle save inside the previews' 30 s wrote the page file alone
+        // (and so does a notebook closed before its idle save), so the drawing is of the file as it was. The card, made
+        // from the canvas as page 1 was left, holds the old ink and the word, and so does the preview a later idle save
+        // made from that canvas, current for the page file. The drawing goes all the same, and the preview and the card
+        // are made again from the page drawn.
+        let root = std::env::temp_dir().join(format!("grimoire-kept-stale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        store_init(root.to_str().unwrap());
+        let mut nb = NotebookInfo::default();
+        assert_eq!(store_create("Stale", "", PAPER_BLANK, &mut nb), 0);
+        let mut a = fshape_app();
+        let s = ed(&mut a);
+        s.nb = nb;
+        assert_eq!(store_save_page(&s.nb, 0, s.open_page().unwrap()), 0); // (blank: cleared)
+        let (mut ghost, stamp) = ghost_of_2_0_1(s, 1);
+        let mut prm = ToolParams::default();
+        tool_params_default(TOOL_BALLPOINT, &mut prm);
+        let mut word = stroke_new(TOOL_BALLPOINT, &prm, 0x77);
+        for i in 0..30 {
+            let t = i as f32 / 29.0;
+            stroke_append(&mut word, &PenSample { x: 300.0 + 500.0 * t, y: 600.0 + 60.0 * t, pressure: 0.6, t_ms: i * 5, ..Default::default() }, 300.0);
+        }
+        page_add(s.open_page_mut().unwrap(), word);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert_eq!(store_save_page(&s.nb, 0, s.open_page().unwrap()), 0);
+        assert!(!store_page_render_kept(&s.nb, 1, s.pgw, s.pgh, false) && store_page_preview_fresh(&s.nb, 1).is_none());
+        // (the old ink and the word, as 2.0.1 showed the page)
+        ghost.px[(600 * s.pgw + 300) as usize..][..500].fill(0);
+        store_save_page_preview(&s.nb, 1, &ghost);
+        assert!(store_page_preview_fresh(&s.nb, 1).is_some());
+        let mut card = Canvas::default();
+        assert_eq!(canvas_init(&mut card, s.pgw / 3, s.pgh / 3), 0);
+        canvas_downsample_keep_lines(&mut card, &ghost, 0.35);
+        assert_eq!(store_save_thumb(s.nb.id.as_str(), &card), 0);
+        render_page_full(&mut a);
+        assert!(!ed_ref(&a).page_kept && canvas_is_the_page(&a));
+        let s = ed(&mut a);
+        assert!(!std::path::Path::new(&stamp).exists());
+        assert!(preview_is_the_canvas(s));
+        assert!(s.thumb_dirty);
+        write_thumb_if_needed(&mut a);
+        let s = ed(&mut a);
+        let mut shown = Canvas::default();
+        assert_eq!(store_load_thumb(s.nb.id.as_str(), &mut shown), 0);
+        canvas_downsample_keep_lines(&mut card, &s.page_canvas, 0.35);
+        assert!(shown.px == card.px);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_drawing_kept_by_2_0_1_goes_as_the_links_bar_stays_on_its_page() {
+        // A page reached from the Links bar comes from the bar's canvas, drawn from its strokes ahead of the tap,
+        // not from render_page_full: staying there takes 2.0.1's drawing away as well, and makes its preview again,
+        // even when the page left had its picture missing (a template's, still being made).
+        let root = std::env::temp_dir().join(format!("grimoire-kept-bar-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        store_init(root.to_str().unwrap());
+        let mut nb = NotebookInfo::default();
+        assert_eq!(store_create("Bar", "", PAPER_BLANK, &mut nb), 0);
+        assert_eq!(store_add_page(&mut nb, 1, PAPER_BLANK), 0);
+        let mut a = fshape_app();
+        let dpi = a.dpi;
+        let s = ed(&mut a);
+        assert_eq!(nb.page_ids, [1, 2]);
+        s.nb = nb;
+        assert_eq!(store_save_page(&s.nb, 0, s.open_page().unwrap()), 0);
+        let e = s.entry_for(2).unwrap();
+        assert_eq!(store_save_page(&s.nb, 1, s.hist[e].page.as_deref().unwrap()), 0); // (blank: cleared)
+        let (_, stamp) = ghost_of_2_0_1(s, 2);
+        // Page 2 peeked: the bar's canvas of it drawn whole
+        let mut peeked = Canvas::default();
+        assert_eq!(canvas_init(&mut peeked, s.pgw, s.pgh), 0);
+        page_render(&mut peeked, s.hist[e].page.as_deref().unwrap(), Rect { x: 0, y: 0, w: s.pgw, h: s.pgh }, dpi);
+        s.ccache[0] = CacheEntry { pid: 2, w: s.pgw, h: s.pgh, pic_gen: bgimage_generation(), canvas: peeked, rows_done: s.pgh, from_hist: true, ..Default::default() };
+        s.lb.open = true;
+        s.peek = Peek { active: true, index: 1, pid: 2, slot: 0, count: 1, from_back: false };
+        s.picture_missing = true;
+        bar_commit(&mut a);
+        let s = ed(&mut a);
+        assert!(!s.lb.open && s.index == 1 && s.open_pid() == 2);
+        assert!(canvas_is_the_page(&a));
+        let s = ed(&mut a);
+        assert!(!s.picture_missing);
+        assert!(!std::path::Path::new(&stamp).exists());
+        assert!(preview_is_the_canvas(s));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     fn fshape_event(a: &mut App, type_: InType, x: f32, y: f32, t_ms: u32) {
         editor_event(a, &InEvent { type_, x, y, t_ms, k_ms: t_ms, ..Default::default() });
     }
@@ -10222,6 +13003,158 @@ mod tests {
     fn pen_event(a: &mut App, type_: InType, side: bool, x: f32, y: f32, t_ms: u32) {
         if matches!(type_, InType::PenUp | InType::PenLeave) { app_pen_feedback_end(a); }
         editor_event(a, &InEvent { type_, side_button: side, x, y, t_ms, ..Default::default() });
+    }
+
+    // A word of two ink strokes on the open page around page point (x, y), its ids.
+    fn sel_word(a: &mut App, x: f32, y: f32) {
+        let s = ed(a);
+        let ip = s.page_ix().unwrap();
+        let page = s.hist[ip].page.as_deref_mut().unwrap();
+        for k in 0..2 {
+            let mut prm = ToolParams::default();
+            tool_params_default(TOOL_BALLPOINT, &mut prm);
+            let mut st = stroke_new(TOOL_BALLPOINT, &prm, 0x300 + k);
+            for i in 0..20 {
+                let t = i as f32 / 19.0;
+                stroke_append(&mut st, &PenSample { x: x - 60.0 + 120.0 * t, y: y - 15.0 + 30.0 * k as f32, pressure: 0.6, ..Default::default() }, 300.0);
+            }
+            page_add(page, st);
+        }
+        render_page_full(a);
+    }
+
+    // A pen lasso (screen px) around (cx, cy), r wide, the button `side` held through it.
+    fn sel_lasso(a: &mut App, cx: f32, cy: f32, r: f32, side: bool, t: u32) {
+        pen_event(a, InType::PenDown, side, cx - r, cy - r, t);
+        let ring = [(cx, cy - r - 5.0), (cx + r, cy - r), (cx + r + 5.0, cy), (cx + r, cy + r), (cx, cy + r + 5.0), (cx - r, cy + r), (cx - r - 5.0, cy), (cx - r, cy - r + 10.0)];
+        for (k, &(x, y)) in ring.iter().enumerate() {
+            pen_event(a, InType::PenMove, side, x, y, t + 10 * (k as u32 + 1));
+        }
+        pen_event(a, InType::PenUp, side, cx - r, cy - r + 10.0, t + 100);
+    }
+
+    // `select` on a pen button's drag is held, not toggled: the contact under the button is the lasso
+    // (never early ink), its selection stays for the bar once the button is let go, and a tap outside it
+    // then ends Select mode without a dot; a lasso around nothing ends it at once (beta.2 brief, Lane B 1).
+    #[test]
+    fn select_held_on_a_pen_drag() {
+        let mut a = fshape_app();
+        assert_eq!(gesturemap_set(&mut a.gestures, pb_key(PenBtn::Button, PenKind::Drag), SHORTCUT_SELECT), 0);
+        app_gestures_sync(&mut a);
+        let (mut px, mut py) = (0.0, 0.0);
+        to_page(ed(&mut a), 400.0, 600.0, &mut px, &mut py);
+        sel_word(&mut a, px, py);
+        pen_event(&mut a, InType::PenHover, false, 300.0, 500.0, 1000);
+        pen_event(&mut a, InType::PenButton, true, 300.0, 500.0, 1010);
+        assert_eq!(ed_ref(&a).sel.state, SelState::Off);
+        // the contact: Select mode held, the lasso drawn, no early ink
+        let ev = InEvent { type_: InType::PenDown, side_button: true, x: 300.0, y: 500.0, ..Default::default() };
+        let mut style = LiveStyle::default();
+        editor_live_style(&a, &ev, &mut style);
+        assert_eq!(style.enabled, 0);
+        pen_event(&mut a, InType::PenDown, true, 300.0, 500.0, 1020);
+        assert_eq!(ed_ref(&a).sel.state, SelState::Lasso);
+        assert!(editor_pen_not_ink(&a));
+        let ring = [(400.0, 495.0), (500.0, 500.0), (505.0, 600.0), (500.0, 700.0), (400.0, 705.0), (300.0, 700.0), (295.0, 600.0), (300.0, 510.0)];
+        for (k, &(x, y)) in ring.iter().enumerate() {
+            pen_event(&mut a, InType::PenMove, true, x, y, 1030 + 10 * k as u32);
+        }
+        pen_event(&mut a, InType::PenUp, true, 300.0, 510.0, 1200);
+        assert_eq!(ed_ref(&a).sel.state, SelState::Selected);
+        assert_eq!(ed_ref(&a).sel.ids.len(), 2);
+        // the button let go: the selection stays for the bar
+        pen_event(&mut a, InType::PenButton, false, 300.0, 510.0, 1300);
+        assert_eq!(ed_ref(&a).sel.state, SelState::Selected);
+        // a tap outside it: Select mode ends, and the tap leaves no ink
+        sel_lasso_free_tap(&mut a, 800.0, 1100.0, 1400);
+        assert_eq!(ed_ref(&a).sel.state, SelState::Off);
+        assert_eq!(ed_ref(&a).open_page().unwrap().strokes.len(), 2);
+        // a held lasso around nothing: Select mode ends with the contact
+        pen_event(&mut a, InType::PenButton, true, 800.0, 1100.0, 1500);
+        sel_lasso(&mut a, 800.0, 1100.0, 60.0, true, 1510);
+        assert_eq!(ed_ref(&a).sel.state, SelState::Off);
+        pen_event(&mut a, InType::PenButton, false, 800.0, 1100.0, 1700);
+        assert_eq!(ed_ref(&a).sel.state, SelState::Off);
+        assert_eq!(ed_ref(&a).open_page().unwrap().strokes.len(), 2);
+        // a click still toggles: Select mode stays on after a click bound to `select`
+        assert!(gesturemap_set(&mut a.gestures, pb_key(PenBtn::Button, PenKind::Tap), SHORTCUT_SELECT) >= 0);
+        app_gestures_sync(&mut a);
+        a.pb_config.waits = [false; 3];
+        pen_event(&mut a, InType::PenButton, true, 800.0, 1100.0, 2000);
+        pen_event(&mut a, InType::PenButton, false, 800.0, 1100.0, 2050);
+        assert_eq!(ed_ref(&a).sel.state, SelState::Armed);
+        assert!(!ed_ref(&a).sel.by_hold);
+    }
+
+    fn sel_lasso_free_tap(a: &mut App, x: f32, y: f32, t: u32) {
+        pen_event(a, InType::PenDown, false, x, y, t);
+        pen_event(a, InType::PenUp, false, x, y, t + 30);
+    }
+
+    // `select` on a pen button's hold: Select mode while it is held (the lasso drawn under it); let go with
+    // nothing selected, the pen draws again.
+    #[test]
+    fn select_held_on_a_pen_hold() {
+        let mut a = fshape_app();
+        assert!(gesturemap_set(&mut a.gestures, pb_key(PenBtn::Button, PenKind::Hold), SHORTCUT_SELECT) >= 0);
+        app_gestures_sync(&mut a);
+        pb_out(&mut a, PbOut::HoldBegin(PenBtn::Button), 1000);
+        assert_eq!(ed_ref(&a).sel.state, SelState::Armed);
+        assert!(ed_ref(&a).sel.holding);
+        pb_out(&mut a, PbOut::HoldEnd(PenBtn::Button), 1500);
+        assert_eq!(ed_ref(&a).sel.state, SelState::Off);
+        // with a selection made under it, Select mode stays after the release
+        let (mut px, mut py) = (0.0, 0.0);
+        to_page(ed(&mut a), 400.0, 600.0, &mut px, &mut py);
+        sel_word(&mut a, px, py);
+        pb_out(&mut a, PbOut::HoldBegin(PenBtn::Button), 2000);
+        pen_event(&mut a, InType::PenHover, false, 300.0, 500.0, 2010);
+        sel_lasso(&mut a, 400.0, 600.0, 100.0, false, 2020);
+        assert_eq!(ed_ref(&a).sel.state, SelState::Selected);
+        pb_out(&mut a, PbOut::HoldEnd(PenBtn::Button), 2300);
+        assert_eq!(ed_ref(&a).sel.state, SelState::Selected);
+        // pens reset (sleep): a held Select is let go
+        pb_out(&mut a, PbOut::HoldBegin(PenBtn::Button), 2400);
+        pb_reset(ed(&mut a));
+        assert!(!ed_ref(&a).sel.holding);
+    }
+
+    #[test]
+    fn select_held_leaves_the_copy_picker_and_sheets_alone() {
+        let mut a = fshape_app();
+        assert!(gesturemap_set(&mut a.gestures, pb_key(PenBtn::Button, PenKind::Hold), SHORTCUT_SELECT) >= 0);
+        app_gestures_sync(&mut a);
+        // Copy to notebook...'s picker up (the Pages view's): a held select neither starts nor closes it
+        ed(&mut a).destination.open = true;
+        ed(&mut a).destination.copying = true;
+        pb_out(&mut a, PbOut::HoldBegin(PenBtn::Button), 1000);
+        assert_eq!(ed_ref(&a).sel.state, SelState::Off);
+        assert!(ed_ref(&a).destination.open && ed_ref(&a).destination.copying);
+        pb_out(&mut a, PbOut::HoldEnd(PenBtn::Button), 1500);
+        // and dropping link making keeps it too
+        lm_drop(ed(&mut a));
+        assert!(ed_ref(&a).destination.open && ed_ref(&a).destination.copying);
+        ed(&mut a).destination = NotebookPicker::default();
+        // a selection: its box and bar draw over the page, but not under a sheet, where they cannot be tapped
+        let (mut px, mut py) = (0.0, 0.0);
+        to_page(ed(&mut a), 400.0, 600.0, &mut px, &mut py);
+        sel_word(&mut a, px, py);
+        pb_out(&mut a, PbOut::HoldBegin(PenBtn::Button), 2000);
+        pen_event(&mut a, InType::PenHover, false, 300.0, 500.0, 2010);
+        sel_lasso(&mut a, 400.0, 600.0, 100.0, false, 2020);
+        pb_out(&mut a, PbOut::HoldEnd(PenBtn::Button), 2300);
+        assert_eq!(ed_ref(&a).sel.state, SelState::Selected);
+        let full = Rect::new(0, 0, a.screen.w, a.screen.h);
+        let before = a.screen.px.clone();
+        sel_draw(&mut a, full);
+        assert!(a.screen.px != before, "the selection draws over the page");
+        ed(&mut a).lb.open = true;
+        let before = a.screen.px.clone();
+        sel_draw(&mut a, full);
+        assert!(a.screen.px == before, "nothing of the selection over the Links bar");
+        // a held select under the open bar does nothing either
+        pb_out(&mut a, PbOut::HoldBegin(PenBtn::Button), 2400);
+        assert!(!ed_ref(&a).sel.holding);
     }
 
     #[test]
@@ -10255,7 +13188,8 @@ mod tests {
     #[test]
     fn pen_momentary_eraser_starts_on_press_and_preserves_a_key_hold() {
         let mut a = fshape_app();
-        assert_eq!(gesturemap_set(&mut a.gestures, pb_key(PenBtn::Button, PenKind::Hold), SHORTCUT_HOLD_ERASER), SHORTCUT_CLEAR_PAGE);
+        // (the hold has no built-in action since 2.1.0-beta.2: nothing lost)
+        assert_eq!(gesturemap_set(&mut a.gestures, pb_key(PenBtn::Button, PenKind::Hold), SHORTCUT_HOLD_ERASER), 0);
         app_gestures_sync(&mut a);
         pen_event(&mut a, InType::PenHover, false, 400.0, 600.0, 1000);
         pen_event(&mut a, InType::PenButton, true, 400.0, 600.0, 1010);
@@ -10310,7 +13244,9 @@ mod tests {
         a.settings.gesture_new_page = true;
         pb_out(&mut a, PbOut::Fire(PenBtn::Button, PenKind::Tap), 1000);
         assert_eq!(ed_ref(&a).nb.page_ids, [1, 2]);
-        assert_eq!(a.toast.as_str(), "This is the last page.");
+        // (it stays on the last page, silently: no toast since the owner's toast pass)
+        assert_eq!(ed_ref(&a).index, 1);
+        assert!(!a.toast_visible);
         let s = ed(&mut a);
         s.map.open = true;
         keyboard_open(&mut s.map_kb, "Name", b"draft");
@@ -10484,6 +13420,121 @@ mod tests {
         assert_eq!(ed_ref(&a).fs_last_action, SHORTCUT_LINKS);
         assert!(!ed_ref(&a).lb.open);
         assert_eq!(ed_ref(&a).index, 0);
+    }
+
+    // A finger shape names its action only when the action did something (2.0.0-beta.2, the owner: "Show the
+    // action's name only when the action actually did something"): Previous page on page 1, Next page on the last
+    // page (a shape adds no page there, even with swiping past the last page adding one), Clear page on an empty
+    // page, Undo or Redo with nothing to undo or redo, and Close menu with nothing open fire and say nothing; so
+    // does Redo right after a stroke, whose settle is no change of the app's. Done, each names its action as
+    // before, and so does a setting that changes with nothing drawn.
+    #[test]
+    fn fshape_names_its_action_only_when_it_did_something() {
+        // (a data root of its own: the setting it changes is saved, settings.ini there)
+        let root = std::env::temp_dir().join(format!("grimoire-fshape-names-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(store_init(root.to_str().unwrap()), 0);
+        let mut a = fshape_app();
+        let path = [(250,400), (350,400), (450,400), (550,400), (650,400), (650,500),
+            (650,600), (650,700), (550,700), (450,700), (350,700), (250,700), (250,600), (250,500), (250,400)];
+        let pts: Vec<FsPt> = path.iter().map(|&(x, y)| FsPt { x, y }).collect();
+        let mut sample = FsSample::default();
+        fs_sample_of(&pts, &mut sample);
+        let clock = Cell::new(1000u32);
+        // (the square drawn with a finger, bound to `action` alone; the toast it leaves, None for none)
+        let fire = |a: &mut App, action: i32| -> Option<String> {
+            assert!(gesturemap_shape_set(&mut a.gestures, action, &[sample; 3]) >= 0);
+            app_toast_dismiss(a);
+            let t = clock.get();
+            fshape_event(a, InType::TouchDown, 250.0, 400.0, t);
+            for (i, &(x, y)) in path.iter().enumerate().skip(1) {
+                fshape_event(a, InType::TouchMove, x as f32, y as f32, t + i as u32 * 30);
+            }
+            fshape_event(a, InType::TouchUp, 250.0, 400.0, t + 450);
+            clock.set(t + 2000);
+            assert_eq!((ed_ref(a).fs_last_kind, ed_ref(a).fs_last_action), (FS_OUT_FIRED, action));
+            ed(a).info_dirty = false; // (this in-memory notebook has no notebook.ini to write)
+            a.toast_visible.then(|| a.toast.as_str().to_string())
+        };
+        let named = |action: i32| Some(action_label(action).to_string());
+        a.settings.gesture_new_page = true;
+        // Page 1 of 2, blank: nothing before it, nothing to clear, undo or redo, no menu to close
+        assert_eq!(fire(&mut a, SHORTCUT_PREV_PAGE), None);
+        assert_eq!(fire(&mut a, SHORTCUT_CLEAR_PAGE), None);
+        assert_eq!(fire(&mut a, SHORTCUT_UNDO), None);
+        assert_eq!(fire(&mut a, SHORTCUT_REDO), None);
+        assert_eq!(fire(&mut a, SHORTCUT_CLOSE_MENU), None);
+        assert_eq!(ed_ref(&a).index, 0);
+        // Next page: page 2, named; there, the last page, nothing
+        assert_eq!(fire(&mut a, SHORTCUT_NEXT_PAGE), named(SHORTCUT_NEXT_PAGE));
+        assert_eq!(ed_ref(&a).index, 1);
+        assert_eq!(fire(&mut a, SHORTCUT_NEXT_PAGE), None);
+        assert_eq!((ed_ref(&a).index, ed_ref(&a).nb.npages()), (1, 2));
+        // A stroke on page 2: Redo has nothing to redo (its settle draws what is there already), Undo takes the
+        // stroke away and Redo puts it back, each named
+        let t = clock.get();
+        pen_event(&mut a, InType::PenDown, false, 300.0, 1000.0, t);
+        for k in 1..10 {
+            pen_event(&mut a, InType::PenMove, false, 300.0 + 30.0 * k as f32, 1000.0, t + 10 * k);
+        }
+        pen_event(&mut a, InType::PenUp, false, 570.0, 1000.0, t + 100);
+        pen_event(&mut a, InType::PenLeave, false, 570.0, 1000.0, t + 110);
+        clock.set(t + 2000);
+        ed(&mut a).pen_left = now_ms().wrapping_sub(5000);
+        assert_eq!(ed_ref(&a).open_page().unwrap().strokes.len(), 1);
+        assert!(!rect_is_empty(ed_ref(&a).settle) || ed_ref(&a).panel_stale);
+        assert_eq!(fire(&mut a, SHORTCUT_REDO), None);
+        assert_eq!(fire(&mut a, SHORTCUT_UNDO), named(SHORTCUT_UNDO));
+        assert_eq!(ed_ref(&a).open_page().unwrap().strokes.len(), 0);
+        assert_eq!(fire(&mut a, SHORTCUT_REDO), named(SHORTCUT_REDO));
+        assert_eq!(fire(&mut a, SHORTCUT_REDO), None);
+        assert_eq!(ed_ref(&a).open_page().unwrap().strokes.len(), 1);
+        // Clear page clears it, saying so with its own toast (2.1.0-beta.2: the way back is Undo), not the
+        // shape's name; then the page is empty: nothing
+        assert_eq!(fire(&mut a, SHORTCUT_CLEAR_PAGE), Some(tr(PAGE_CLEARED).to_string()));
+        assert_eq!(ed_ref(&a).open_page().unwrap().strokes.len(), 0);
+        assert_eq!(fire(&mut a, SHORTCUT_CLEAR_PAGE), None);
+        // Previous page: page 1, named (the cleared page as saved: this in-memory notebook has no file for it)
+        ed(&mut a).page_dirty = false;
+        assert_eq!(fire(&mut a, SHORTCUT_PREV_PAGE), named(SHORTCUT_PREV_PAGE));
+        assert_eq!(ed_ref(&a).index, 0);
+        // A setting with nothing drawn (swiping past the last page adds a page, no toast of its own): named
+        assert_eq!(fire(&mut a, SHORTCUT_GESTURE_NEW_PAGE), named(SHORTCUT_GESTURE_NEW_PAGE));
+        assert!(!a.settings.gesture_new_page);
+        assert!(std::fs::read_to_string(root.join("settings.ini")).unwrap().contains("gesture_new_page=0"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Zoom in at the most zoom, Zoom out at the least, and a scroll past the end of the first or the last page
+    // leave the view where it was: they draw nothing, so a finger shape bound to them says nothing either. A zoom
+    // or a scroll that moves the view draws it.
+    #[test]
+    fn zoom_and_scroll_at_their_limits_draw_nothing() {
+        let mut a = fshape_app();
+        let s = ed(&mut a);
+        s.zoom = s.zoom_max;
+        view_clamp(&mut a);
+        let changes = a.changes;
+        assert!(editor_shortcut_at(&mut a, SHORTCUT_ZOOM_IN, 500.0, 700.0, ActionSrc::Shape));
+        assert_eq!(a.changes, changes);
+        assert!(editor_shortcut_at(&mut a, SHORTCUT_ZOOM_OUT, 500.0, 700.0, ActionSrc::Shape));
+        assert_ne!(a.changes, changes);
+        let s = ed(&mut a);
+        s.zoom = s.zoom_min;
+        view_clamp(&mut a);
+        let changes = a.changes;
+        assert!(editor_shortcut_at(&mut a, SHORTCUT_ZOOM_OUT, 500.0, 700.0, ActionSrc::Shape));
+        assert_eq!(a.changes, changes);
+        // Page 1 of 2, its top on show: up goes nowhere; zoomed in, down moves the view
+        view_reset(&mut a);
+        let changes = a.changes;
+        assert!(editor_shortcut(&mut a, SHORTCUT_SCROLL_UP));
+        assert_eq!((a.changes, ed_ref(&a).index), (changes, 0));
+        ed(&mut a).zoom = 2.0;
+        view_clamp(&mut a);
+        let (changes, oy) = (a.changes, ed_ref(&a).oy);
+        assert!(editor_shortcut(&mut a, SHORTCUT_SCROLL_DOWN));
+        assert!(a.changes != changes && ed_ref(&a).oy > oy && ed_ref(&a).index == 0);
     }
 
     #[test]
@@ -10739,14 +13790,15 @@ mod tests {
         ed(&mut a).panel = Rect::new(0, 0, box_(), box_());
         let c = editor_live_chip(&a, 42);
         assert!(rect_contains_rect(Rect::new(0, 0, 1860, 2480), c));
-        // A menu, sheet, bar or the Pages view in front takes it away, and the panel's Live layer with it.
+        // A menu, sheet, bar or the Pages view in front takes it away (the panel's Live layer stays, holding the menu
+        // over it as the screen does, but under the Pages view: the_live_toolbar_layer_stays_...).
         ed(&mut a).collapsed = false;
         ed(&mut a).panel = Rect::new(1704, 220, 128, 1520);
         assert_ne!(editor_live_panel(&a), RECT_EMPTY);
         assert_eq!(editor_live_hole(&a), Rect::new(1704, 220, 128, 1520));
         for open in [
             |s: &mut EditorState, on: bool| s.pv.open = on,
-            // (the tool picker over the panel: beside it, the layer stays, the_live_toolbar_stays_...)
+            // (the tool picker over the panel)
             |s: &mut EditorState, on: bool| { s.tools_open = on; s.tools_rect = if on { s.panel } else { RECT_EMPTY }; },
             |s: &mut EditorState, on: bool| s.mb.open = on,
             |s: &mut EditorState, on: bool| s.dm.open = on,
@@ -10759,7 +13811,7 @@ mod tests {
             open(ed(&mut a), true);
             assert!(!editor_page_in_front(&a));
             assert_eq!(editor_live_chip(&a, 42), RECT_EMPTY);
-            assert_eq!(editor_live_panel(&a), RECT_EMPTY);
+            assert_eq!(editor_live_panel(&a) == RECT_EMPTY, ed_ref(&a).pv.open);
             // (the frame is still pushed without the panel under a menu, but for the Pages view, which has none)
             assert_eq!(editor_live_hole(&a) == RECT_EMPTY, ed_ref(&a).pv.open);
             open(ed(&mut a), false);
@@ -10904,6 +13956,10 @@ mod tests {
         assert_eq!(owner_name(Owner::Lasso),"lasso");
         assert_eq!(owner_name(Owner::LinkTo),"linkto");
         assert_eq!(owner_name(Owner::PenDrag),"pen-drag");
+        assert_eq!(owner_name(Owner::Select),"select");
+        assert_eq!(owner_name(Owner::AddPad),"add-pad");
+        assert_eq!(Owner::QuickSize as i32, 22);
+        assert_eq!(owner_name(Owner::QuickSize),"quick-size");
     }
 
     #[test]
@@ -11132,10 +14188,583 @@ mod tests {
         assert!(!lasso_too_small(Rect { x: 0, y: 0, w: 3, h: min }, 300.0));
         assert!(lasso_too_small(Rect { x: 0, y: 0, w: min, h: min }, 600.0));
     }
+
+    // ---- the finger's way in to Select (owner ruling 2026-11-02): hold still, then draw ----
+
+    // A data root of its own (the clipboard is root/clipboard.qpg), emptied first.
+    fn fhold_root(name: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("grimoire-fhold-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        store_init(root.to_str().unwrap());
+        assert!(!clipboard_has());
+        root
+    }
+
+    fn finger(a: &mut App, type_: InType, x: f32, y: f32) {
+        fshape_event(a, type_, x, y, now_ms());
+    }
+
+    // A finger down at (x, y), still for the hold time: editor_tick's hold fires.
+    fn finger_hold(a: &mut App, x: f32, y: f32) {
+        finger(a, InType::TouchDown, x, y);
+        editor_tick(a, now_ms().wrapping_add(HOLD_MS + 10));
+    }
+
+    // The rest of a finger's lasso from its hold at (cx - r, cy - r): around (cx, cy), then the lift.
+    fn finger_ring(a: &mut App, cx: f32, cy: f32, r: f32) {
+        let ring = [(cx, cy - r - 5.0), (cx + r, cy - r), (cx + r + 5.0, cy), (cx + r, cy + r), (cx, cy + r + 5.0), (cx - r, cy + r), (cx - r - 5.0, cy), (cx - r, cy - r + 10.0)];
+        for &(x, y) in &ring {
+            finger(a, InType::TouchMove, x, y);
+        }
+        finger(a, InType::TouchUp, cx - r, cy - r + 10.0);
+    }
+
+    fn undo_depth(a: &mut App) -> usize {
+        let h = ed(a).cur_hist().unwrap();
+        ed_ref(a).hist[h].h.undo.len()
+    }
+
+    // Whether Select's bar is on the screen: laid out, and ink in its rect.
+    fn bar_drawn(a: &App) -> bool {
+        let b = rect_intersect(ed_ref(a).sel.bar, Rect { x: 0, y: 0, w: a.screen.w, h: a.screen.h });
+        !rect_is_empty(b) && (b.y..b.y + b.h).any(|y| (b.x..b.x + b.w).any(|x| a.screen.px[(y * a.screen.stride + x) as usize] < 128))
+    }
+
+    // Held still off a link, a finger arms the lasso (a ring at it, Select mode entered quietly); drawn on, it
+    // selects as the pen's lasso does, with no undo step, and a tap outside the selection ends Select mode.
+    #[test]
+    fn finger_hold_then_draw_selects() {
+        let root = fhold_root("draw");
+        let mut a = fshape_app();
+        sel_word(&mut a, 400.0, 600.0);
+        let depth = undo_depth(&mut a);
+        finger_hold(&mut a, 280.0, 495.0);
+        let s = ed_ref(&a);
+        assert_eq!(s.sel.state, SelState::Lasso);
+        assert_eq!(s.owner, Owner::Select);
+        assert!(s.sel.finger && s.sel.by_finger);
+        assert!(!rect_is_empty(s.sel.lasso_rect), "the ring is drawn, to be drawn away with the lasso");
+        assert!(rect_is_empty(s.sel.bar), "no bar yet");
+        // the pen's timed paste is not the finger's: held on, nothing happens
+        editor_tick(&mut a, now_ms().wrapping_add(3 * HOLD_MS));
+        assert_eq!(ed_ref(&a).sel.state, SelState::Lasso);
+        finger_ring(&mut a, 400.0, 615.0, 120.0);
+        let s = ed_ref(&a);
+        assert_eq!(s.sel.state, SelState::Selected);
+        assert_eq!(s.sel.ids.len(), 2);
+        assert_eq!(s.owner, Owner::None);
+        assert!(s.sel.by_finger && !s.sel.finger);
+        assert!(rect_is_empty(s.sel.lasso_rect));
+        assert!(bar_drawn(&a), "the pen lasso's bar, drawn");
+        assert_eq!(undo_depth(&mut a), depth, "selecting alone is no undo step");
+        // a finger inside the box drags it, as before
+        let b = ed_ref(&a).sel.box_;
+        finger(&mut a, InType::TouchDown, (b.x + b.w / 2) as f32, (b.y + b.h / 2) as f32);
+        assert_eq!(ed_ref(&a).sel.state, SelState::Dragging);
+        finger(&mut a, InType::TouchUp, (b.x + b.w / 2) as f32, (b.y + b.h / 2) as f32);
+        assert_eq!(ed_ref(&a).sel.state, SelState::Selected);
+        // a tap outside: the selection ends, and with it the Select mode the hold entered; nothing else
+        finger(&mut a, InType::TouchDown, 700.0, 1100.0);
+        assert_eq!(ed_ref(&a).sel.state, SelState::Off);
+        finger(&mut a, InType::TouchUp, 700.0, 1100.0);
+        assert_eq!(ed_ref(&a).owner, Owner::None);
+        assert_eq!(ed_ref(&a).open_page().unwrap().strokes.len(), 2);
+        // a lasso around nothing ends Select mode at once
+        finger_hold(&mut a, 580.0, 980.0);
+        assert_eq!(ed_ref(&a).sel.state, SelState::Lasso);
+        finger_ring(&mut a, 700.0, 1100.0, 120.0);
+        assert_eq!(ed_ref(&a).sel.state, SelState::Off);
+        assert_eq!(ed_ref(&a).owner, Owner::None);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // The screen is what its layers make of it (the `layers` probe's rule: a frame's blended edge drawn again over
+    // itself may differ by 64 at most).
+    fn layers_ok(a: &mut App) -> bool {
+        let keep = a.screen.px.clone();
+        compose(a, Rect { x: 0, y: 0, w: a.w, h: a.h });
+        keep.iter().zip(a.screen.px.iter()).all(|(x, y)| x.abs_diff(*y) <= 64)
+    }
+
+    // A drag of the selection (2.1.0, select.rs's head): its pen samples draw nothing and refresh nothing; the
+    // tick shows the newest place, the first move taking the bar away, and no other show comes before
+    // DRAG_SHOW_MS while the pen moves; the screen is what compose makes of it at each step; Back in the middle
+    // ends the selection with its copy of the screen and leaves the screen as compose makes it; a drag's lift
+    // moves the ink by exactly its newest place, shown or not; a tap that wobbles a pixel is a tap; and a drag
+    // whose lift was lost is ended by the next down, which acts on no button of the bar it had taken away.
+    #[test]
+    fn a_drag_draws_at_the_tick_never_at_a_sample() {
+        let root = fhold_root("drag");
+        let mut a = fshape_app();
+        let (mut px, mut py) = (0.0, 0.0);
+        to_page(ed(&mut a), 400.0, 600.0, &mut px, &mut py);
+        sel_word(&mut a, px, py);
+        sel_toggle(&mut a);
+        sel_lasso(&mut a, 400.0, 615.0, 120.0, false, 1000);
+        app_flush(&mut a);
+        assert_eq!(ed_ref(&a).sel.state, SelState::Selected);
+        assert!(bar_drawn(&a));
+        let probe = |a: &App, k: &str| sel_probe(a, k).unwrap();
+        let first = |a: &App| ed_ref(a).open_page().unwrap().strokes.iter().map(|st| (st.pts[0].x, st.pts[0].y)).collect::<Vec<_>>();
+        let at0 = first(&a);
+        // the samples: nothing drawn, nothing to refresh
+        let screen0 = a.screen.px.clone();
+        pen_event(&mut a, InType::PenDown, false, 400.0, 610.0, 2000);
+        assert_eq!(ed_ref(&a).sel.state, SelState::Dragging);
+        for k in 1..=40 {
+            pen_event(&mut a, InType::PenMove, false, 400.0 + 3.0 * k as f32, 610.0 - k as f32, 2000 + 3 * k as u32);
+        }
+        assert!(a.screen.px == screen0 && rect_is_empty(a.dirty), "a sample draws nothing");
+        // (the first three within the drag's slop, 1 mm: the box stays for them)
+        assert_eq!((probe(&a, "drag_samples"), probe(&a, "drag_shows"), probe(&a, "drag_shown")), ("37".into(), "0".into(), "-".into()));
+        // the tick: the first move shown, the bar gone, the selection's ink walked only for the outline's strips
+        // (the show's time a second back: every sample after it is newer than any tick below, so the pen never
+        // seems to have paused and only DRAG_SHOW_MS can let a show through)
+        let t0 = now_ms().wrapping_sub(1000);
+        editor_tick(&mut a, t0);
+        app_flush(&mut a);
+        assert_eq!((probe(&a, "drag_shows"), probe(&a, "drag_copy")), ("1".into(), "1".into()));
+        let (mut dx, mut dy) = (0.0, 0.0);
+        to_page(ed(&mut a), 520.0, 570.0, &mut dx, &mut dy);
+        let (mut ox, mut oy) = (0.0, 0.0);
+        to_page(ed(&mut a), 400.0, 610.0, &mut ox, &mut oy);
+        let want = ((dx - ox).round() as i32, (dy - oy).round() as i32);
+        assert_eq!(probe(&a, "drag_shown"), format!("{} {}", want.0, want.1));
+        assert!(!bar_drawn(&a), "the bar is away while the box moves");
+        let inked: u32 = probe(&a, "drag_inked").parse().unwrap();
+        // (the outline's four strips, and the four resize handle squares the selection showed)
+        assert!((1..=8).contains(&inked), "the halo walked only where the outline's strips and handles were: {inked}");
+        assert!(layers_ok(&mut a));
+        // the pen moves on: a tick before DRAG_SHOW_MS went by since the show shows nothing
+        for k in 41..=50 {
+            pen_event(&mut a, InType::PenMove, false, 400.0 + 3.0 * k as f32, 610.0 - k as f32, 2200 + 3 * k as u32);
+        }
+        let screen1 = a.screen.px.clone();
+        editor_tick(&mut a, t0.wrapping_add(DRAG_SHOW_MS - 1));
+        assert!(a.screen.px == screen1 && rect_is_empty(a.dirty), "no show before DRAG_SHOW_MS");
+        assert_eq!((probe(&a, "drag_shows"), probe(&a, "drag_shown")), ("1".into(), format!("{} {}", want.0, want.1)));
+        // more samples, and DRAG_SHOW_MS went by since the show: the newest place shown, once
+        for k in 51..=60 {
+            pen_event(&mut a, InType::PenMove, false, 400.0 + 3.0 * k as f32, 610.0 - k as f32, 2200 + 3 * k as u32);
+        }
+        editor_tick(&mut a, t0.wrapping_add(DRAG_SHOW_MS));
+        app_flush(&mut a);
+        assert_eq!(probe(&a, "drag_shows"), "2");
+        let newest = {
+            let (mut x, mut y) = (0.0, 0.0);
+            to_page(ed(&mut a), 580.0, 550.0, &mut x, &mut y);
+            format!("{} {}", (x - ox).round() as i32, (y - oy).round() as i32)
+        };
+        assert_eq!(probe(&a, "drag_shown"), newest);
+        editor_tick(&mut a, t0.wrapping_add(2 * DRAG_SHOW_MS)); // (nothing newer: nothing to show)
+        assert_eq!(probe(&a, "drag_shows"), "2");
+        assert!(layers_ok(&mut a));
+        // Back in the middle: the selection ends, its copy of the screen with it, the screen as compose makes it
+        assert!(editor_back(&mut a));
+        app_flush(&mut a);
+        assert_eq!(ed_ref(&a).sel.state, SelState::Armed);
+        assert_eq!(probe(&a, "drag_copy"), "0");
+        assert!(layers_ok(&mut a));
+        pen_event(&mut a, InType::PenUp, false, 580.0, 550.0, 2600);
+        assert_eq!(first(&a), at0, "nothing moved");
+        // again, lifted with a place the tick never showed: the ink moved by it exactly, one step
+        sel_lasso(&mut a, 400.0, 615.0, 120.0, false, 3000);
+        assert_eq!(ed_ref(&a).sel.state, SelState::Selected);
+        let depth = undo_depth(&mut a);
+        pen_event(&mut a, InType::PenDown, false, 400.0, 610.0, 4000);
+        pen_event(&mut a, InType::PenMove, false, 450.0, 640.0, 4010);
+        editor_tick(&mut a, now_ms());
+        pen_event(&mut a, InType::PenMove, false, 470.0, 700.0, 4020);
+        pen_event(&mut a, InType::PenUp, false, 470.0, 700.0, 4030);
+        app_flush(&mut a);
+        assert_eq!(ed_ref(&a).sel.state, SelState::Selected);
+        assert_eq!(undo_depth(&mut a), depth + 1);
+        let (mut x, mut y) = (0.0, 0.0);
+        to_page(ed(&mut a), 470.0, 700.0, &mut x, &mut y);
+        let (mx, my) = ((x - ox).round(), (y - oy).round());
+        let moved: Vec<(f32, f32)> = at0.iter().map(|&(x, y)| (x + mx, y + my)).collect();
+        assert_eq!(first(&a), moved);
+        assert_eq!(probe(&a, "drag_copy"), "0");
+        assert!(layers_ok(&mut a));
+        // a tap inside that wobbles a pixel (within the slop): no show, nothing moved, no undo step, the bar
+        // left as it was
+        let depth = undo_depth(&mut a);
+        let screen2 = a.screen.px.clone();
+        pen_event(&mut a, InType::PenDown, false, 470.0, 700.0, 5000);
+        assert_eq!(ed_ref(&a).sel.state, SelState::Dragging);
+        pen_event(&mut a, InType::PenMove, false, 471.0, 700.0, 5003);
+        pen_event(&mut a, InType::PenMove, false, 471.0, 701.0, 5006);
+        editor_tick(&mut a, now_ms().wrapping_add(1000));
+        assert!(a.screen.px == screen2 && rect_is_empty(a.dirty), "a wobble shows nothing");
+        pen_event(&mut a, InType::PenUp, false, 471.0, 701.0, 5009);
+        app_flush(&mut a);
+        assert_eq!((probe(&a, "drag_samples"), probe(&a, "drag_shows")), ("0".into(), "0".into()));
+        assert_eq!(ed_ref(&a).sel.state, SelState::Selected);
+        assert_eq!(undo_depth(&mut a), depth);
+        assert_eq!(first(&a), moved);
+        assert!(bar_drawn(&a));
+        assert!(layers_ok(&mut a));
+        // a drag whose lift was lost and that nothing ended (its owner let go): the next down ends it as a
+        // cancel and is swallowed, even where the bar's Delete was before the drag (not on the screen then)
+        let del = ed_ref(&a).sel.btns.iter().find(|(_, k)| *k == SelBtn::Delete).map(|(r, _)| *r).unwrap();
+        let (cx, cy) = ((del.x + del.w / 2) as f32, (del.y + del.h / 2) as f32);
+        pen_event(&mut a, InType::PenDown, false, 470.0, 700.0, 6000);
+        pen_event(&mut a, InType::PenMove, false, 470.0, 640.0, 6010); // (up: the outline off the bar's rect)
+        editor_tick(&mut a, now_ms());
+        app_flush(&mut a);
+        assert_eq!(probe(&a, "drag_shows"), "1");
+        assert!(!bar_drawn(&a));
+        ed(&mut a).owner = Owner::None;
+        pen_event(&mut a, InType::PenDown, false, cx, cy, 7000);
+        pen_event(&mut a, InType::PenUp, false, cx, cy, 7010);
+        app_flush(&mut a);
+        assert_eq!(ed_ref(&a).sel.state, SelState::Selected);
+        assert_eq!(ed_ref(&a).owner, Owner::None);
+        assert_eq!(first(&a), moved, "nothing deleted, nothing moved");
+        assert_eq!(undo_depth(&mut a), depth);
+        assert_eq!(probe(&a, "drag_copy"), "0");
+        assert!(bar_drawn(&a));
+        assert!(layers_ok(&mut a));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // A selection of strokes shows resize handles at its box's corners (issue #37); dragged, a handle scales
+    // the ink about the opposite corner, the box following, one undo step at the lift; a tap on a handle that
+    // never moves changes nothing.
+    #[test]
+    fn a_resize_handle_scales_the_selection_about_its_opposite_corner() {
+        let root = fhold_root("resize");
+        let mut a = fshape_app();
+        let (mut px, mut py) = (0.0, 0.0);
+        to_page(ed(&mut a), 400.0, 600.0, &mut px, &mut py);
+        sel_word(&mut a, px, py);
+        sel_toggle(&mut a);
+        sel_lasso(&mut a, 400.0, 615.0, 120.0, false, 1000);
+        app_flush(&mut a);
+        assert_eq!(ed_ref(&a).sel.state, SelState::Selected);
+        let s = ed_ref(&a);
+        let b0 = s.sel.box_;
+        let bs = box_screen(s, b0);
+        let (cx, cy) = ((bs.x + bs.w) as f32, (bs.y + bs.h) as f32);
+        // the handles are drawn: a black square at a corner, past the outline's band
+        let full = Rect { x: 0, y: 0, w: a.w, h: a.h };
+        compose(&mut a, full);
+        let at = |a: &App, x: i32, y: i32| a.screen.px[(y * a.screen.stride + x) as usize];
+        assert!(at(&a, bs.x + bs.w + 6, bs.y + bs.h + 6) < 128, "the bottom-right handle is drawn");
+        // dragged out by the box's width and height: twice as large, the opposite corner staying
+        let depth = undo_depth(&mut a);
+        let n0 = ed_ref(&a).sel.ids.len();
+        pen_event(&mut a, InType::PenDown, false, cx, cy, 2000);
+        assert_eq!(ed_ref(&a).sel.state, SelState::Dragging);
+        assert_eq!(ed_ref(&a).sel.resize_handle, 4);
+        pen_event(&mut a, InType::PenMove, false, cx + bs.w as f32, cy + bs.h as f32, 2010);
+        editor_tick(&mut a, now_ms());
+        pen_event(&mut a, InType::PenUp, false, cx + bs.w as f32, cy + bs.h as f32, 2020);
+        app_flush(&mut a);
+        assert_eq!(ed_ref(&a).sel.state, SelState::Selected);
+        assert_eq!(ed_ref(&a).sel.resize_handle, 0);
+        assert_eq!(undo_depth(&mut a), depth + 1, "one step for the resize");
+        let b1 = ed_ref(&a).sel.box_;
+        assert_eq!((b1.x, b1.y), (b0.x, b0.y), "the opposite corner stayed");
+        assert!(b1.w > b0.w + b0.w / 2 && b1.h > b0.h + b0.h / 2, "the ink was scaled up: {:?} from {:?}", b1, b0);
+        assert_eq!(ed_ref(&a).sel.ids.len(), n0);
+        assert!(layers_ok(&mut a));
+        // a tap on a handle: no step, the box as it was
+        let s = ed_ref(&a);
+        let bs = box_screen(s, s.sel.box_);
+        let (cx, cy) = ((bs.x + bs.w) as f32, (bs.y + bs.h) as f32);
+        let depth = undo_depth(&mut a);
+        pen_event(&mut a, InType::PenDown, false, cx, cy, 3000);
+        assert_eq!(ed_ref(&a).sel.resize_handle, 4);
+        pen_event(&mut a, InType::PenUp, false, cx + 2.0, cy + 2.0, 3010);
+        app_flush(&mut a);
+        assert_eq!(ed_ref(&a).sel.state, SelState::Selected);
+        assert_eq!(undo_depth(&mut a), depth);
+        assert_eq!(ed_ref(&a).sel.box_, b1);
+        assert!(bar_drawn(&a));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // A finger held on a link opens the link's card, never the lasso; one that moved before the hold time is
+    // what it always was (no lasso, no card).
+    #[test]
+    fn finger_hold_on_a_link_opens_its_card_and_a_moved_finger_arms_nothing() {
+        let root = fhold_root("link");
+        let mut a = fshape_app();
+        let s = ed(&mut a);
+        assert_eq!(nav_link_set(&mut s.nav, 1, 77, "p2"), 0);
+        assert_eq!(nav_link_set_area(&mut s.nav, 1, 77, Some(Rect { x: 100, y: 200, w: 300, h: 300 })), 0);
+        finger_hold(&mut a, 250.0, 350.0);
+        let s = ed_ref(&a);
+        assert_eq!(s.sel.state, SelState::Off);
+        assert!(s.card.open, "the link's long-press card");
+        assert!(s.link_held);
+        finger(&mut a, InType::TouchUp, 250.0, 350.0);
+        card_drop(ed(&mut a));
+        assert_eq!(ed_ref(&a).sel.state, SelState::Off);
+        // moved past the slop before the hold time: no lasso, whatever the wait
+        finger(&mut a, InType::TouchDown, 600.0, 900.0);
+        finger(&mut a, InType::TouchMove, 600.0, 1000.0);
+        editor_tick(&mut a, now_ms().wrapping_add(HOLD_MS + 10));
+        assert_eq!(ed_ref(&a).sel.state, SelState::Off);
+        assert_eq!(ed_ref(&a).owner, Owner::Link);
+        finger(&mut a, InType::TouchUp, 600.0, 1000.0);
+        assert_eq!(ed_ref(&a).owner, Owner::None);
+        assert_eq!(ed_ref(&a).sel.state, SelState::Off);
+        // a tremor within the slop still holds
+        finger(&mut a, InType::TouchDown, 600.0, 900.0);
+        finger(&mut a, InType::TouchMove, 605.0, 903.0);
+        editor_tick(&mut a, now_ms().wrapping_add(HOLD_MS + 10));
+        assert_eq!(ed_ref(&a).sel.state, SelState::Lasso);
+        finger(&mut a, InType::TouchUp, 605.0, 903.0);
+        assert_eq!(ed_ref(&a).sel.state, SelState::Off);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // Lifted where it was held, the finger pastes the clipboard centred there (one undo step), or with no
+    // clipboard does nothing at all; on a read-only page the lasso and Copy work and the paste is refused.
+    #[test]
+    fn finger_hold_lifted_still_pastes_and_read_only_refuses_it() {
+        let root = fhold_root("paste");
+        let mut a = fshape_app();
+        sel_word(&mut a, 400.0, 600.0);
+        let depth = undo_depth(&mut a);
+        // no clipboard: nothing (Select mode left as quietly as it came)
+        finger_hold(&mut a, 600.0, 1000.0);
+        assert_eq!(ed_ref(&a).sel.state, SelState::Lasso);
+        finger(&mut a, InType::TouchUp, 602.0, 1001.0);
+        let s = ed_ref(&a);
+        assert_eq!(s.sel.state, SelState::Off);
+        assert_eq!(s.owner, Owner::None);
+        assert_eq!(s.open_page().unwrap().strokes.len(), 2);
+        assert_eq!(undo_depth(&mut a), depth);
+        assert!(!a.toast_visible);
+        // a clipboard: the word lassoed with a finger and copied from the bar
+        finger_hold(&mut a, 280.0, 495.0);
+        finger_ring(&mut a, 400.0, 615.0, 120.0);
+        assert_eq!(ed_ref(&a).sel.state, SelState::Selected);
+        let (cx, cy) = sel_control_point(ed_ref(&a), "copy").unwrap();
+        finger(&mut a, InType::TouchDown, cx, cy);
+        finger(&mut a, InType::TouchUp, cx, cy);
+        assert!(clipboard_has());
+        // held and lifted outside the selection: the old one goes, the paste lands centred there, selected
+        finger_hold(&mut a, 500.0, 1000.0);
+        assert_eq!(ed_ref(&a).sel.state, SelState::Lasso);
+        finger(&mut a, InType::TouchUp, 500.0, 1000.0);
+        let s = ed_ref(&a);
+        assert_eq!(s.sel.state, SelState::Selected);
+        assert_eq!(s.open_page().unwrap().strokes.len(), 4);
+        assert!(bar_drawn(&a), "the pasted group's bar, drawn");
+        let s = ed_ref(&a);
+        let b = s.sel.box_;
+        assert!((b.x + b.w / 2 - 500).abs() <= 1 && (b.y + b.h / 2 - 1000).abs() <= 1, "centred on the hold: {:?}", b);
+        assert_eq!(undo_depth(&mut a), depth + 1, "the paste is one step");
+        undo_redo(&mut a, true);
+        assert_eq!(ed_ref(&a).open_page().unwrap().strokes.len(), 2);
+        assert_eq!(undo_depth(&mut a), depth);
+        // read-only: the lasso and Copy work, the paste is refused with nothing changed
+        sel_off(&mut a);
+        ed(&mut a).open_page_mut().unwrap().readonly = true;
+        assert_eq!(clipboard_restore(None), 0); // (so the Copy below is what fills it)
+        finger_hold(&mut a, 280.0, 495.0);
+        finger_ring(&mut a, 400.0, 615.0, 120.0);
+        assert_eq!(ed_ref(&a).sel.state, SelState::Selected);
+        let (cx, cy) = sel_control_point(ed_ref(&a), "copy").unwrap();
+        finger(&mut a, InType::TouchDown, cx, cy);
+        finger(&mut a, InType::TouchUp, cx, cy);
+        assert!(clipboard_read().is_some_and(|g| g.ink == 2), "Copy on a read-only page fills the clipboard (the word's two strokes)");
+        assert!(!a.toast_visible, "and says nothing");
+        finger_hold(&mut a, 500.0, 1000.0);
+        finger(&mut a, InType::TouchUp, 500.0, 1000.0);
+        assert_eq!(a.toast.as_str(), tr(K_READONLY_MSG));
+        let s = ed_ref(&a);
+        assert_eq!(s.open_page().unwrap().strokes.len(), 2);
+        assert_eq!(s.sel.state, SelState::Off);
+        assert_eq!(undo_depth(&mut a), depth);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // In Select mode from the tool picker, a finger's hold lassos too, and the mode stays after it (it is
+    // not the hold's to end); the pen's lasso there is unchanged.
+    #[test]
+    fn finger_hold_in_select_mode_keeps_the_mode() {
+        let root = fhold_root("mode");
+        let mut a = fshape_app();
+        sel_word(&mut a, 400.0, 600.0);
+        sel_toggle(&mut a);
+        assert_eq!(ed_ref(&a).sel.state, SelState::Armed);
+        finger_hold(&mut a, 280.0, 495.0);
+        assert_eq!(ed_ref(&a).sel.state, SelState::Lasso);
+        assert!(!ed_ref(&a).sel.by_finger);
+        finger_ring(&mut a, 400.0, 615.0, 120.0);
+        assert_eq!(ed_ref(&a).sel.state, SelState::Selected);
+        finger(&mut a, InType::TouchDown, 700.0, 1100.0);
+        finger(&mut a, InType::TouchUp, 700.0, 1100.0);
+        assert_eq!(ed_ref(&a).sel.state, SelState::Armed, "a tap outside deselects; the mode stays");
+        // a still finger with no clipboard: nothing, and the mode stays
+        finger_hold(&mut a, 600.0, 1000.0);
+        finger(&mut a, InType::TouchUp, 600.0, 1000.0);
+        assert_eq!(ed_ref(&a).sel.state, SelState::Armed);
+        sel_lasso(&mut a, 400.0, 615.0, 120.0, false, 5000);
+        assert_eq!(ed_ref(&a).sel.state, SelState::Selected);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // ---- the finger hold's guards: a palm, a grip thumb or the writing hand never selects or pastes ----
+
+    fn finger_v(a: &mut App, type_: InType, x: f32, y: f32, value: i32) {
+        let t = now_ms();
+        editor_event(a, &InEvent { type_, x, y, value, t_ms: t, k_ms: t, ..Default::default() });
+    }
+
+    // The word at (400, 600) on the page, lassoed with a finger and copied: the clipboard is full; Select
+    // mode off again.
+    fn fhold_clipboard(a: &mut App) {
+        sel_word(a, 400.0, 600.0);
+        finger_hold(a, 280.0, 495.0);
+        finger_ring(a, 400.0, 615.0, 120.0);
+        assert_eq!(ed_ref(a).sel.state, SelState::Selected);
+        let (cx, cy) = sel_control_point(ed_ref(a), "copy").unwrap();
+        finger(a, InType::TouchDown, cx, cy);
+        finger(a, InType::TouchUp, cx, cy);
+        assert!(clipboard_has());
+        sel_off(a);
+        assert_eq!(ed_ref(a).sel.state, SelState::Off);
+    }
+
+    // A contact the panel calls palm-sized (TOUCH_F_BROAD) never arms: at its down, or on a move before the
+    // hold time; one that turns palm-sized after the arm drops the lasso, and its lift pastes nothing.
+    #[test]
+    fn finger_hold_guard_palm() {
+        let root = fhold_root("palm");
+        let mut a = fshape_app();
+        fhold_clipboard(&mut a);
+        let n = ed_ref(&a).open_page().unwrap().strokes.len();
+        finger_v(&mut a, InType::TouchDown, 600.0, 1000.0, TOUCH_F_BROAD);
+        editor_tick(&mut a, now_ms().wrapping_add(HOLD_MS + 10));
+        assert_eq!(ed_ref(&a).sel.state, SelState::Off);
+        finger_v(&mut a, InType::TouchUp, 600.0, 1000.0, TOUCH_F_BROAD);
+        assert_eq!(ed_ref(&a).open_page().unwrap().strokes.len(), n);
+        // broad on a move before the hold time
+        finger(&mut a, InType::TouchDown, 600.0, 1000.0);
+        finger_v(&mut a, InType::TouchMove, 601.0, 1000.0, TOUCH_F_BROAD);
+        editor_tick(&mut a, now_ms().wrapping_add(HOLD_MS + 10));
+        assert_eq!(ed_ref(&a).sel.state, SelState::Off);
+        finger(&mut a, InType::TouchUp, 601.0, 1000.0);
+        assert_eq!(ed_ref(&a).open_page().unwrap().strokes.len(), n);
+        // broad after the arm: dropped, the ring drawn away, the lift ignored
+        finger_hold(&mut a, 600.0, 1000.0);
+        assert_eq!(ed_ref(&a).sel.state, SelState::Lasso);
+        finger_v(&mut a, InType::TouchMove, 601.0, 1000.0, TOUCH_F_BROAD);
+        let s = ed_ref(&a);
+        assert_eq!(s.sel.state, SelState::Off);
+        assert_eq!(s.owner, Owner::None);
+        assert!(rect_is_empty(s.sel.lasso_rect));
+        finger(&mut a, InType::TouchUp, 601.0, 1000.0);
+        assert_eq!(ed_ref(&a).open_page().unwrap().strokes.len(), n);
+        assert_eq!(ed_ref(&a).sel.state, SelState::Off);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // The pen in range at the down (hovering, or gone under FHOLD_PEN_MS), or coming in range before the
+    // hold time: nothing arms, and the lift pastes nothing. Gone longer ago: the hold arms as ever.
+    #[test]
+    fn finger_hold_guard_pen_before_the_arm() {
+        let root = fhold_root("pen-before");
+        let mut a = fshape_app();
+        fhold_clipboard(&mut a);
+        let n = ed_ref(&a).open_page().unwrap().strokes.len();
+        pen_event(&mut a, InType::PenHover, false, 200.0, 200.0, now_ms());
+        assert!(ed_ref(&a).pen_near);
+        finger_hold(&mut a, 600.0, 1000.0);
+        assert_eq!(ed_ref(&a).sel.state, SelState::Off);
+        assert_eq!(ed_ref(&a).owner, Owner::Link);
+        finger(&mut a, InType::TouchUp, 600.0, 1000.0);
+        assert_eq!(ed_ref(&a).open_page().unwrap().strokes.len(), n);
+        // gone just now: still in range for this finger
+        pen_event(&mut a, InType::PenLeave, false, 200.0, 200.0, now_ms());
+        finger_hold(&mut a, 600.0, 1000.0);
+        assert_eq!(ed_ref(&a).sel.state, SelState::Off);
+        finger(&mut a, InType::TouchUp, 600.0, 1000.0);
+        // coming in range between the down and the hold time (fingers off the shape capture, so the
+        // finger keeps its contact)
+        ed(&mut a).pen_left = now_ms().wrapping_sub(5000);
+        a.settings.gestures = false;
+        finger(&mut a, InType::TouchDown, 600.0, 1000.0);
+        pen_event(&mut a, InType::PenHover, false, 200.0, 200.0, now_ms());
+        pen_event(&mut a, InType::PenLeave, false, 200.0, 200.0, now_ms());
+        assert_eq!(ed_ref(&a).owner, Owner::Link);
+        editor_tick(&mut a, now_ms().wrapping_add(HOLD_MS + 10));
+        assert_eq!(ed_ref(&a).sel.state, SelState::Off);
+        finger(&mut a, InType::TouchUp, 600.0, 1000.0);
+        assert_eq!(ed_ref(&a).open_page().unwrap().strokes.len(), n);
+        // gone long ago: the hold arms
+        ed(&mut a).pen_left = now_ms().wrapping_sub(5000);
+        finger_hold(&mut a, 600.0, 1000.0);
+        assert_eq!(ed_ref(&a).sel.state, SelState::Lasso);
+        finger(&mut a, InType::TouchUp, 600.0, 1000.0);
+        assert_eq!(ed_ref(&a).open_page().unwrap().strokes.len(), n + 2, "lifted still: the paste");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // The pen coming after the arm (hovering, or writing elsewhere while a thumb rests): the armed lasso is
+    // dropped at its first event, the ring drawn away, and the lift neither pastes nor selects; the pen's
+    // stroke is ink as ever.
+    #[test]
+    fn finger_hold_guard_pen_after_the_arm() {
+        let root = fhold_root("pen-after");
+        let mut a = fshape_app();
+        fhold_clipboard(&mut a);
+        let n = ed_ref(&a).open_page().unwrap().strokes.len();
+        finger_hold(&mut a, 600.0, 1000.0);
+        assert_eq!(ed_ref(&a).sel.state, SelState::Lasso);
+        pen_event(&mut a, InType::PenHover, false, 200.0, 200.0, now_ms());
+        let s = ed_ref(&a);
+        assert_eq!(s.sel.state, SelState::Off);
+        assert_eq!(s.owner, Owner::None);
+        assert!(rect_is_empty(s.sel.lasso_rect));
+        finger(&mut a, InType::TouchMove, 900.0, 1000.0);
+        finger(&mut a, InType::TouchUp, 900.0, 1000.0);
+        assert_eq!(ed_ref(&a).open_page().unwrap().strokes.len(), n);
+        assert_eq!(ed_ref(&a).sel.state, SelState::Off);
+        pen_event(&mut a, InType::PenLeave, false, 200.0, 200.0, now_ms());
+        // a thumb resting, armed, while the pen writes elsewhere: ink, and no paste at the thumb's lift
+        ed(&mut a).pen_left = now_ms().wrapping_sub(5000);
+        finger_hold(&mut a, 900.0, 1300.0);
+        assert_eq!(ed_ref(&a).sel.state, SelState::Lasso);
+        let t = now_ms();
+        pen_event(&mut a, InType::PenDown, false, 200.0, 900.0, t);
+        for k in 1..10 {
+            pen_event(&mut a, InType::PenMove, false, 200.0 + 30.0 * k as f32, 900.0, t + 10 * k);
+        }
+        pen_event(&mut a, InType::PenUp, false, 470.0, 900.0, t + 100);
+        pen_event(&mut a, InType::PenLeave, false, 470.0, 900.0, t + 110);
+        assert_eq!(ed_ref(&a).sel.state, SelState::Off);
+        finger(&mut a, InType::TouchUp, 900.0, 1300.0);
+        let s = ed_ref(&a);
+        assert_eq!(s.open_page().unwrap().strokes.len(), n + 1, "the pen's stroke, and no paste");
+        assert_eq!(s.sel.state, SelState::Off);
+        // and a thumb that lands while the pen writes: never armed, no paste
+        let t = now_ms();
+        pen_event(&mut a, InType::PenDown, false, 200.0, 1100.0, t);
+        finger(&mut a, InType::TouchDown, 900.0, 1300.0);
+        pen_event(&mut a, InType::PenMove, false, 400.0, 1100.0, t + 50);
+        pen_event(&mut a, InType::PenUp, false, 400.0, 1100.0, t + 100);
+        editor_tick(&mut a, now_ms().wrapping_add(HOLD_MS + 10));
+        assert_eq!(ed_ref(&a).sel.state, SelState::Off);
+        finger(&mut a, InType::TouchUp, 900.0, 1300.0);
+        assert_eq!(ed_ref(&a).open_page().unwrap().strokes.len(), n + 2);
+        assert_eq!(ed_ref(&a).sel.state, SelState::Off);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
-pub fn editor_map_point(a: &App, pid: u32) -> Option<(f32, f32)> {
-    a.ed.as_deref().and_then(|s| mapview_node_point(&s.map, pid))
+pub fn editor_map_point(a: &App, spec: &str) -> Option<(f32, f32)> {
+    if a.scr == ScreenId::Library {
+        return crate::library::library_map_point(a, spec);
+    }
+    a.ed.as_deref().and_then(|s| mapview_node_point(&s.map, spec))
 }
 
 /// Replay page samples through the current viewport, as real input reaches it.
@@ -11147,7 +14776,7 @@ fn destination_open(a:&mut App) {
     if !save_page(a){return;}
     let folder=ed_ref(a).nb.folder.as_str().to_string();
     if with_modal(a,|s|&mut s.destination,|p,_|p.start(&folder)) {ed(a).lt.hidden=true;compose_all(a,RefreshMode::Full);}
-    else {app_toast(a,tr("Could not read the notebooks."),3000);}
+    else {app_toast(a,tr("Couldn't read notebooks."),3000);}
 }
 fn follow_target(a:&mut App,target:&str)->bool {
     if let Some((id,pid))=nav_external_target(target) {
@@ -11155,30 +14784,69 @@ fn follow_target(a:&mut App,target:&str)->bool {
     } else if target=="index" {map_show(a,false);ed_ref(a).map.open}
     else {
         let l=NavLink{target:FixedStr::from_str(target),..Default::default()};let to=nav_link_page(&l,&ed_ref(a).nb);
-        if to>=0 {go_to_page_pushing(a,to)}else{app_toast(a,tr("That link's page is not in this notebook."),3000);false}
+        if to>=0 {go_to_page_pushing(a,to)}else{app_toast(a,tr("Linked page isn't in this notebook."),3000);false}
     }
 }
 
 // Both following a link and returning across notebooks must save the current links and validate
 // the requested page before closing the editor that owns the current notebook.
 fn return_to_notebook(a:&mut App)->bool {
-    let Some(&(id,pid))=ed_ref(a).notebook_back.last() else {return false;};
+    let Some(b)=ed_ref(a).notebook_back.last().cloned() else {return false;};
     let mut stack=ed_ref(a).notebook_back.clone();stack.pop();
-    if !open_external_page(a,id.as_str(),pid,false) {return false;}
-    ed(a).notebook_back=stack;true
+    if !open_external_page(a,b.id.as_str(),b.pid,false) {return false;}
+    ed(a).notebook_back=stack;
+    // The page as it was left: its notebook's own back list, and the view (zoom and offset) when the screen
+    // is the size it was for (a turn since rests the page as any open does).
+    let s=ed(a);
+    s.back=b.back;s.back_prune();
+    if b.zoom>0.0 && b.view_w==s.view_w && b.view_h==s.view_h && (b.zoom,b.ox,b.oy)!=(s.zoom,s.ox,s.oy) {
+        s.zoom=b.zoom.clamp(s.zoom_min,s.zoom_max);s.ox=b.ox;s.oy=b.oy;
+        view_clamp(a);
+        compose_all(a,RefreshMode::Full);
+    }
+    true
 }
 fn open_external_page(a:&mut App,id:&str,pid:u32,push_origin:bool)->bool {
         let mut nb=NotebookInfo::default();
-        if store_load_info(id,&mut nb)!=0 || !nb.page_ids.contains(&pid) {app_toast(a,tr("That notebook or page is no longer available."),3000);return false;}
+        // TRANSLATORS: a toast (about 1700 px at 44 px in bold, or two lines): a link to another notebook's page
+        // was followed, but that notebook or page is gone.
+        if store_load_info(id,&mut nb)!=0 || !nb.page_ids.contains(&pid) {app_toast(a,tr("Notebook or page no longer exists."),3000);return false;}
         if ed_ref(a).nb.id==id {return nb.page_ids.iter().position(|&p|p==pid).is_some_and(|i|go_to_page_pushing(a,i as i32));}
-        if !save_page(a){return false;}
-        links_flush(a);if ed_ref(a).links_dirty {app_toast(a,tr("Could not save the links."),3000);return false;}
+        if !save_page_leaving(a){return false;}
+        links_flush(a);if ed_ref(a).links_dirty {app_toast(a,tr("Couldn't save links."),3000);return false;}
         let i=nb.page_ids.iter().position(|&p|p==pid).unwrap();let mut checked=None;
-        if store_read_page(&nb,i as i32,&mut checked)!=0 {app_toast(a,tr("Could not open that page."),3000);return false;}drop(checked);
-        let origin=(ed_ref(a).nb.id,ed_ref(a).open_pid());
+        if store_read_page(&nb,i as i32,&mut checked)!=0 {app_toast(a,tr("Couldn't open page."),3000);return false;}drop(checked);
+        let s=ed_ref(a);
+        let origin=NotebookBack{id:s.nb.id,pid:s.open_pid(),zoom:s.zoom,ox:s.ox,oy:s.oy,view_w:s.view_w,view_h:s.view_h,back:s.back.clone()};
         let mut back=std::mem::take(&mut ed(a).notebook_back);
         if push_origin {if back.len()>=32 {back.remove(0);}back.push(origin);}
-        editor_open_notebook_at(a,id,pid,false);ed(a).notebook_back=back;ed_ref(a).open&&ed_ref(a).nb.id==id&&ed_ref(a).open_pid()==pid
+        let from_graph=ed_ref(a).from_graph;
+        editor_open_notebook_at(a,id,pid,false);ed(a).notebook_back=back;ed(a).from_graph=from_graph;ed_ref(a).open&&ed_ref(a).nb.id==id&&ed_ref(a).open_pid()==pid
+}
+
+/// The Library's Graph opened a node (2.0.0-beta.2): notebook id at page pid, as editor_open_notebook_at opens
+/// it, remembered as opened from the Graph, so Back with nothing before it goes back there.
+pub fn editor_open_from_graph(a: &mut App, id: &str, pid: u32) {
+    editor_open_notebook_at(a, id, pid, false);
+    if a.scr == ScreenId::Editor && ed_ref(a).open && ed_ref(a).nb.id == id {
+        ed(a).from_graph = true;
+    }
+}
+
+// Back to the Library's Graph from a notebook it opened: the page saved and the notebook closed, as the
+// Library button does, and the Library shows the Graph as it was left. False (staying) when the page could
+// not be saved.
+fn back_to_graph(a: &mut App) -> bool {
+    app_flush(a);
+    if !save_page(a) {
+        return false;
+    }
+    close_notebook(a);
+    ed(a).from_graph = false;
+    crate::library::library_return_to_graph(a);
+    app_switch(a, ScreenId::Library);
+    app_toast(a, "", 0);
+    true
 }
 
 pub fn editor_settings_background(a:&mut App) {

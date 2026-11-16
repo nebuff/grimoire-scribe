@@ -5,9 +5,13 @@ wait 300
 tap library folder.Void
 tap library notebook.A
 swipe 2 930 900 0 400
-expect editor.map.visible is 1 2
-expect editor.map.foreign is 1
-expect editor.map.stats is 3 13 3 15 20
+# (the Graph is every notebook's: there is no Notebook choice, the owner's ruling of 2026-11-03)
+expect editor.map.scope is all
+# (the library's page count, and the other notebooks' pages, come from the Graph's library index, filled on
+# idle ticks: its first check)
+wait 1500
+expect editor.map.visible.ids is A:1 A:2 C:2
+expect editor.map.stats is 3 17 3 15 20
 expect editor.screen_composed is 1
 shot 01-compact-graph
 tap panel map.view
@@ -97,21 +101,25 @@ pen leave
 expect editor.strokes is 0
 expect editor.screen_composed is 1
 shot 07-settings-over-notebook
+tap library settings.cat.4
 tap library gestures
 expect editor.settings.sheet is gestures
 expect editor.screen_composed is 1
-tap library done
+tap library settings.back
 expect editor.settings.sheet is settings
-tap library controller
+tap library shortcuts
 expect editor.settings.sheet is shortcuts
-tap library done
+tap library settings.back
 expect editor.settings.sheet is settings
+tap library settings.cat.1
 tap library display
 expect editor.settings.sheet is display
-expect status.shown is 1
+# The clock corner belongs to the notebook page: not drawn over Settings' Display sheet.
+expect status.shown is 0
 expect editor.screen_composed is 1
 key 45 0
 expect editor.settings.sheet is settings
+tap library settings.cat.3
 tap library pen-feel
 expect screen is penset
 tap 125 95

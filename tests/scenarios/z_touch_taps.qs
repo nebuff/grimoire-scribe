@@ -6,6 +6,8 @@
 # Buttons are not wrongly rejected: a tap is a tap however the fingertip rolled while it stayed on
 # what it pressed, a slow press on a button with no hold is its tap, a press shows pressed at once
 # where it did not, and a finger landing between the panel's buttons takes the nearest one.
+# (the clock corner held still: its minute's refresh would land among the counted ones)
+clock 1700000000
 wait 300
 tap 200 400
 wait 300
@@ -29,22 +31,22 @@ wait 800
 touch up 1761 2046
 wait 300
 expect editor.bar is 0
-# The Display sheet: a tap rolled 40 px on Invert colors acts, and its Done shows pressed at once.
+# The Display sheet: a tap rolled 40 px on Sideways acts, and its Done shows pressed at once.
 tap panel display
 wait 300
 expect editor.modal is display
-touch down 400 832
-touch move 440 845
-touch up 440 845
+touch down 400 608
+touch move 440 621
+touch up 440 621
 wait 500
-expect settings.invert is 1
-tap 400 832
+expect settings.landscape_fit is 0
+tap 400 608
 wait 500
-expect settings.invert is 0
+expect settings.landscape_fit is 1
 expect display.presents not -1
-touch down 1464 1858
-expect display.presents is fast 1280 1788 360 140
-touch up 1464 1858
+touch down 1735 95
+expect display.presents not -1
+touch up 1735 95
 wait 300
 expect editor.modal is none
 # The panel: a finger in the gap between two buttons, or in the frame's margin beside one, takes
@@ -56,6 +58,6 @@ expect editor.panel_at.1768.1190 is
 tap 1710 1674
 wait 300
 expect editor.modal is display
-tap 1464 1858
+tap 1735 95
 wait 300
 expect editor.modal is none

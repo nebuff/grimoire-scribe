@@ -24,6 +24,13 @@ use testlib::*;
 
 const H0: u64 = 14695981039346656037;
 
+/// The fixture holds the recording machine's hashes: its libm decides powf (the pressure curve)
+/// and tan/atan (the tilt), and another platform's rounds them differently (on this host the C
+/// build differs from its own recorded hashes on exactly the lines the port does). Elsewhere the
+/// scenarios still run and hash, but the recorded comparison is skipped, as test_page_probe.rs,
+/// test_golden.rs and test_erase.rs skip theirs.
+const RECORDING_HOST: bool = cfg!(all(target_arch = "aarch64", target_os = "macos"));
+
 fn fnv(h: u64, b: &[u8]) -> u64 {
     b.iter().fold(h, |h, &x| (h ^ x as u64).wrapping_mul(1099511628211))
 }
@@ -75,7 +82,7 @@ fn make_stroke(n: usize, seed: u32) -> Vec<PenSample> {
 
 fn variant(t: ToolKind, var: i32) -> ToolParams {
     let mut p = ToolParams::default();
-    tool_params_default(t, &mut p);
+    tool_params_default_pre21(t, &mut p); // (the C build's hashes: its sizes)
     if var == 1 {
         p.grain = 0.9;
         p.tilt_size = 2.0;
@@ -238,7 +245,7 @@ fn pure(out: &mut String) {
     }
     for t in TOOLS {
         let mut p = ToolParams::default();
-        tool_params_default(t, &mut p);
+        tool_params_default_pre21(t, &mut p);
         for i in 0..ToolParams::COUNT {
             h = fnv_f(h, p.get(i));
         }
@@ -277,7 +284,7 @@ fn odd(out: &mut String) {
     let mut c = Canvas::default();
     check!(canvas_init(&mut c, CW, CH) == 0);
     let mut p = ToolParams::default();
-    tool_params_default(TOOL_PENCIL, &mut p);
+    tool_params_default_pre21(TOOL_PENCIL, &mut p);
     let mut b = BrushState::default();
     brush_begin(&mut b, TOOL_PENCIL, &p, 5, 300.0);
     let s = PenSample { x: 100.0, y: 100.0, pressure: 0.7, tilt_x: 10.0, tilt_y: 20.0, t_ms: 5000 };
@@ -310,6 +317,10 @@ fn brush_matches_the_c_build() {
                 }
             }
         }
+    }
+    if !RECORDING_HOST {
+        eprintln!("  brush: not the recording host (clang, arm64 macOS): renders not compared");
+        return;
     }
     let want: &str = include_str!("fixtures/brush_probe_c.txt");
     let (got_lines, want_lines): (Vec<&str>, Vec<&str>) = (out.lines().collect(), want.lines().collect());

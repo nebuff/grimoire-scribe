@@ -357,6 +357,52 @@ module.exports = async function browserChecks(ok) {
     p.raw.calls = [];
     toolbar.click(); toolbar.click(); p.paint();
     ok('layers: one no longer on the screen draws nothing', !drewLayer());
+    // The toast (layer 2; 2.0.0-beta.2): drawn over the toolbar where they meet, with no switch of its
+    // own (the toolbar's switched off, the toast still shows); gone with w = 0; taken away by any state but
+    // awake, the toolbar kept; and a layer id the page does not know (as the toast's is to an older page) is
+    // left out, the stream going on.
+    {
+        const q = page();
+        await turn();
+        const t = q.readers['/live/stream'];
+        t.push(hello(1));
+        const lay = (id, x, y, w, h) => {
+            const b = new Uint8Array(w ? 14 : 10), d = new DataView(b.buffer);
+            b[0] = id; [x, y, w, h].forEach((v, k) => d.setUint16(2 + k * 2, v, true));
+            return frame(9, b);
+        };
+        const tb = {close() {}};
+        q.decode(tb);  // (every layer's picture is this one: they are told apart by where they are drawn)
+        t.push(lay(0, 10, 20, 30, 40)); t.push(lay(2, 5, 30, 60, 10)); t.push(batch(0, 1));
+        for (let i = 0; i < 5; i++) await turn();
+        q.raw.calls = []; q.paint();
+        const at = (x, y) => q.raw.calls.findIndex(c => c[0] === 'drawImage' && c[1] === tb && c[6] === x && c[7] === y);
+        ok('toast: drawn after the toolbar over the page, so on top where they meet', at(10, 20) >= 0 && at(5, 30) > at(10, 20));
+        const toolbar = q.elements.find(e => e.textContent === 'toolbar');
+        ok('toast: no switch of its own', !q.elements.some(e => e.textContent === 'toast'));
+        q.raw.calls = []; toolbar.click(); q.paint();  // (the toolbar's rect made again: the toast's part of it from 10, 30)
+        ok('toast: the toolbar switched off, the toast still shows', at(10, 20) < 0 && at(10, 30) >= 0);
+        toolbar.click(); q.paint();
+        t.push(lay(2, 0, 0, 0, 0)); t.push(batch(0, 1));
+        for (let i = 0; i < 5; i++) await turn();
+        q.raw.calls = []; q.paint();
+        ok('toast: gone with w = 0, its place made again from the page and the toolbar',
+            at(5, 30) < 0 && at(10, 30) >= 0 && q.raw.calls.some(c => c[0] === 'drawImage' && c[1] !== tb && c[6] === 5 && c[7] === 30));
+        t.push(lay(2, 5, 30, 60, 10)); t.push(batch(0, 1));
+        for (let i = 0; i < 5; i++) await turn();
+        q.paint();
+        t.push(frame(5, new Uint8Array([1, 0, 255])));
+        for (let i = 0; i < 5; i++) await turn();
+        q.raw.calls = []; q.paint();
+        ok('toast: a state but awake takes it away and keeps the toolbar', at(5, 30) < 0 && at(10, 30) >= 0);
+        t.push(frame(5, new Uint8Array([0, 0, 255])));
+        t.push(lay(3, 0, 0, 10, 10)); t.push(batch(0, 1));
+        t.push(lay(2, 5, 30, 60, 10)); t.push(batch(0, 1));
+        for (let i = 0; i < 5; i++) await turn();
+        q.raw.calls = []; q.paint();
+        ok('layers: an id the page does not know is left out, and the next batch draws as before',
+            at(0, 0) < 0 && at(5, 30) >= 0);
+    }
     const select = p.elements.find(e => e.tag === 'select'), picker = p.elements.find(e => e.type === 'color');
     ok('dot: the size small and the first color by default, settable without storage', select.value === 'small' &&
        picker.value === '#f03c28' && (select.value = 'large', select.change(), true) && select.value === 'large');
@@ -543,15 +589,126 @@ module.exports = async function browserChecks(ok) {
         ok('pip (video): no frame while nothing changes', track.frames === frames);
         t.push(frame(2, tile)); t.push(batch(0, 1)); q.decode({close() {}});
         for (let i = 0; i < 6; i++) await turn();
-        q.timers.filter(x => x.ms === 16).pop().fn();
-        ok('pip (video): a change is one frame, from the ticker as well (a hidden tab has no animation frames)', track.frames === frames + 1);
+        const ticks = q.timers.filter(x => x.ms === 34);
+        ok('pip (video): with the tab shown, the ticker only stands in for animation frames (34 ms, never 16)',
+            ticks.length > 0 && !q.timers.some(x => x.ms === 16));
+        q.advance(40);  // (no animation frame came)
+        (ticks.pop() || {fn() {}}).fn();
+        ok('pip (video): a change is one frame, from the ticker as well (a frame that does not come)', track.frames === frames + 1);
         q.paint();
         ok('pip (video): meanwhile the page\'s view and its quick ink draw nothing', track.frames === frames + 1 &&
             q.view.ctx.calls.length === viewCalls && q.overlay.calls.length === inkCalls);
+        t.push(frame(2, tile)); t.push(batch(0, 1)); q.decode({close() {}});
+        for (let i = 0; i < 6; i++) await turn();
+        q.paint();
+        const painted = track.frames;
+        t.push(frame(2, tile)); t.push(batch(0, 1)); q.decode({close() {}});
+        for (let i = 0; i < 6; i++) await turn();
+        q.timers.filter(x => x.ms === 34).forEach(x => x.fn());
+        const early = track.frames;
+        q.paint();
+        ok('pip (video): an animation frame just came, the ticker draws nothing: the next one draws it (one frame, as on the page)',
+            painted > frames + 1 && early === painted && track.frames === painted + 1);
         video.leavepictureinpicture();
         q.paint();
         ok('pip (video): ended, the view is drawn whole again', pip['@aria-pressed'] === 'false' &&
             q.view.ctx.calls.slice(viewCalls).some(c => c[0] === 'drawImage' && c[1] === q.canvases[2] && c.slice(2, 6).join() === '0,0,100,100'));
+    }
+    // Video PiP with this tab hidden (behind the floating window): no animation frames, and Firefox
+    // Nightly 161 slows every timer of a hidden tab, a Worker's too, to once a second. A batch or a
+    // pen packet is a frame as soon as it is read, with no timer or animation frame run; all the ink
+    // that came is drawn, the dot at the newest sample; and a frame never asks for the next itself.
+    {
+        const track = {frames: 0, requestFrame() { this.frames++; }};
+        const vwin = {width: 80, height: 80, addEventListener() {}};
+        let out = null;  // (the canvas the video is of)
+        const q = page(null, {
+            window: {HTMLCanvasElement: {prototype: {captureStream() {}}}, HTMLVideoElement: {prototype: {requestPictureInPicture() {}}}},
+            document: {pictureInPictureEnabled: true, pictureInPictureElement: null, hidden: true},
+            canvas: {captureStream() { out = this; return {getVideoTracks: () => [track]}; }},
+            video: {play: () => Promise.resolve(), requestPictureInPicture: () => Promise.resolve(vwin)}});
+        await turn();
+        const t = q.readers['/live/stream'];
+        t.push(hello(1)); await turn(); q.paint();
+        q.button('pictureInPicture').click(); await turn();
+        for (let i = 0; i < 6; i++) await turn();
+        q.raf.length = 0;
+        const timersRun = q.timers.length, frames = track.frames;
+        t.push(frame(2, tile)); t.push(batch(0, 1)); q.decode({close() {}});
+        for (let i = 0; i < 6; i++) await turn();
+        ok('pip (video, hidden tab): a batch is a frame as soon as it is read, no timer or animation frame run',
+            !!out && out.width === 80 && track.frames === frames + 1);
+        const pen = q.readers['/live/pen'];
+        pen.push(hello(1)); pen.push(style); pen.push(sample(1, 20, 20));
+        for (let i = 0; i < 6; i++) await turn();
+        q.advance(10);
+        out.ctx.calls = [];
+        pen.push(sample(2, 30, 16, 1, 110));
+        for (let i = 0; i < 6; i++) await turn();
+        const calls = out.ctx.calls, mark = (30 + 0.5) * 0.8;
+        ok('pip (video, hidden tab): a pen packet is a frame at once, all its ink drawn, the dot at its newest sample',
+            track.frames > frames + 1 && calls.some(c => c[0] === 'lineTo' && c[1] === 30) &&
+            calls.some(c => c[0] === 'arc' && Math.abs(c[1] - mark) < 1e-9));
+        const fills = calls.filter(c => c[0] === 'fillRect');
+        ok('pip (video, hidden tab): only what changed is drawn again: the pen\'s frame, a small box of the picture',
+            fills.length > 0 && fills.every(c => c[3] * c[4] < 80 * 80 / 4) &&
+            calls.some(c => c[0] === 'drawImage' && c.length === 10 && c[3] * c[4] < 80 * 80 / 4));
+        const settled = track.frames;
+        for (let i = 0; i < 6; i++) await turn();
+        ok('pip (video, hidden tab): nothing new, no frame (a frame never asks for the next)',
+            track.frames === settled && q.timers.length >= timersRun);
+        q.advance(2);
+        pen.push(sample(3, 35, 16, 1, 112));
+        for (let i = 0; i < 6; i++) await turn();
+        const early = track.frames;
+        q.advance(8);
+        out.ctx.calls = [];
+        pen.push(sample(4, 40, 16, 1, 120));
+        for (let i = 0; i < 6; i++) await turn();
+        ok('pip (video, hidden tab): the pen moving on draws once 8 ms at most, the next packet drawing what waited',
+            early === settled && track.frames === settled + 1 && out.ctx.calls.some(c => c[0] === 'lineTo' && c[1] === 40) &&
+            out.ctx.calls.some(c => c[0] === 'lineTo' && c[1] === 35));
+        q.advance(1);
+        const lifted = track.frames;
+        const lift = sample(5, 40, 0, 1, 121);
+        lift[5 + 24] = 1;  // (hovering)
+        pen.push(lift);
+        for (let i = 0; i < 6; i++) await turn();
+        ok('pip (video, hidden tab): a change of state (a lift) is drawn at once, however soon', track.frames === lifted + 1);
+    }
+    // Firefox 159 on: the video PiP API, but requestFrame on the capture stream, not its track
+    // (measured on 159 and 161). Frames must still come only when asked, from the stream; and when
+    // Firefox refuses to float the video, it goes in the page for Firefox's own button.
+    for (const refuse of [false, true]) {
+        const stream = {frames: 0, requestFrame() { this.frames++; }, getVideoTracks: () => [track]};
+        const track = {};
+        let fps = null;
+        const vwin = {width: 80, height: 80, addEventListener() {}};
+        const q = page(null, {
+            window: {HTMLCanvasElement: {prototype: {captureStream() {}}}, HTMLVideoElement: {prototype: {requestPictureInPicture() {}}},
+                navigator: {userAgent: 'Mozilla/5.0 (Macintosh) Gecko/20100101 Firefox/161.0'}},
+            document: {pictureInPictureEnabled: true, pictureInPictureElement: null},
+            canvas: {captureStream(f) { fps = f; return stream; }},
+            video: {play: () => Promise.resolve(),
+                requestPictureInPicture: () => refuse ? Promise.reject(Object.assign(new Error('no'), {name: 'NotSupportedError'})) : Promise.resolve(vwin)}});
+        await turn();
+        const t = q.readers['/live/stream'];
+        t.push(hello(1)); await turn(); q.paint();
+        const video = q.elements.find(e => e.tag === 'video'), pip = q.button('pictureInPicture');
+        pip.click(); await turn(); await turn(); q.paint();
+        if (!refuse) {
+            const frames = stream.frames;
+            t.push(frame(2, tile)); t.push(batch(0, 1)); q.decode({close() {}});
+            for (let i = 0; i < 6; i++) await turn();
+            q.advance(40);  // (no animation frame came)
+            (q.timers.filter(x => x.ms === 34).pop() || {fn() {}}).fn();
+            ok('pip (Firefox): frames asked of the capture stream, one per change', fps === 0 && frames >= 1 &&
+                stream.frames === frames + 1 && pip['@aria-pressed'] === 'true');
+            video.leavepictureinpicture();
+        } else {
+            ok('pip (Firefox): refused, the video goes in the page for Firefox\'s own button',
+                pip['@aria-pressed'] === 'true' && video.classList.contains('shown'));
+        }
     }
     {
         const q = page(null, {window: {open() {}}});

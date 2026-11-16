@@ -4,6 +4,8 @@
 # goes where it went), Redo takes it again; link steps and ink come off one stack in order; a save that fails
 # changes nothing and pushes no step, and an undo whose save fails is dropped; with the eye on, an undo shows in
 # the boxes (one GL16) and says nothing.
+# (the clock corner held still: its minute's refresh would land among the counted ones)
+clock 1700000000
 wait 300
 tap 200 400
 wait 300
@@ -18,7 +20,7 @@ expect editor.ui_at.679.2118 is card.delete
 tap 679 2118
 expect editor.links is 2 2
 expect editor.link_card is 0
-expect toast is Link deleted. Undo brings it back.
+expect toast is
 expect editor.undo_kind is link
 pentap panel undo
 wait 300
@@ -65,7 +67,7 @@ touch down 600 1450
 wait 800
 touch up 600 1450
 tap 679 2118
-expect toast is Could not save the link.
+expect toast is Couldn't save link.
 expect editor.links is 3 3
 expect editor.undo_kind is
 storage ok
@@ -80,7 +82,7 @@ expect editor.undo_kind is link
 storage full
 pentap panel undo
 wait 300
-expect toast is Could not save the links: that change was not undone.
+expect toast is Couldn't save links: undo unsuccessful.
 expect editor.links is 2 2
 expect editor.redo_kind is
 expect editor.undo_kind is

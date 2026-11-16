@@ -11,6 +11,289 @@ refuses a notebook's own PDF from `grimoire/PDFs`. Those last two fixes have aut
 but have not been confirmed on a Kindle. The candidates 1.1.0-rc.1 to rc.3 were never published;
 their results are below, newest first.
 
+## The automated checks: make check and CI
+
+`make check` runs the same checks as before; what changed in 2.0.0-beta.2 is how they are run.
+
+**The scenario runner.** `tests/scenario_runner.py` runs `make scenarios` (and `make scenarios-late`
+and the language runs of `make l10n-check`): every `tests/scenarios/*.qs` against its own data root
+(`build/scen/NAME`) and shots folder, as the old loop in the Makefile did, but `SCEN_JOBS` at a time
+(default: the number of CPUs; `SCEN_JOBS=1` runs them one after another). A scenario with a
+`# root: NAME` line starts once NAME has finished (from what it left, passed or not, as before). Each
+run of a batch gets a port of its own for the share server: `GRIMOIRE_TEST_PORT` (else 8765) plus its
+slot, so `make scenarios` and `make l10n-check` use the ports from `GRIMOIRE_TEST_PORT` to
+`GRIMOIRE_TEST_PORT + SCEN_JOBS - 1`. `make rust-check` (and so `make check`) runs `make host-checks`
+beside the languages, SCEN_JOBS ports further on: the late scenarios on `GRIMOIRE_TEST_PORT + SCEN_JOBS`
+and `+ SCEN_JOBS + 1`, the share server's and Live view's checks on the first of those. A worktree's
+gate therefore uses the ports from `GRIMOIRE_TEST_PORT` to `GRIMOIRE_TEST_PORT + SCEN_JOBS + 1`, and
+two worktrees' gates never collide when their `GRIMOIRE_TEST_PORT` values are at least `SCEN_JOBS + 2`
+apart (17 at 15 jobs: 8861, 8878, 8895 and so on). `SCEN_JOBS` defaults to the number of CPUs.
+Each run's output goes to `build/scen-logs/NAME.log` (the languages' to `build/scen-logs/l10n/`); one
+line per run is printed as it ends, the failed runs' logs whole at the end in the order the scenarios
+were named, then `SCENARIOS FAILED: ...` and a failing status, as before. `SCENARIOS=`, `SCEN_ENV`,
+`SCEN_SKIP_RUST_ONLY` and `SCEN_NO_SELFTEST` work as they did.
+
+**The timing table.** `tests/scenario-times.txt` holds each scenario's seconds from a full parallel
+run on the maintainer's Mac. The runner starts the longest chains first (a root counts its
+dependants), so the long scenarios never start last; the CI shards are balanced by it. A scenario
+missing from it counts 5 s. `make scenario-times` runs the scenarios and rewrites it (commit the
+result after adding or slowing down scenarios; `build/scen-times.txt` has the last run's times).
+
+**The serial list.** `SCEN_SERIAL` in the Makefile names scenarios that must run alone, after the
+parallel batch, because they depend on an idle machine and cannot be fixed yet, each with its reason.
+It is empty: the whole set passed in parallel at 3 jobs, five times at 15 and at 32. The one failure the parallel runs
+found was not load but a clock: 23 scenarios count the screen's refreshes, and a minute turning over
+during the count added the clock corner's refresh; they now hold the corner's clock still
+(`clock 1700000000`), as the refresh scenarios already did.
+
+**Fewer long runs.** The handwriting replay (z_shape_writing, 85 s in real time) is four scenarios,
+z_shape_writing_1 to _4, a quarter of the strokes each, which run side by side; the replay stays real
+time, since the hold that the test is about fires on the real clock, also inside strokes, and with its
+700 ms hold no stroke is part of a writing burst, so no part depends on the strokes before it.
+y_all_screens.qs runs once in English and Gothic, in `make scenarios`; when that run was among its
+scenarios (`SCENARIOS` names y_all_screens.qs and no `SCEN_SHARD` is set), `make rust-check` passes
+`L10N_SKIP=en-gothic` to `make l10n-check`, whose English Gothic run was the same run (same script,
+same `GRIMOIRE_CHECK_FIT=1` and address; the scenario's one `# settings:` line, status_mode=1, is what
+every settings file reads as anyway). `make l10n-check` alone still makes all four.
+
+**Times on the maintainer's Mac** (15 cores, no other gate running): the scenarios took 118 s at 15
+jobs (the same set took about 30 minutes one after another), 592 s at 3 jobs (the CI runner's cores).
+`make l10n-check`'s 41 runs (the Index and Wi-Fi language checks are among them now) took 78 s
+instead of 175 s. `make rust-check` runs the unit tests beside the scripted checks, and l10n-check
+beside `make host-checks` (on ports apart), so `make -j15 check` took 4 min 41 s instead of 44 min.
+
+**CI** (`.github/workflows/release.yml`) splits `make check` into jobs that run at once:
+
+| Job | Runner | What it runs (the make check part it replaces) |
+|---|---|---|
+| changes | Linux | Decides what runs: a pull request that changes only `*.md` and `docs/` (not `docs/whatsnew/` or `CHANGELOG.md`, whose notes and dates the app compiles in) runs the docs job alone; a file moved into `docs/` counts its old path too |
+| docs | Linux | `git diff --check` on a docs-only pull request, from where it branched off |
+| build-host | macOS | `make headless tools`, uploaded for the jobs below |
+| unit (host, sim) | macOS | `make test-host`, `make test-sim`: the two halves of `make test` |
+| scenarios (1 to 6) | macOS | `make scenarios SCEN_SHARD=N/6`: whole `# root:` chains, balanced by the timing table (a big tree's root goes with each part); the selftest with shard 1 |
+| l10n | macOS | `make l10n-check L10N_SKIP=en-gothic` (a shard made that run) |
+| host-checks | macOS | b_library and s_shape_1_record, then `make host-checks`: the late-timer scenarios, the pages cache, mirror cleanup, the share server, Live view, Bluetooth, the exporter |
+| package | macOS | `make package-contents-check launcher-check dev-check kpm-check kopatch-check wifi-check usb-stage-check runner-check dist` (the Kindle build, the zip and its launchers, KPM, the KOReader patches, the scenario runner's own tests); on pushes to main and releases also `make repro-check` (two clean builds) and the release files |
+| gate | Linux | The one required check: every job above passed (docs-only: the docs job did); it also runs, and fails, in a cancelled run |
+| publish | Linux | Releases only, after gate |
+
+Pull requests skip `make repro-check` and the release files: they are never published, and the clean
+builds take two Kindle builds' time; pushes to main and releases run them, so `main` and every
+release keep the whole of `make check`. A newer push to a pull request cancels its older run; a
+release run is never cancelled. The repository variable `GRIMOIRE_CI_LINUX=true` moves build-host,
+unit, the shards and l10n to Linux runners, which start sooner and of which a free plan runs far more
+at once (macOS: 5); it stays off until a run passes there (docs/BACKLOG.md).
+
+**Tests that read the documents.** A docs-only pull request runs no test, and a few tests read the
+documents: `rust/tests/test_sec_invariants.rs` (DESIGN.md, FORMAT.md, KINDLE.md, TESTING.md, BACKLOG.md and
+RELEASING.md: sentences about the safe loader that must not come back, the names `RECORDS_MAX_BYTES` and
+`<key>.slow`, and a few sentences that hold only while another one stands), `mapview.rs` (the Graph's keys) and
+`test_scenarios.rs` with `sim_sdl.rs` (SIM.md). After rewording a sentence they hold, run `make test-sim`
+by hand: otherwise the push to main is the first run to say so.
+
+**The required check.** Branch protection on `main` must require the `gate` job, and only it (one
+setting, made once on GitHub: Settings, Branches, the rule for `main`, Require status checks, `gate`).
+Before this split the only job was `package`; a rule that still requires `package` lets a pull request
+merge with a failed unit, scenario, l10n or host-checks job. A skipped required check counts as passed
+on GitHub, so `gate` runs even in a cancelled run and fails there.
+
+**The runner's own tests.** `make runner-check` (tests/test_scenario_runner.py, part of `make check`
+and of CI's package job) checks that the CI shards' split ends and keeps each scenario beside its
+roots at any shard count (`SCENARIO_SHARDS` can go up safely), that a scenario under a skipped
+rust-only root is skipped whatever the order, and that a failed run says why.
+
+## 2.0.0
+
+The first stable release, promoted by the owner from 2.0.0-beta.2 on 2026-11-05 ("promote to 2.0.0 stable"),
+with three fixes the owner put into it: the lasso drag on dense selections (his report of 2026-11-05), What's
+new after every update with Dismiss in place of the box (his rule of 2026-11-05), and Live view's toolbar under
+menus (issue #16, reported by nebuff). Their checks for the owner's Scribe are the "2.0.0, ..." sections at the
+end of this file. The owner used 2.0.0-beta.2 (and its candidates) on the Kindle Scribe 2024 (firmware
+5.20.1.0.2); what beta.2's section lists as not reported still holds until he reports it. The stable channel
+gets its first 2.0 release here: after the release, check stable/manifest.json and preview/manifest.json on the
+kpm branch and the release's files, the first run of the fixed publish job.
+
+The owner checked 8fcf67c's build (fbb07f29cd3e, installed through KPM on 2026-11-05) on the Scribe and asked for
+one change only, a shorter What's new ("only thing i'll change is the what's new note here -- it's too long"):
+the KOReader battery and Links between notebooks items out, Pages shortened. The release is that build with
+the shorter notes.
+
+## 2.0.0-beta.2
+
+Checked by the owner on the Kindle Scribe 2024 (firmware 5.20.1.0.2) on the beta.2 builds installed through
+KPM on 2026-11-04 and 05, the last of them 8e1bd38's (this release's code, with the version before the bump).
+What the owner reported:
+
+- On the first candidate (416686d): toasts "Good for now"; Japanese works; KOReader's menus good, but its
+  battery symbol showed "JS" (fixed since: on 2026-11-05 at 03:48
+  KOReader's crash.log names Grimoire's own Terminess for its menus); Pages' drag had to start before the held
+  page's card, and the count pad's opening 1 read as a 0 (both changed: the sections below); the keyboard was
+  not tried yet.
+- On the next candidates: swiping past the last page adds a page by default ("Great stuff"); two new stress
+  pages written on the Kindle, STRESS TEST 2 and 3 (2.8 and 3.0 MB, 648 and 698 strokes), whose first revisits
+  took 11.6 s and 28.4 s with no kept drawing (docs/BACKLOG.md, Found on the owner's stress pages).
+- Toasts in Live view, the shift key's caps on and delete held down were added at the owner's request and
+  installed on 2026-11-05 (8e1bd38); the owner then said "Release, this is beta 2."
+
+Not reported on a Kindle, or still needing one: the battery symbol seen in KOReader (the log shows the font),
+the device names in Settings > Shortcuts across a reconnect, how the 300 ms drag hold feels, Live view's toasts
+in a browser, whether caps on's bar stands out, delete held down batching on the panel, and the device checks of
+the 2.0.0-beta.2 sections below marked pending.
+
+## 2.0.0-beta.2, Live view picture in picture in Firefox Nightly (browser checks pending)
+
+Automated: tests/live_browser_check.js (in `make check`, through live_check.sh) checks that in video
+PiP with the tab hidden a batch and a pen packet are each a frame at once, with no timer or animation
+frame run, all the ink drawn and the dot at the newest sample; that a frame never asks for the next;
+that the pen merely moving on draws once 8 ms at most, the next packet drawing what waited; and that a
+lift draws at once; with the tab shown, that the ticker stands in for animation frames only after 34 ms
+and draws nothing when one has just come, and that a frame draws only the box that changed. Measured,
+not in `make check` (it needs the browsers and an idle machine):
+`node tests/live_pip_bench.js` serves the page with a stand-in Kindle writing at a realistic pace (a
+sample every 4 ms, sent as it comes, tile batches every 33 ms), opens it in headless Firefox
+Nightly, Firefox and Chrome (each found in /Applications; `--browsers` picks), and prints, windowed and in
+video PiP with the tab hidden and visible: our time per frame (averageInto, vpipDraw, the quick ink),
+the time from a batch's arrival to its frame being handed to the capture, frames handed per second and
+the gaps between them, and which frames the video itself shows (read back every 4 ms). `--budget`
+fails when a hidden tab's PiP hands batches later than 50 ms at p90 or fewer than 30 frames a second
+while writing. It also reads the page's own Latency meter (pen age at paint, p50/p90/p99/max, with the
+playout delay and the time from a sample's arrival to its paint), checks that a frame drawn piecemeal
+matches the same picture drawn whole pixel for pixel, and takes `--pip-size WxH` (the PiP window in CSS
+pixels at 2x; 930x1240 is the Kindle's 1:1), `--fps` (Firefox's refresh rate, 60), `--pen-ms` (how
+often the pen stream sends, 4), `--capture-ms` (main-thread ms per million pixels each captured frame
+costs, emulated) and `--prefs name=value,...`. Headless Firefox draws canvases in software, so a GPU's
+cost per pixel does not show there. In a real browser: open Live view in Firefox Nightly over plain http, press the rail's
+Picture in picture, switch to another tab or app and write: the floating picture follows the pen
+smoothly, as the page itself does. Then make the PiP window large and compare the Latency readout's pen
+age at paint with the page's (Live view Settings, Diagnostics): within a couple of milliseconds.
+
+## 2.0.0-beta.2, lasso (device checks pending)
+
+Automated: tests/test_lasso.rs, tests/test_lasso_render.rs, the editor's unit tests
+select_held_on_a_pen_drag and select_held_on_a_pen_hold, and the scenarios z_lasso_1_select_move (undo of
+a scoped paste refreshes only its place), z_lasso_2_link_copy, z_lasso_3_dense_timing (a generated
+1,000-stroke page; the move and paste times are in grimoire.log as `lasso: move ... src_ms=... dst_ms=...`),
+z_lasso_4_cut_paste (a generated pair of notebooks: Cut then Paste in place, Copy then Paste 3 mm off, pen
+and finger long-press paste, cut and paste across pages, the read-only page's refusals, scale-to-fit into
+a smaller page size) and z_lasso_5_link_follow (a tap on a link pasted into another notebook opens the
+first notebook's page 3). The live preview (docs/beta2/PIXEL-LASSO.md 2): tests/test_lasso_live.rs (the
+preview folded in batches of any size equals the lift on 500 random lassos, a removed edge subtracts exactly
+what it added, ties decided alike; its cost on the dense page, printed with `--nocapture`, the owner's page
+with GRIMOIRE_DENSE_PAGE=a copy of p72.qpg), z_lasso_10_preview_presents (the halo follows the lasso, one
+small fast refresh per word that flips, counted, the lift covers them in one Ui refresh) and
+z_lasso_11_preview_leave (a word taken in and left out again; a finger's lasso shows the halo too). On the
+Kindle: draw a lasso slowly round a paragraph and watch the halo follow it; lift and check the selection is
+what the halo showed. The exact-area lasso (docs/beta2/PIXEL-LASSO.md 1): tests/test_lasso_cut.rs (the dab
+log is the real draw's; for every tool and tip a cut stroke's pieces draw what it drew, the counted rare
+one-level pixel aside, jitter tools and calligraphy pinned; pieces round-trip through the file; rect_inside
+against brute force; the plan's rules; splice and back; an exact move undone and redone; the dense page's
+plan time with `--nocapture`), z_lasso_12_exact_move (cut a line, move and delete its right part, undo and
+redo), z_lasso_13_exact_erased_copy (a white-ink gap travels with the cut part, Copy leaves the page byte
+for byte, Paste) and z_lasso_14_exact_toggle (`select-exact` on a key, the preview's cut tick, the mode
+button and the key judge the same lasso again, Alt held as a lasso begins; the `mods` script line), z_lasso_16_exact_shift_key (Shift
+and Alt held on a paired keyboard flip one lasso's mode), and
+z_lasso_15_exact_es_gothic and _classic (the bar in Spanish with the fit check on: y_all_screens does not
+open Select mode; the bar keeps beside the panel, its plain buttons narrower when six do not fit). On
+the Kindle: Exact area on the bar, lasso through the middle of a written line and drag the part out; check
+the part left behind and the ends; undo. On the Kindle: open the tool picker,
+Select, lasso a word and its i-dots, drag it; erase part of a word with the precise eraser, lasso and move
+it, then paste a copy over other ink (the ink under it must not lighten); copy a linked item into another
+notebook and tap it there. Bind `select` to the pen button's drag (Settings > Gestures): hold the
+button and lasso, let go, drag the selection, tap outside it and write; hold the pen still on empty page in
+Select mode to paste. Time a move on the 1,090-stroke page (October-2026-02, page 72).
+
+## 2.0.0-beta.2, page previews and dense pages (device checks pending)
+
+Automated: tests/test_page_previews.rs (the light pages' previews written before a dense page's, a current
+kept drawing read back and a stale one never used, a dense page's drawing kept by the job exactly as drawn
+and no lighter page's however slow, nor again a light page's that kept one before, a preview cut short made
+again, what counts as dense (a page file of 512 KB or more; a kept drawing does not make a page dense); a kept
+drawing by another renderer not taken for a quick page; a page whose picture is missing keeps no drawing and
+gets no preview), bgjob.rs's unit tests (a tile shows the loading mark until its preview lands and its number alone
+once its batch ended without one, a check names only the tiles that changed; a waited batch goes first;
+batches of screens turned away from leave the queue; never two children on the same pages; a second child
+that cannot be forked puts its batch back; a running batch not asked for here is not waited on, a queued one
+is), and the scenarios on
+tests/previews_fixture.py (a notebook whose first page has 1,000 strokes, 1.3 MB):
+z_previews_1_tiles (the light tiles come while the dense page is still drawn, which shows an hourglass, then
+its tile alone is refreshed), z_previews_2_kept (the job keeps the dense page's drawing, which then opens
+from it, and no light page's), z_previews_3_loading ("Loading page..." reaches the panel before a dense page
+is drawn, as a notebook opens on it and as the page is turned to; never for a light page or a kept drawing),
+z_previews_4_picker (the destination picker does the same), z_previews_5_turn (a screen turned to while a
+batch runs gets its previews after it), z_previews_6_beside (with the cores, beside it), z_previews_7_once
+(Pages opened over the idle warm-up of its own screen waits on it: no second process draws the dense page
+again) and z_previews_8_moved (a page deleted while a batch runs, the view opened again: the page moved into
+the screen is asked for, not left with its number). The dense pages make the job slow with
+GRIMOIRE_SIM_DENSE_DRAW_MS, as a Kindle draws them; tests/pages_cache_check.py still
+holds that page turns and saves write no preview. Each batch logs `previews: nb=... pages=... cached=...
+kept=... drawn=... keep=... ms=... first=... slow=... cores=...` in grimoire.log.
+
+On the Kindle, in a notebook with dense pages (2.0-b1 DEMO: pages 1, 7, 8 and 12 are 0.6 to 2.6 MB): open
+Pages on a screen with a dense page: the other tiles come one by one within a second or two, the dense
+page's tile shows an hourglass until its own comes. Turn to the next screen at once: its tiles come without
+waiting for the dense page. Open a dense page whose preview was just made: it opens quickly. Edit a dense
+page, turn away within two seconds, and come back: "Loading page..." shows until the page is drawn, and goes.
+A light page never shows it (under 256 KB since the owner's decision of 2026-11-04: see the end of this
+file). Write on a page whose screen has a dense page, pause three seconds (the idle save, and the warm-up
+starts), then open Pages: only one `previews:` line has the dense page as its `slow=` page (it is drawn
+once, not twice). In grimoire.log, check the `previews:` lines (`first=` is the first tile's
+time) and `beside pid` (the second background process).
+
+## 2.0.0-beta.2, the Terminess diet (device checks pending)
+
+Automated: rust/tests/test_terminess_keep.rs (the embedded fonts hold exactly
+`assets/terminess-keep.txt`'s code points, 1,197 of Terminus's text and 85 Material Design icons; every
+icon the sources draw is listed, is in both weights and draws ink; none of the Nerd Fonts glyphs the diet
+leaves out is listed), test_koreader.rs's fonts_follow_the_binary (KOReader's `fonts/Grimoire` written
+again when it differs, left alone when equal, made only while the Terminess patch is applied, nothing
+written without either, nothing else touched), test_scenarios.rs's
+a_start_brings_koreaders_terminess_up_to_date (a start of the runner does that once), test_httpd.rs
+(`/font/licenses.txt` serves the licenses of the fonts the share pages use, and each font's answer names
+it), test_font and test_golden as they were (both compare on arm64 macOS, where they were recorded), and
+package_check (the icons' notice and the Apache-2.0 text in `app/licenses` and beside the fonts in the
+KOReader patches folder). Measured once, not in `make check`
+(it needs fontTools and freetype-py): every kept code point of both weights, old file against new, drawn
+through stb_truetype as font.rs draws it (every quarter pixel from 12 to 100 px, whole pixels to 200,
+icons every quarter pixel to 400 px and through font_draw_icon's own sizing for boxes of 16 to 600 px:
+721,833 draws a weight) and through FreeType 2.13.2 at 12 to 100 px, hinted, light, unhinted, auto-hinted
+and mono, embedded bitmaps on and off (798,063 draws a weight): byte for byte the same. The same check
+finds 111,192 of the 114,009 hinted outline draws differ in a subset without hinting (FreeType then
+auto-hints), and the 10,773 draws at the bitmap sizes (12 to 32 px) in a subset without the embedded
+bitmaps; the shipped subset keeps both.
+
+On the Kindle: Classic and Gothic look as before (the toolbar's tools, the sheets' and the Library's icons,
+a music paper's clefs, the clock corner). With the Terminess patch applied in KOReader by an earlier
+version: the first start of this build logs `koreader: wrote 2 of Grimoire's Terminess files in
+.../fonts/Grimoire`, the files there are the new size (427,436 and 428,220 bytes), and a second start
+writes nothing; then in KOReader the menus look as before and the battery shows KOReader's own symbols
+in the dropdown and the reading footer, charging and unplugged. (The folder shortcuts' list draws its
+"└" from KOReader's fallback fonts now: the Nerd Fonts box drawing is gone from Terminess.) In a
+browser at the Share screen's address, `/font/licenses.txt` shows the fonts' licenses.
+
+## 2.0.0-beta.2, big page batches and finger shapes (device checks pending)
+
+Automated: z_pages_add_8_notice ("Adding N pages..." in the refresh that takes the count pad down, from the
+toolbar's pad and from the Pages view's, and gone with the refresh that shows the pages: 100 and 51 pages say it,
+10 and 50 do not; a batch the storage refuses has "Couldn't add pages." in its place, and adds no page; the
+100-page batch's Redo says it too, in a refresh of its own before the pages are written again, a Redo the storage
+refuses has "Couldn't redo." in its place, and a 10-page batch's Redo says nothing). editor.add_notices counts
+only a notice that a refresh carried before the writing began (App.toast_presents).
+
+On the Kindle: add 60 pages from the Pages view's count pad: "Adding 60 pages..." shows until they are added,
+then goes; 30 pages are added with nothing said. Undo the 60 pages, then Redo: the notice again. Each batch of 25
+pages or more logs `pages: added=N of N ms=M notice=0|1 paper=drawn|picture` in grimoire.log (a Redo, `pages:
+redo added=N of N ms=M notice=0|1`): M / N is a page's cost on this Kindle, which editor.rs ADD_PAGE_MS (40 ms)
+estimates, and which sets where the notice starts (2 s: 51 pages at 40 ms).
+
+A finger shape names its action only when the action did something. Automated: editor.rs's
+fshape_names_its_action_only_when_it_did_something (a square bound in turn to each action: Previous page on page
+1, Next page on the last page, Clear page on a blank page, Undo and Redo with nothing to undo or redo, Close menu
+with nothing open, and Redo right after a stroke, whose settle is drawn first, say nothing; done, each says its
+name, and so does a setting that changes with nothing drawn) and s_shape_10_nothing (the recorded Z, Undo:
+nothing said on a blank page, "Undo" after a stroke, nothing once the stroke is undone). On the Kindle: bind
+Undo to a shape (Settings > Gestures), draw it on a blank page: no toast; write, draw it: "Undo" and the stroke
+goes; draw it again: no toast.
+
 ## 2.0.0-beta.1
 
 The same app as 2.0.0-beta.0. Checked by the owner on the Kindle Scribe 2024 (firmware 5.20.1.0.2), from the
@@ -144,7 +427,8 @@ network is lost. This candidate does not claim these physical transitions have b
 
 Check October-2026-02: unlinked pages 13/14 and deleted pages must not appear as graph nodes.
 There is no Unlinked tray, zoom-button pair or Tidy up button. The compact footer's View button
-cycles All, Around and Fit; pinch zoom remains available. Node counts describe the displayed
+reads View: All or View: Adjacent and a tap always switches to the other one, fitted (2.0.0-beta.2;
+in rc.5 it cycled All, Around and Fit); pinch zoom remains available. Node counts describe the displayed
 local and external nodes, orphans are current-notebook pages without valid links, links count
 valid outgoing links, and page totals distinguish this notebook from all notebooks.
 
@@ -277,6 +561,31 @@ and send the trace/log. [TOUCH-STUDY.md](index-hook/TOUCH-STUDY.md) records the 
 acceptance targets and shape freeze gate. Owner blocks J/K must have zero pattern and shape
 fires, and L must establish shape acceptance; synthetic negative traces cannot substitute.
 
+## Links between notebooks, polish (2.0.0-beta.2 lane C, not yet on a Kindle)
+
+Not yet on a Kindle. `make check` covers the backlinks cache (cargo tests in backlinks.rs: a save updates it
+at once, a lazy check finds what another version wrote and drops deleted notebooks, a cache that does not
+read is built again, 4000 links from one notebook fit and the overall limit holds), the Graph's anchors
+never moving a dot or changing graph.ini's gen (mapview.rs), and the scenarios z_links_1_backlinks (Linked
+from rows, the Pages card count, following a row and Back to the same page and zoom, anchors in both
+languages through make l10n-check) and z_links_2_broken (a gone page and a gone notebook, from the bar, the
+page and the Graph; Delete link and Undo), z_links_3_bar_learns (a bar opened before the first check is
+through gets its Linked from rows by itself; a long press on a row follows it) and z_links_4_back_list (Back
+across notebooks brings back that notebook's own back list). It cannot say how long the first check takes on a Kindle with
+many notebooks, or whether a bar redrawn when the check finds more is noticed.
+
+1. **Linked from.** In notebook B, link a page to a page of notebook A (Link to... > Somewhere Else). Open A
+   at that page and the Links bar: "Linked from B / Page N" is listed (wait a second after opening A the
+   first time: the check runs while nothing is touched). Tap it: B opens at that page.
+2. **Back keeps the zoom.** Zoom in on a page of A, open the bar, tap a Linked from row into B, press Back
+   (your go-back key, or the bar's Back to): A comes back at the same page, zoomed and panned as it was.
+3. **Pages card.** In A's Pages, hold that page: its card says "Linked from 1 page".
+4. **Graph anchors.** A's Graph shows B's page in a box at the right, with a dashed line (links that come
+   here) or a solid one (links that go there); tap it to open it. No dot moved.
+5. **Broken links.** Delete B's page (or B): in A, a link to it is a dashed "Page gone" chip; a tap on it,
+   on the page or in the Graph opens its card: Change where it goes, Delete link. Undo brings a deleted
+   link back. Restore B from trash/ by hand: the link works again.
+
 ## Index phase 2: links without ink and the long-press card (2.0.0-beta.6 candidate, not yet on a Kindle)
 
 Not yet on a Kindle. `make check` covers links.ini's area lines byte for byte, the migration of beta.5 links
@@ -300,7 +609,7 @@ Install the build and test first in the notebooks that have your beta.5 links.
    - Pick one: "Linked to ..." (the very first time, a tip about tap and hold); from the bar, the bar comes
      back with the new row. One Undo removes the link; Redo brings it back.
    - New page...: name it; a new last page is added and linked, and you stay where you were.
-   - A dot is "Too small"; Cancel says "No link made.".
+   - A dot is "Link area too small."; Cancel closes it with no toast.
 4. **Holding a link.** Hold a finger on a link for about half a second: a heavy dotted border shows
    exactly what is tappable, then a small card opens beside it. The page stays in view the whole time (no
    Pages view, no full flash).
@@ -308,7 +617,7 @@ Install the build and test first in the notebooks that have your beta.5 links.
      page in the Index everywhere. On an unnamed page the row reads "Add page N to the Index...".
    - Change where it goes...: the chooser marks the current target and has no Choose from the pages....
    - Redraw the area: circle the new area; Undo brings the old one back.
-   - Delete link: "Link deleted. Undo brings it back."; a border you drew yourself stays, and so does the
+   - Delete link: it goes with no toast, and Undo brings it back; a border you drew yourself stays, and so does the
      ring of a beta.5 link (deleting a link never deletes ink).
    - A tap outside the card closes it and does nothing else. With the card up the clock is not shown,
      so a tap in the clock corner closes the card too (the brief had it toggle the clock and leave the
@@ -347,9 +656,9 @@ Install the build and test in a notebook that has your beta.5 links, unless said
 
 1. **Upright.** Two fingers down anywhere on a page open Pages with one flash; two fingers up close
    them. Two fingers left turn to the next page, and right to the previous one. On the last page, two
-   fingers left add a page (Display > "Swiping past the last page adds a page", on by default; off, they show
-   "This is the last page." and add none); on the first page, two fingers
-   right show "This is the first page." The panel's + still adds a page.
+   fingers left add a page (Display > "Swiping past the last page adds a page", on by default; off, they stay
+   on the last page and add none, with no toast); on the first page, two fingers
+   right stay there. The panel's + still adds a page.
 2. **The Links bar.** Two fingers up (or the chain button after Next on the panel, which has a small
    dot when the page has links) open the bar along the bottom with no flash. It shows one row for each
    Index entry the page links to, numbered in reading order, with "×2" where two links go to the same
@@ -724,3 +1033,1695 @@ For a failure, write down the Scribe model, firmware, jailbreak, KOReader versio
 is installed and how Grimoire was started. Attach `grimoire/grimoire.log`, and for a hand-over
 failure `koreader/crash.log`. Read the logs before sharing them; never include a passcode, a
 serial number or a book file.
+
+## 2.0.0-beta.2, Loading page from 256 KB
+
+The owner's decision of 2026-11-04: "Loading page..." shows as a page of 256 KB or more opens with no kept
+drawing (store_page_slow), where it went by the dense page's 512 KB before; the previews job still keeps a
+drawing only of a page of 512 KB or more (store_page_dense). A page of handwriting is under 0.3 MB and draws
+in well under a second; one of 0.3 to 0.5 MB could sit 2 to 4 s on its first open with nothing said.
+
+Automated: tests/test_page_previews.rs's slow_page_not_dense (a page between 256 and 512 KB is slow and not
+dense, one under 256 KB neither, one over 512 KB both; the job makes the slow page's preview and keeps no
+drawing of it, every drawing counted as slow; a kept drawing changes neither) and z_previews_9_slow
+(tests/previews_fixture.py slow: a 381 KB page with no kept drawing, its preview just made by the job, says
+"Loading page..." in a refresh of its own before it is drawn, gone once the page shows; a light page with no
+kept drawing says nothing; the slow page again, from the drawing the editor kept, says nothing). The scenario
+fails with the notice on the 512 KB rule.
+
+On the Kindle: open a page of 300 to 500 KB (its `p<id>.qpg` in the notebook's folder) that has no kept
+drawing (write a stroke on it, turn to another page and come back): "Loading page..." shows until the page is
+drawn, then goes. Turn away and back again: nothing (a page that took a second or more to draw keeps its
+drawing). A light page (under 256 KB, most pages of handwriting) shows nothing. Write on the 300 to 500 KB
+page again, turn to the next page, open Pages and let the page's tile come, go back and open the page:
+"Loading page..." still shows, as the job keeps no drawing of a page under 512 KB (a dense page opens at
+once then; in grimoire.log the batch's `previews:` line says `keep=0` when its screen has no dense page).
+
+## 2.0.0-beta.2, count pad and drag hold
+
+The owner's Scribe feedback of 2026-11-04: "Make the delay for reordering smaller, so that it can safely be
+activated before the long-pressed management dialong. They are too disruptive as a pair." and "Pages - Batch page
+adding starts the counter at 0 - and is displayed at a large, intrusive amount."
+
+Automated: keyboard.rs `the_count_pads_opening_one_is_plain_text` (the opening 1 drawn as the pad's title is,
+black on white at the title's size, with no box and no caret; a typed count has its caret), and the count pad's
+behaviour as before (`the_count_pad_opens_at_one_and_the_first_digit_replaces_it`); the shots
+z_pages_add_1_batch/01-pad.png (the Pages view's pad) and z_pages_add_5_toolbar/01-pad.png (the toolbar's).
+z_pages_drag_hold: a page held 350 ms and moved past the slop on its own tile draws nothing and is not a drag yet;
+moved off the tile it is dragged with no card, its first refresh the gap's bar alone (fast), the card's 600 ms
+passing under the drag drawing nothing; a slow tap (held 350 ms, rolled 45 px, lifted on its tile) is the tap it
+was: on a ticked page in Select it unticks it and the ticked pages stay where they are, and with Select off it
+selects the page with one small repaint; a swipe from a page turns the screen; a contact past the slop at 100 ms
+and lifted at 400 ms is a flick, and lifted past 1 s nothing, never a drag; a page held still 700 ms opens its
+card; ticked pages and a pen drag on the short hold too. Its short holds are `finger` and `frame` lines, and it
+runs again in `make scenarios-late` (every wait 400 ms late). z_pages_drag still drags from the card (held
+700 ms); a drag lifted back in its own place takes the bar off with one fast refresh of its rect.
+
+On the Scribe:
+
+1. Pages, hold a page about a third of a second and move it without lifting: the black bar shows as the finger
+   leaves the page and follows, and the page's card never flashes up. Drop it in another gap: the page moves,
+   and Undo puts it back. Drag it out and back to where it was and lift: only the bar goes, with no redraw of
+   the whole screen.
+2. Hold a page still: its card opens at the same moment as before (Open, Add a link, Rename, Delete, Move to...,
+   Copy to notebook...). With the card up, move without lifting: the drag starts and the card goes.
+3. Flick sideways from a page, as quickly as you would to turn: the screen turns, no bar shows. Try a few
+   flicks that start with a slight pause; note any that became a drag instead (how long the pause felt).
+4. Tap and double-tap pages: a tap still ticks, a double tap still opens, including slow taps that roll a little
+   under the finger. With Select on and a few pages ticked, slow-tap a ticked page: it unticks, and no page moves.
+   Note any tap that showed the bar instead.
+5. Hold New page (+): the count pad reads "Pages to add 1", a plain black 1 the size of "Pages to add", no box
+   and no caret after it. Type 7: it reads 7 (not 17) with the caret after it. Add 1 page at once adds one.
+   The same on the toolbar's + held on the last page.
+6. Note whether the drag feels late to start on a big tile (the bar waits until the finger is off the page); if
+   it does, say so, and the pick-up can move back to the slop with a drop in place made harmless instead.
+
+## 2.0.0-beta.2, KOReader battery symbols
+
+The owner's Scribe showed a "JS" badge where KOReader's dropdown has its battery symbol (2026-11-04). KOReader's
+battery symbols are U+E778 to U+E783 and U+EDA3, from its own `nerdfonts/symbols.ttf`; a full Terminess Nerd Font
+has Devicons and Font Awesome there (U+E781 is the JavaScript badge, a 90 to 99 percent battery). The likeliest
+cause: the Kindle still had rc.6's Terminess patch (the RC7 sweep found it there), which takes the full Nerd Font in
+`fonts/Terminus` for the menus, the footer and the dropdown's status line alike, and only a toggle in Settings >
+KOReader replaced it. Not confirmed on the Kindle: it was not reachable.
+
+Automated: tests/kopatch_check.lua (make kopatch-check) plays the patch against stand-in fonts folders and faces:
+Grimoire's own copy in `koreader/fonts/Grimoire` comes first, over the whole Nerd Font in `fonts/Terminus` and over
+a clean Terminus, and only its face is opened to check; Grimoire's bold alone is not its copy; without it, a font
+with a glyph at a battery code point is passed over for one without, and with none without, the first by rank is
+used as before; a face that cannot be read (an error, or nil as KOReader's getFace gives for a font it cannot open)
+is passed over; crash.log names the menus' fonts and why each other regular face was passed over; the footer and
+the dropdown's status line keep KOReader's own font. Its faces are cdata like KOReader's (an ffi metatype, so a
+method a face lacks raises an error, as on the Kindle): `ftsize:hasGlyph` (true or false) as in KOReader
+v2026.07.2, the owner's; `checkGlyph` (0 for none) on `ftsize` or on `ftface` as in older builds, which pick the
+clean Terminus over the whole Nerd Font all the same; and neither, where nothing can be checked: the first by rank,
+crash.log saying the glyphs could not be read (not that the others have one), and with Grimoire's copy, that copy
+with a `not checked:` line. test_koreader.rs's
+earlier_terminess_patch_follows_the_binary runs koreader_patch_refresh against the app's real files: each copy in
+kindle/koreader/legacy is replaced with the current patch (a new file), this build's copy is not written again, a
+copy with one byte changed or one line added and an unrelated file are kept, an absent patch stays absent, and the
+code's list of earlier copies is the folder's. test_scenarios.rs's a_start_brings_an_earlier_terminess_patch_up_to_date
+starts the runner with rc.6's copy in KOReader: it is the current patch after the start, grimoire.log says so, and a
+second start says nothing. tests/package_check.sh checks the app carries kindle/koreader/patches and
+kindle/koreader/legacy as they are. test_terminess_keep.rs's koreaders_battery_symbols_are_named_and_never_in_terminess
+holds that only the patch names the battery code points (the icon scan leaves them out) and that neither embedded
+Terminess has a glyph at one.
+
+On the Kindle (with the whole Terminess Nerd Font still in `fonts/Terminus`, as on the owner's Scribe):
+
+1. Install beta.2 and start Grimoire once from the Library. `grimoire/grimoire.log` has
+   `koreader: .../koreader/patches/2-terminess-ui-font.lua was Grimoire's earlier patch (2-terminess-ui-font-rc6.lua
+   in app/koreader/legacy); it is this build's now` (or `-rc7` or the plain name for another earlier copy). Leave
+   Grimoire and start it again: no such line the second time. No line on the first start either: the Kindle's
+   copy was already this build's, or not one Grimoire wrote (changed by hand), which Grimoire keeps; compare
+   `koreader/patches/2-terminess-ui-font.lua` with the zip's `KOReader patches (optional)` copy, and if they
+   differ, delete it and apply the patch again in Settings > KOReader.
+2. Start KOReader. `koreader/crash.log` has `terminess ui font patch: menus in
+   ./fonts/Grimoire/TerminessNerdFontMono-Regular.ttf and ./fonts/Grimoire/TerminessNerdFontMono-Bold.ttf (Grimoire's
+   own copy)`, then a `passed over /mnt/us/fonts/Terminus/... (Grimoire's own copy in koreader/fonts/Grimoire comes
+   first)` line for each other regular Terminess, and no `used anyway:`, `not checked:` or `could not be read`
+   line. A `not checked: ... (its glyphs could not be read)` line means the patch could not ask this KOReader for
+   glyphs at all (its face API differs from v2026.07.2's): the menus still use Grimoire's copy, but send crash.log.
+3. Open KOReader's dropdown (tap the top of the screen): the clock, then the battery symbol and the percentage with
+   a space between them, not "JS". Check it charging (the plug) and unplugged at a few levels if you can; the
+   90 to 99 percent level is the one that drew "JS".
+4. Open a book with the reading footer showing the battery: the battery symbol there too, not "JS".
+5. The menus still read in Terminess, regular and bold (titles), as before.
+
+## 2.0.0-beta.2, Shortcuts and Pair
+
+Settings' Controller sheet is two now (the owner's ruling of 2026-11-04): **Settings > Shortcuts**, a top row,
+and **Settings > Pair**, the bottom row's button where Controller was; each keyboard or controller can have
+shortcuts of its own (docs/SHORTCUTS.md, Device profiles). The scenarios cover the sheets and the profiles
+with stand-in devices (`tests/scenarios/v_shortcuts_profiles.qs`, `v_shortcuts_buttons_device.qs`,
+`y_all_screens.qs`, `tests/bt/`); what
+only the Scribe can show:
+
+1. **Settings.** The top rows read Display, Pen sensitivity, Shortcuts, Calibrate pen and touch, upright
+   and sideways, in Gothic and Classic, and each opens its own screen. The bottom row reads KOReader | Pair |
+   Gestures | Updates | Done, and nothing under the top rows moved (Style, Mirror PDFs, the pen button row,
+   turning, pinching, Language).
+2. **Pair.** With the helper in `grimoire/bluetooth`, Settings > Pair > Bluetooth controller starts it,
+   Pair a controller... finds and pairs a controller, its Done comes back to Pair, and the status line
+   names the controller once it connects (or that another app holds it). With shortcuts off the rows are
+   greyed and the line says to turn them on in Settings > Shortcuts. Esc (with shortcuts on) goes back to
+   Settings.
+3. **The device row.** With a keyboard and a controller connected, Settings > Shortcuts' Device row names
+   one, a tap the other ("(tap for the next)" while there are two or more). Note the names it shows: they
+   are what the profiles are known by.
+4. **Own shortcuts.** For the controller, tap Own shortcuts for this device: it reads Own shortcuts (N, 0
+   refused), the same N as Reload shortcuts.ini's, and over USB `grimoire/shortcuts/` has
+   `<name>-<vendor>-<product>.ini` with its `# Device:` and `# Id:` lines. `shortcuts.ini` and
+   `controller.ini` are unchanged (their dates too).
+5. **Its buttons.** Buttons... is titled Buttons: NAME. Learn one button to another action, then in a
+   notebook check that this controller does the new action and the keyboard (or a second controller) still
+   does the default's. `controller.ini` is not touched; `<slug>.controller.ini` appears beside the profile.
+   Then choose the keyboard in the Device row and open Buttons... again: it is titled Buttons (the
+   default's), and a press on the controller is not learned: a toast names the controller and says to
+   choose it in the Device row first.
+6. **Off and on.** Turn Own shortcuts off: the controller does the default's actions again, and the files
+   are all still there (plus a `.off`). Turn it on again: the learned button is back. Disconnect the
+   controller: the Device row still lists it, "NAME, not connected", and its row still turns it on and off.
+   Turn Enable shortcuts off with the controller connected: the Device row reads "Devices are listed while
+   shortcuts are on" (no device, connected or saved), and turned back on it shows the same device.
+7. **Reconnect.** Switch the controller off and on (or out of range and back) and reconnect it over
+   Bluetooth: its own shortcuts apply again without opening Settings. Say whether the name it shows is the
+   same each time (it is how the profile is found; a controller in another mode is another device).
+8. **Edit by hand.** Edit the profile's `.ini` over USB (a `key.` line for the keyboard's profile, say), then
+   Reload shortcuts.ini: the change acts for that device only, and a bad line counts in its Own shortcuts row
+   as refused.
+9. **Upgrade.** A Kindle that had shortcuts on in an earlier beta.2 build with an unedited `shortcuts.ini`:
+   after this build's first start its first line names Settings > Shortcuts (grimoire.log says it became
+   this build's); an edited one is left as it was.
+
+## 2.0.0-beta.2, Toasts in Live view
+
+Live view shows Grimoire's toasts now (the owner, 2026-11-05: "Enable toasts on the live view display. they
+don't show up now."): a third layer of the stream, drawn over the page, the toolbar and the clock corner, with
+no setting. It comes with transparency: the toast alone, and what shows under its round ends is what the
+browser shows there. The automated checks: `rust/tests/test_live.rs` (the layer's rect and its gray and alpha,
+moved, gone, nothing while pairing or asleep; `app_flush` gives the layer the toast alone, neither the live
+chip nor a toolbar under its ends, and over what the Kindle had under it the layer is what the panel shows),
+`tests/scenarios/y_live_toast.qs` (in the simulator: over the pairing card, moved by a sheet, sideways,
+inverted, replaced, timed out, asleep; the layer drawn over the screen against the simulated panel),
+`tests/live_stream.py` (the first browser's own toast over a real stream, clear at its corners) and
+`tests/live_browser_check.js` (the page draws it on top, clears it, drops it with any state but awake, and
+leaves out a layer id it does not know).
+What only the Scribe and a real browser can show:
+
+1. **The first one.** Pair a browser. As the card closes, the Kindle says "A computer is watching this screen."
+   for 3 s: the browser shows it in the same place with the same look (black, white words, round ends; in
+   Gothic its pointed ends and inner line), and it goes from both together.
+2. **On a page.** In a notebook, choose the lasso and circle empty paper: "Nothing to select." on both, over
+   the page; gone from both after 2 s. To see one toast replace another: bind a key or a controller button to
+   light-up (none is bound by default: Settings > Shortcuts > Buttons... for a controller, or a `key.` line in
+   shortcuts.ini, docs/SHORTCUTS.md) and press it a few times quickly: each "Light N of 24" replaces the last
+   in the browser too.
+3. **Switches and the toolbar.** Drag the toolbar down to the foot of the page, under where toasts show, and
+   make "Nothing to select." over it: on both, the toast covers the toolbar and the toolbar shows around its
+   round ends. In the browser's View settings, switch Show toolbar and Show clock and battery off and make the
+   toast again: it still shows, and around its round ends is the page, with no piece of the hidden toolbar.
+   The same in Gothic (Settings, Style: tap for Gothic), at its pointed ends. Switch them back on and put
+   the toolbar back.
+4. **Loading page...** Turn to a dense page that says "Loading page..." as it opens: the browser shows it while
+   the Kindle draws, and it goes as the page shows.
+5. **It moves.** Make "Nothing to select." and at once open the toolbar's Pages view: the toast moves above the
+   Pages view's buttons on the Kindle and in the browser alike. Make one and turn the Kindle sideways: the
+   browser shows it in its sideways place.
+6. **Asleep.** Make "Nothing to select." and press the power button while it is up (within its 2 s): the
+   browser says the Kindle is asleep and the toast leaves its picture at once. Wake the Kindle: no toast on
+   either.
+7. **The pairing card.** With a browser watching, open Library > Share > Live view again (the card): the
+   browser says it is pairing and shows nothing new. To have a toast up as the card closes, turn on a paired
+   Bluetooth keyboard or controller while the card shows (Shortcuts on): the Kindle says "Controller
+   connected" for 1.5 s; tap Done while it is up, and the browser shows it as the card closes. Again, but wait
+   for it to go before Done: it does not come back. (That toast comes at most once in 30 s: turn the device
+   off and wait between the two.)
+8. **Inverted.** With Dark mode on (Settings > Display), the browser's toast is inverted with the rest of
+   the picture, as on the Kindle (white with black words), and the browser's Invert colors switch turns it
+   with the picture.
+
+## 2.0.0-beta.2, Shift and caps
+
+The owner's request of 2026-11-05 about the on-screen keyboard: "next toggle shift in typing toggles off shift
+for next char then shift on which makes longer caps strings possible." The shift key has three states, a tap
+each and round again: the next letter's capital (as before), caps on, off.
+
+Automated: keyboard.rs `shift_once_gives_the_next_letter_only` (one tap: one capital, then small letters; a
+digit, a symbol or the space bar leaves it waiting for a letter, as before), `shift_twice_is_caps_on_until_a_third_tap`
+(capitals through digits, the space bar, delete and the symbols and accents pages; a third tap is off, a
+fourth shift for one letter again), `caps_on_ends_when_the_keyboard_closes` (Done, Cancel and a paired
+keyboard's Esc; the next keyboard opens with shift off), `a_shift_tap_refreshes_only_what_it_changed` (off to
+one letter and caps on to off refresh the keyboard, as shift always did, since every letter key's label
+changes case; one letter to caps on refreshes the shift key alone, and on the symbols page, where no label
+changes case, all three taps do) and `caps_on_draws_a_bar_under_the_shift_label`
+(Gothic and Classic, upright and sideways: shift for one letter is the pressed key, as before; caps on is that
+key with a white bar under its label, and nothing else on the keyboard differs between the two).
+tests/scenarios/u_keyboard_caps.qs types "NASA 2026 ÉTÉ! go" in New folder, caps on through a digit, delete
+and the accents and symbols pages, then off, with each shift tap's refresh counted (on the symbols page too:
+the shift key alone each time), and shoots the states
+upright and sideways (build/shots/u_keyboard_caps: 02-shift-once, 03-caps-on, 04-caps-on-accents,
+06-caps-on-sideways); u_keyboard_caps_classic.qs shoots Classic's. u_accents.qs now taps shift twice to turn
+it off after its shift shot (one tap did that when shift had two states). The tests fail on the two-state
+shift.
+
+On the Scribe:
+
+1. **One tap.** Library, New folder: tap shift once. The key goes black and the letter keys show capitals.
+   Type "ab": it reads "Ab", the keys show small letters again and shift is white. Tap shift, then 1, the
+   space bar and c: "1 C" (the digit and the space leave shift waiting for a letter).
+2. **Two taps: caps on.** Tap shift twice: the key stays black and a white bar shows under its label. Note
+   whether the two looks are easy to tell apart at a glance, and whether the second tap refreshes only the
+   shift key at once (the keyboard's usual clean-up follows when typing pauses). Type "nasa": "NASA". Then a
+   digit, the space bar, del and more letters: still capitals.
+3. **The other pages.** With caps on, tap áé: the accented letters show as capitals (É, Ñ, Œ) and shift keeps
+   its bar; é types É. Tap #+=: the symbols type as they are; abc, and the letters are still capitals. On the
+   symbols page a shift tap refreshes the shift key alone (none of its keys has a capital to show).
+4. **Three taps: off.** Tap shift a third time: the key goes white, the bar goes, the letter keys show small
+   letters and type them. A fourth tap is shift for one letter again.
+5. **Closing.** With caps on, tap Done (or Cancel). Open a keyboard again: shift is off (a white key, small
+   letters).
+6. **Sideways and Classic.** Steps 1 to 4 sideways, and in Classic (Settings, Style): the bar shows under the
+   label in each, and in Spanish under "mayús".
+7. **Rename and Find.** Rename a notebook from the Library with caps on, and in a notebook type a page name in
+   Find (Go to page... in Pages, or the Links bar's Go to) with caps on: the same three states. Find's Done with
+   no page to go to keeps the keyboard, and caps on with it.
+
+## 2.0.0-beta.2, Hold delete
+
+The owner, 2026-11-05: "hold del long enough in keyboards to quick delete", "low ish delay but not too low",
+"repeat rate high so it feels snappy", "not too high". Delete held deletes again after 400 ms (`KB_HOLD_MS`),
+then every 65 ms (`KB_REPEAT_MS`), about 15 a second, on every keyboard; a tap deletes one as before.
+
+Automated: keyboard.rs `a_tap_on_delete_deletes_one`, `a_hold_deletes_again_after_the_delay_then_at_the_rate`
+(held H ms: 1 under 400, else 2 + (H - 400) / 65, across the clock's wrap too),
+`a_late_repeat_catches_up_a_batch_at_most`, `a_repeat_waits_for_the_panel` (a due repeat waits while the last fast
+refresh may be on the panel, then the ones that came due go together, three at most, one refresh; nothing after
+the lift), `sliding_off_delete_ends_the_hold`, `the_hold_ends_with_the_text`,
+`closing_a_new_contact_and_sleep_end_the_hold`, `every_keyboard_page_repeats_delete` (letters, accents, symbols,
+the number pad, the kana pad) and `the_count_pads_del_repeats_down_to_nothing` (the opening 1 cleared by the
+touch-down, nothing to repeat). tests/scenarios/u_keyboard_hold_delete.qs holds del on the Library's New folder
+keyboard and on the Find sheet: a tap and a 399 ms hold delete one; held 630 ms with samples, four; each repeat
+one fast refresh of the text line (and on Find the rows' card after it), the keyboard drawn once, nothing once
+the text is gone, the key alone at the lift and only the keyboard's GL16 after it; held with no samples at all
+(the tick's repeats) the field empties and stops. It runs again in `make scenarios-late`.
+
+On the Scribe (Gothic and Classic, upright and sideways):
+
+1. **Rename.** In the Library, a notebook's Rename (a name of 20 characters or so): tap del, one character goes.
+   Hold it: after about 0.4 s it goes on deleting, about 15 a second, and stops the moment the finger lifts; the
+   name shown at the lift is the name kept (Done saves exactly that). Note if it starts too soon (a deliberate
+   tap that deleted two) or too late, or runs too fast to stop where you mean to.
+2. **The pen.** The same with the pen held on del: it repeats too, and stops at the lift.
+3. **Slide off.** Hold del, then slide onto another key without lifting: the deleting stops there, and no key is
+   typed; sliding back onto del does not start it again.
+4. **Empty.** Hold del until the name is empty, and keep holding a few seconds: it stops at empty, nothing flashes
+   or refreshes over and over, and the keyboard gets its gray clean-up once the finger lifts. Hold del on an empty
+   field: nothing happens but the key's own pressed look.
+5. **Find.** In a notebook with named pages, Find (Ctrl+F, or the bar's Go to): type a few letters so rows show,
+   then hold del: the text and the rows follow it down, the rows refreshed after the text each step, and both stop
+   at the lift. Note if the text ever seems to fall behind the finger (a jump of a few characters at once is the
+   panel catching up, at most three at a time; anything that keeps changing after the lift is a fault).
+6. **Other keyboards.** A page's name (R, or Rename in Pages), a link's Rename on its card, New page...'s name and
+   the Graph's rename: holding del repeats on each. In Japanese, the kana pad's del repeats too.
+7. **Count pad.** Hold New page (+) in Pages: the pad reads 1. Hold del: the 1 clears at once and nothing more
+   happens. Type 123 and hold del: 12, 1, then empty, its Done greyed at 0; lift and type a digit: it follows as
+   before. The same on the toolbar's + count pad. With a keyboard paired: type 12345, hold del on the screen and,
+   while it deletes, type 9 on the keyboard: the 9 stays and the deleting stops, the finger still on del.
+8. **Interrupted.** Hold del and, still holding, press the power button to sleep; wake: nothing was deleted after
+   the sleep, and holding is over. Hold del and put a second finger on another key: the deleting stops and the
+   second key types.
+9. **Cold.** If the Kindle is cold (below about 15 degrees), note whether holding del feels slower: it waits for
+   the panel's slower refreshes rather than run ahead of them.
+
+## 2.0.0, What's new
+
+The owner's rulings of 2026-11-05: "do the small change" (the card had cut the last paragraph of 2.0.0's notes
+mid-sentence, "please consider donating to", just above the signature) and "new rule -- no don't show this
+again, just a "Dismiss" and every update with changes by default has at least a basic what's new". The card
+ends at the last note that fits whole; there is no box; the first start after every update opens the notes once,
+whatever the old box said; every release has a What's new (tools/release-preflight.sh fails when
+docs/WHATSNEW.md did not change since the release before).
+
+Automated: about.rs `the_card_ends_at_the_last_block_that_fits_whole` (2.0.0's notes on 1860x2480, upright
+and sideways, Gothic and Classic: the card ends with a whole block and the next would not have fitted; upright
+all 13 blocks, sideways the first 8 in Gothic and 9 in Classic) and
+`a_first_paragraph_too_long_for_the_card_is_cut_at_a_line`; test_store.rs `whatsnew_due_after_every_update`
+(due with `whatsnew_hide=1` and another version seen, `whatsnew_hide` written back as it was; not due for this
+version's notes, nor for a file without `settings_version`). tests/scenarios/z_about.qs (the card upright and
+sideways, `library.about.card_cut` 0, Read all's pages, Dismiss), z_about_1_update.qs and z_about_2_after.qs
+(an update opens the notes once), z_about_3_hidden.qs and z_about_4_hidden_after.qs (a settings.ini with
+`whatsnew_hide=1` and 1.2.0's notes seen: the notes open, Dismiss closes them with this version recorded, the
+next start opens the Library alone, and `whatsnew_hide=1` is still there). The release check's What's new rule
+was tried by hand on a scratch clone (docs/RELEASING.md, The bump commit).
+
+On the Scribe (Gothic and Classic, upright and sideways):
+
+1. **The update opens the notes once, even with the old box ticked.** Before installing 2.0.0, settings.ini has
+   `whatsnew_hide=1` (Don't show this again was ticked in a beta; the owner's Scribe has it). Install 2.0.0 and
+   start Grimoire: the Library opens with What's new hanging from the bat by itself.
+2. **No box, and Dismiss.** The card has What's new and the version, the notes, the signature, Read all and
+   Dismiss, and no Don't show this again. Dismiss closes it; open it again from the bat and close it with Back
+   or Esc on a keyboard: it closes the same way. Read all shows the whole notes on the sheet with Dismiss at
+   its foot, no box, and Dismiss closes it.
+3. **Once.** Exit Grimoire and start it again: the Library opens alone. settings.ini still has
+   `whatsnew_hide=1` and `whatsnew_seen=2.0.0`.
+4. **The bat opens them again.** A tap on the bat, or on the name Grimoire beside it, opens the card every time.
+5. **The card ends at a whole item.** Upright, 2.0.0's notes should all fit, the Ko-fi paragraph whole above the
+   signature. Sideways, the card ends with a whole bullet (no line of a bullet or paragraph left hanging) and
+   the signature under it; Read all has the rest. Note any card that ends mid-sentence.
+
+## 2.0.0, lasso drag
+
+A drag of a selection follows the pen whatever it holds (the owner, 2026-11-05: "the copy paste lasso function
+is horrifically slow on drag with anything containing colored in or multiple strokes"). A pen sample only notes
+the newest place; the outline is drawn there once the panel has finished the last fast refresh (about five times
+a second at room temperature) or at once when the pen stops; the box moves only once the pen has strayed 1 mm
+from where it came down (a tap that wobbles is a tap); the bar goes for the drag, by a fast refresh of its rect at
+the first step, and comes back at the lift; after that only the outline's strips are refreshed, each a DU of its
+own, and no ink or halo is drawn while the box moves. The lift is unchanged; a sleep in the middle of a drag
+cancels it. The automated checks: editor.rs `a_drag_draws_at_the_tick_never_at_a_sample` (samples draw and
+refresh nothing; the tick shows the newest place, the bar away, the screen what compose makes of it; no other
+show before 120 ms while the pen moves; Back in the middle; a lift at a place never shown moves the ink by
+exactly that place, one step; a wobble of a pixel is a tap; a drag whose lift was lost is ended by the next
+down, which presses no button of the bar it had taken away),
+`tests/scenarios/z_lasso_19_drag_dense.qs` (a generated page with the owner's page's statistics, 12 Pencil
+strokes of 9,852 points coloured in: copy, paste 3 mm off over the originals, then 60 samples at once are one show
+of nine DU, the bar's and the strips', 60 more one show of eight strips, then 200 samples 4 ms apart; the ink
+walked only for the first move's four strips; the lift's refresh, box and undo as before),
+`tests/scenarios/z_lasso_20_drag_live.qs` (the same with Live view on: its frame equals the screen after every
+step), `tests/scenarios/z_lasso_21_drag_sleep.qs` (a tap that wobbles a pixel moves and refreshes nothing; a
+sleep in the middle of a drag wakes to the box at its place with its bar, nothing moved; a drag after it as any
+other) and `tests/scenarios/z_refresh_4_select.qs` (the whole way drawn again in grays at the lift). Each drag
+logs `lasso: drag samples=N shows=N px=N inked=N copy=1` in grimoire.log, before its `lasso: move` line: copy=0
+says there was no memory for the drag's copy of the screen (each show then composes its strips, slower on a
+heavy selection).
+
+On the owner's Scribe, his notebook "Seyes", page 5 of 6 (the colored-in hexagons, Hexagon paper), upright, at
+room temperature first:
+
+1. **Copy, paste, drag, Live view off.** Select, lasso the hexagons, Copy, Paste: the copy lands 3 mm off over the
+   originals, selected. Put the pen down inside the box and drag it slowly across the page: the bar goes as the
+   box starts to move; the dotted box follows the pen in small steps, a few a second, and is under the pen
+   whenever it stops; the hexagons and their dotted halo stay where they were. Where the bar was, the page shows
+   in black-and-white dots (its rect's one fast refresh, at the first step) until the lift; elsewhere the hexagon
+   lines stay gray but for thin traces where the box's edges passed (beta.2 turned a band as wide as the bar and
+   as tall as the box and the bar together to black-and-white dots, again at every pen sample); nothing else on
+   the page flickers. Lift: the dots and traces turn gray again, and about half a second later the hexagons
+   appear at the new place with their grain and the bar comes back under the box. A drag of a few seconds
+   leaves no Clean flash after it (several in a row may add up to one, at a pause, as erasing does). Undo puts
+   them back over the originals in one step.
+2. **Fast and back.** Drag quickly in a wide circle and lift near where you started: the box keeps up (it may
+   jump further between steps, never behind the pen), and the lift moves the hexagons by as much as the pen
+   lifted from where it came down (a pixel or two), the bar back, one undo step. Drag a few centimetres and stop
+   without lifting: the box settles under the pen at once.
+3. **Grimoire.log.** For each drag, `lasso: drag samples=... shows=... px=... inked=4 copy=1`: shows about five
+   for each second of dragging, px about 13,000 a show (on this page) after the first's about 225,000 (the bar),
+   inked 4 (the halo drawn only where the first move took the outline away; more only when something else
+   redrew the page during the drag). The log's `display: fast timing`
+   lines during the drag should read a copy of well under 1 ms (2.0.0-beta.2: about 11 ms). Note the
+   `lasso: move ... src_ms=... dst_ms=...` (beta.2: 263 and 290 ms here; unchanged by this).
+4. **Live view on.** Pair a browser and repeat 1 and 2: the browser shows the box stepping with the Kindle's,
+   no bar during the drag, the hexagons moved at the lift; the Kindle's drag feels as it did with Live view off.
+5. **A tap, Back, sleep.** Tap inside the selection, as a hand taps, a little wobble included: nothing moves,
+   the bar stays, no undo step. Put the pen down inside it and move it slowly: the box starts to move once the
+   pen has gone about 1 mm. Start a drag and, without lifting, press Esc on a paired keyboard (or a button bound
+   to Back): the selection ends, the box and the halo go, nothing moved. Start a drag and, without lifting,
+   press the power button; wake the Kindle: the box is back at its place with the bar under it, nothing moved,
+   and the bar's buttons work where you see them.
+6. **Big and light.** Lasso a whole paragraph of writing (most of the page) and drag it: it follows the pen the
+   same, the refreshes only along the box's edges after the bar's at the first step. Lasso three words of
+   ballpoint and drag: the same feel.
+7. **A link.** Lasso ink with a link area and drag it: its dashed area moves with the box, and the link goes
+   with the ink at the lift.
+8. **Cold.** If the Kindle is cold (below about 15 degrees), note the steps: fewer a second (the panel's slower
+   refresh paces them), still under the pen when it stops.
+
+## 2.0.0, Live view toolbar (issue #16)
+
+The toolbar stays in Live view's browser while a menu is up on the Kindle (issue #16, reported by nebuff:
+"Toolbar disappears in live view when a popup menu (settings, display settings) is opened then comes back after
+closing menu, Only happens when a setting was changed inside of that menu"). The toolbar's layer used to go
+whenever one of the notebook's menus opened (Display, Paper, Templates, Custom music, the tool picker over the
+toolbar, Find, the Links bar); now it holds what the Kindle shows where the toolbar is, the toolbar and any part
+of a menu over it. The automated checks: `tests/scenarios/y_live_toolbar_menus.qs` (in the simulator: the
+Display sheet and the Paper sheet beside the toolbar, the brightness dragged, a box ticked and the colors
+inverted, the Display sheet over the toolbar's top, then Settings with a row changed, its Display sheet and the
+style; the browser's picture of the toolbar's rect against the simulated panel each time, and the Kindle's own
+refreshes as before) and the editor's unit test `the_live_toolbar_layer_stays_where_the_panel_is_under_any_menu`.
+What only the Scribe and a real browser can show:
+
+1. **Display.** Pair a browser and open a notebook. Tap the toolbar's Display button: the Display sheet opens on
+   the Kindle and in the browser, and the toolbar stays beside it in the browser, as on the Kindle. Drag
+   Brightness, tick or untick "Swiping past the last page adds a page", then close the sheet and tap Dark mode twice in
+   Settings > Display: the toolbar
+   stays in the browser the whole time (inverted with the rest while the colors are). Tap Done: the sheet goes
+   from both and the toolbar is unchanged.
+2. **Settings.** Tap the toolbar's Settings button: the browser shows the Settings sheet as the Kindle does, over
+   most of the toolbar, and any strip of the toolbar it leaves at its right. Change a row (Rotation, say, and back),
+   open Display from it and drag Brightness, then go back and tap Done: at every step the browser shows what the
+   Kindle shows, and after Done the toolbar is in the browser as before.
+3. **Over the toolbar.** Drag the toolbar to the middle of the page and open Display again: the sheet covers the
+   toolbar's top on the Kindle, and the browser shows the same, the sheet over the toolbar and the rest of the
+   toolbar below it. Change a setting and close the sheet: the whole toolbar is back in both. Drag the toolbar
+   back.
+4. **Other menus.** Open Paper and the tool picker in turn: the toolbar stays in the browser wherever the Kindle
+   shows it. The Pages view and the Graph cover the whole screen on both.
+5. **Show toolbar off.** In the browser's View settings, switch Show toolbar off and open Display: the browser
+   shows the page and the sheet and no toolbar. Switch it back on.
+
+## 2.1.0, What's new by version
+
+The owner's request of 2026-11-06: "The messages have all fit in the popup card, now we do the sensible thing -
+wire read all button to a list of each UNIQUE release note, and allow users to easily browse the changes by
+version - some of them are important". Read all opens the list of every version's notes, newest first, this
+version's marked; a row shows that version's notes whole, with Back to the list; Dismiss closes from anywhere.
+The notes are a file for each version (docs/whatsnew/), dated by CHANGELOG.md's headings.
+
+Automated: about.rs `the_archive_is_newest_first_one_entry_a_note` (versions in version order, numbers as
+numbers: 2.1.0, 2.0.0, rc.10, rc.2, beta.10, beta.2; notes that are the same block for block, line breaks
+aside, are one entry naming both, at the newest's place and with its date),
+`the_current_note_is_this_versions_else_the_newest` (a version without a file, 2.1.0 before its notes, shows
+the newest; the built-in VERSION has its own), `the_built_in_notes_are_the_folders` (build.rs's list is docs/whatsnew/ file for file, the
+released versions' dates are the changelog's, 2.0.0-beta.2 has none), `a_rows_line_is_the_first_heading_or_line`,
+`the_list_holds_whole_rows_a_page_at_a_time` (1, 3 and 40 versions, upright and sideways, Gothic and Classic:
+every row on the sheet above its buttons, as many a page as fit and no more, each version once over the pages,
+the marked row), `the_built_in_list_marks_this_version` and `a_versions_notes_end_with_the_signature_and_go_back`
+(2.0.0-beta.1's letter: the signature on its last page, Back at the foot's left). tests/scenarios/z_about_list.qs
+(the list's three rows, 2.1.0 unreleased, 2.0.0 marked This version with 2026-11-05, 2.0.0-beta.1 with
+2026-11-01; the letter signed, Back to the list; sideways the letter on one page (below); Dismiss from the notes and
+from the list; Enter, Esc (the notes to the list, the list to the card, the card closed), Left and Right; the
+refreshes of each step only the sheet's place), z_about.qs
+(the card as before, then 2.0.0's notes from their row), y_all_screens.qs (the list and a version's notes in
+every language and look: `make l10n-check` finds no Spanish text cut short). The release check's new rule
+was tried by hand on a scratch clone: a missing file, a file with only its title and `{signature}`, a file
+that is 2.0.0's notes again (docs/WHATSNEW.md at v2.0.0) and, after a scratch v2.0.1 tag, 2.0.2's notes the
+same as 2.0.1's each fail; new notes pass; a clone without tags says it could not compare and passes.
+
+On the Scribe (Gothic and Classic, upright and sideways), with a build of this branch (its version is still
+2.0.0, so the list shows 2.1.0's draft notes as unreleased above it):
+
+1. **Read all is the list.** Open What's new from the bat: the card is as in 2.0.0 (2.0.0's notes, the
+   signature, Read all and Dismiss). Tap Read all: the sheet titled What's new lists 2.1.0 (unreleased),
+   2.0.0 (with a black This version mark and 2026-11-05) and 2.0.0-beta.1 (2026-11-01), each with its first
+   line under it (2.0.0-beta.1's letter cut short with "..."). Only the sheet's place redraws, without a flash;
+   the Library's cards around it do not.
+2. **A version's notes.** Tap 2.0.0-beta.1: the letter whole, "Grimoire 2.0.0-beta.1" and its date under the
+   title, the signature and the bat at its end, on one page (2.1.0, Read all fits each version's notes,
+   below). Back at the foot's left returns to the list. Tap 2.0.0: 2.0.0's notes, on one page too.
+3. **Dismiss closes everything**, from the list and from a version's notes; the bat opens the card again.
+4. **Sideways** the list and the notes fit, the rows whole, the date at the right.
+5. **A keyboard** (shortcuts on): on the card Enter opens the list, Enter again 2.0.0's notes (one page:
+   Right and Left do nothing); Esc goes back to the list, Esc again to the card (only where the list and the
+   card are redraws, without a flash), and Esc on the card closes it.
+6. **Spanish** (Settings > Language): the list's mark reads Esta versión and 2.1.0's date sin publicar; Back
+   reads Volver. Japanese shows those two words in English until they are translated.
+
+## 2.1.0, Read all fits each version's notes
+
+The owner's decision of 2026-11-07: "The read all doesn't need text that big -- either smaller text for all
+past messages, or fit all (which i lean toward)". A version's notes are set whole on the sheet, in the
+orientation in use: since the review that followed (2.1.0, Read all set closer, at the end) closer first at
+44 px, then smaller in half pixels; the floor is 34 px, the size the card sets the same notes in, below which
+notes would take pages again (none do). The sizes and the leading on the Scribe:
+
+| Notes | Gothic upright | Gothic sideways | Classic upright | Classic sideways |
+|---|---|---|---|---|
+| 2.1.0 (draft) | 44 px, 1.3 | 44 px, 1.3 | 44 px, 1.3 | 44 px, 1.3 |
+| 2.0.0 | 44 px, 1.19 | 43 px, 1.3 | 44 px, 1.3 | 41.5 px, 1.15 |
+| 2.0.0-beta.1 | 44 px, 1.3 | 43 px, 1.3 | 44 px, 1.3 | 44 px, 1.3 |
+
+All on one page. Gothic's text face draws whole design pixels, so its 43 px text is the same size as its 34 px
+text, the card's; at 44 px, even at the closest leading, 2.0.0's notes and the letter take two pages sideways
+there.
+
+Automated: about.rs `every_note_fits_one_page_upright_and_sideways` (each note in docs/whatsnew/, upright and
+sideways, Gothic and Classic: one page, signed, no page arrows, set as note_fit sets them, and the sheet clear
+of the Library's top bar and pager or at the margin),
+`a_note_tightens_its_leading_and_gaps_before_its_type_gets_smaller` (a short note keeps 44 px and the look Read
+all always had; bullets enough for two pages at 44 px fit there set closer; more take the largest smaller
+size), `a_note_too_long_for_the_floor_takes_pages_at_the_floor` (90 bullets: 34 px, three to five pages,
+the arrows between Back and Dismiss, the signature on the last page alone), `a_sheet_never_cuts_across_the_top_bar_or_the_pager`
+and `a_notes_size_is_found_once_for_each_screen` (the search runs once for a note, an orientation and a look,
+not on a page turn or a redraw). tests/scenarios/z_about.qs (2.0.0's notes: one page, 44 px at the leading 1.19
+upright, 43 px sideways, no arrows), z_about_list.qs (the letter at 44 px upright, 43 px sideways, one page each; 2.1.0's at
+44 px both ways; Right and Left do nothing on notes that fit; the refreshes of each step still only the
+sheet's place, the letter's sheet down to the margin), y_all_screens.qs (2.0.0's notes on one page, upright and
+sideways, in every language and both looks). The shots, before and after, are in the maintainer's lab folder
+(readall-fit-2026-11-07).
+
+On the Scribe, with a build of this branch, in Gothic and in Classic:
+
+1. **2.0.0's notes on one screen.** Open What's new from the bat, Read all, then 2.0.0: every bullet, the two
+   paragraphs and the signature on one sheet, with Back and Dismiss at its foot and no page arrows or "1 / 2".
+   The text reads comfortably at arm's length (upright it is the size it always was, in Gothic a little closer).
+   Turn the Scribe sideways: still one sheet (in Gothic the next size down; in Classic a little smaller and
+   closer), nothing cut.
+2. **The other notes.** Back, then 2.0.0-beta.1's letter: one sheet upright and sideways, signed. 2.1.0's notes
+   at the size they always had.
+3. **No half label.** Sideways in Gothic with 2.0.0's notes, and upright with 2.0.0-beta.1's letter: the sheet
+   reaches down over the Library's page buttons; no part of "Page 1 of 1" shows under its edge.
+4. **The steps still redraw only the sheet's place**, without a flash: a row, Back, Esc, Dismiss as before.
+
+## 2.1.0, Classic fonts
+
+Built for the owner's ask of 2026-11-04 ("Custom font support/More fonts in the classic theme"): in Classic
+the Style row's Font chip opens the Font sheet, with Terminess (the default), Atkinson Hyperlegible Next, Noto
+Sans and Literata; Done applies, Cancel leaves the font as it was; `font=` in settings.ini; the share pages
+follow (docs/DESIGN.md, Text; docs/BACKLOG.md, Classic fonts (2.1.0), for the choices made for him).
+
+Automated: rust/tests/test_font.rs `families_unchanged` (each family's Regular and Bold at 13 sizes and five
+strings against K_CRC_FAMILIES; Title and Caps are its Bold, FIXED stays Terminess, Gothic ignores the
+family) and `families_fall_back_to_terminess` (Greek in a family's text is Terminess's own pixels, Japanese is
+DotGothic16's); the first table, Terminess's, and rust/tests/test_golden.rs unchanged; font.rs `the_face_table`
+(ids, files, scales, a family past the list is Terminess, `font_with_family` puts the font back, kerning);
+test_store.rs `font_key` (Terminess without the key; each id; `font=comic-sans` draws as Terminess and goes back
+as it was through other saves until a font is picked; written after `shape_corner`); test_i18n.rs (every
+translation's letters in each family's own Regular and Bold, Japanese's aside; the rare notices, the Links
+bar, the gestures, the pen labels and the raw labels fit in each font); test_httpd.rs (each family's files
+served with their license; the Classic pages load the font in use, Terminess for the studio's command line);
+tests/package_check.sh (each Classic font's OFL text in app/licenses; the binary under 11 MB and the zip
+under 6 MB, since 2.1.0-beta.2); tests/scenarios/y_fonts.qs (the chip opens the sheet on the font in use; a tap highlights and
+applies nothing; Cancel and Esc; Done applies and saves; Gothic has no chip), z_fonts_kept.qs (the font
+outlasts a restart) and y_fonts_unknown.qs (an unknown value kept); make l10n-check (every screen in English
+and Spanish in each font, `classic-atkinson`, `classic-noto-sans`, `classic-literata`, with the fit check, and
+tests/l10n/fonts.qs, the Font sheet in every language and font, upright and sideways); about.rs
+`every_note_fits_one_page_upright_and_sideways` in each font too (each version's notes on one page, upright and
+sideways, as set for that font: 2.0.0's sideways 44 px at the leading 1.23 in Atkinson, 1.27 in Noto Sans and
+1.22 in Literata, 41.5 px at 1.15 in Terminess) and `a_notes_size_is_found_once_for_each_screen` (a font picked searches again,
+once; Gothic ignores Classic's font).
+
+On the Scribe (a 2022 or 2024 Scribe, with a build of this branch):
+
+1. **The sample page on e-ink.** Copy the plan's fonts sample page (`fonts-sample-1860x2480.png`, one Scribe
+   page of the candidate fonts drawn as Grimoire draws text) into `grimoire/photos` over USB, then in a scratch
+   notebook open Paper > Photos... on a new page and pick it. At 1:1, judge Atkinson Hyperlegible Next, Noto
+   Sans and Literata against Terminess, regular, bold and small, and each block's third line, drawn as a fast
+   refresh shows text (no grays). (The page draws them a little smaller than the app now does: x1.05, x1.0
+   and x1.12 there, x1.10, x1.065 and x1.15 here.) Say if another of its fonts (Inter, Fira Sans, Source
+   Serif 4) should take one's place.
+2. **Pick each font.** Settings in Classic: the Style row reads "Style (Classic)" with "Font:
+   Terminess" in a chip at its right end; a tap left of the chip still changes the style. Tap the chip: the
+   Font sheet, Terminess highlighted and checked. Tap each family: only the sample and the two rows redraw,
+   without a flash, and the sample's name, sentence and digits are in that family. Done on Atkinson: one full
+   refresh, and Settings, the Library, a notebook's menus, the toolbar's sheets and the keyboard are in it;
+   the chip reads "Font: Atkinson". Then Noto Sans and Literata the same way, upright and sideways. Cancel and
+   Back change nothing. Restart Grimoire: the font is still the one picked. Switch to Gothic: no chip, the
+   pixel type as before; back in Classic the font picked is still there.
+3. **Thin strokes under the fast refresh.** In each font, type a notebook's name on the keyboard (its text
+   line draws with the fast refresh) and turn a slider in Pen feel: no letter should break up or vanish while
+   it updates, Literata's serifs and Atkinson's thin joins included. Say which, if any, reads poorly.
+4. **What never changes.** A page with Cornell paper and a music page: the headings and clefs are as before
+   in every font, and so are the clock and battery corner, the icons, a mirror PDF and a shared PNG.
+5. **Spanish and Japanese.** Settings > Language > Español: "Fuente: Atkinson" in the chip, "Fuente" over the
+   sheet, the sentence "La cigüeña tocaba el saxofón detrás del palenque de paja."; nothing cut short in any
+   font. In 日本語 the kana and kanji stay DotGothic16 in every font; the chip, the sheet's title and its
+   sentence show in English until they are translated.
+6. **The share pages.** With Noto Sans picked, open Share and the address in a browser: the Library list and a
+   notebook's page are in Noto Sans (Literata, Atkinson the same when picked before Share opens); the Effects
+   studio's command box stays in Terminess. With Live view on (it keeps the server up across screens), pick
+   Literata in Settings > Font and Done, then reload the Library list in the browser: it is in Literata; switch
+   the style to Gothic and reload: it is in Gothic's pixel type.
+7. **KOReader unaffected.** With the KOReader patch on (Settings > KOReader), open KOReader: its menus are in
+   Terminess as before, whatever font Grimoire's Classic uses, and Open this book and the Grimoire plugin work
+   as in 2.0.0.
+8. **What's new in each font.** In Terminess, open What's new from the bat, Read all, then 2.0.0, sideways:
+   one sheet. Dismiss, pick Literata (Settings > Font, Done) and open 2.0.0's notes sideways again: still one
+   sheet, every bullet and the signature, no page arrows. The same in Atkinson and Noto Sans.
+
+## 2.1.0, Read all set closer
+
+The owner on Read all's notes, 2026-11-07: "The note reading itself isn't polished enough". A review of the fit
+above found five things, fixed here: in Gothic, 2.0.0's notes dropped to the card's type with 122 to 127
+characters a line over 1095 of the 1940 px the sheet has upright; a size found in one of Classic's fonts was
+kept for another (already fixed with Classic fonts: the font is in the key); at a dpi other than 300 every
+Gothic note took two pages, the second with only its last row; a word wider than the sheet (a link, or
+Japanese, which has no spaces) was cut with "..."; Read all's list of 6 versions sideways (9 upright) ended
+across the Library's pager. Besides: a shrunk note's bullets were smaller than the card's beside the same type;
+in Classic sideways 2.0.0's fitted sheet started across the top bar's buttons; the card sideways in Gothic
+covered the pager's left button and the P of Page 1 of 1. Now notes are set closer before they are set
+smaller: at 44 px the leading tightens from 1.3 to at least 1.15 and the gaps to at least 60% of theirs; only
+then does the size step down, and a step down gives its room back to the leading, up to the usual look (sizes
+and leadings in the table of "Read all fits each version's notes", above). The list's sheet is kept off the
+pager as a note's is; a sheet that would start across the top bar's buttons starts at the margin above them,
+as the tallest does; the card ends above the pager (sideways it shows 2.0.0's nine bullets, the paragraphs Read
+all's); a note's bullets keep the card's proportion to the type (1.29 times the card's beside Classic's 44 px
+text, 1.5 times beside Gothic's, whose 44 px type is that much taller); wrap breaks a too-wide word between its
+characters and Japanese or Chinese between any two; and the sheet's edges and title are measured as ui_sheet
+draws them (ui_sheet_inner).
+
+Automated: about.rs `a_note_tightens_its_leading_and_gaps_before_its_type_gets_smaller` (the tightest look:
+leading 1.15, gaps 60%, the type and the rest as they were; bullets enough for two pages in the open look fit
+at 44 px a few steps closer, no step more open fitting; more than the tightest holds take the largest smaller
+size, as open as fits, in Gothic the card's type in the open look), `every_note_fits_one_page_upright_and_sideways`
+(each note, each look and font: the largest size whose tightest look fits, the most open look that fits there),
+`a_sheet_never_cuts_across_the_top_bar_or_the_pager` (every body height, and the list of 1 to 40 versions: the
+sheet starts below the top bar's buttons, where sheet_rect put it, or at the margin above them, and ends above
+the pager or at the margin under it),
+`the_sheet_has_the_body_it_was_measured_for_at_any_dpi` (320, 250, 212 and 167 dpi: ui_sheet's inside is what
+sheet_chrome says, and every note that fits at all takes one page), `a_bullets_dot_keeps_the_cards_proportion_to_its_text`,
+`a_word_wider_than_the_sheet_is_broken_not_cut` (a link and a Japanese paragraph at 44 and 34 px, upright and
+sideways: every line within the sheet, nothing lost, no line starting with a closing mark),
+`the_card_ends_at_the_last_block_that_fits_whole` (the card above the pager) and
+`a_notes_size_is_found_once_for_each_screen`. tests/scenarios/z_about.qs (the card sideways: 9 blocks; 2.0.0's
+notes 44 px at the leading 1.19 upright, 43 px at 1.3 sideways), z_about_list.qs (`library.about.lead`) and the
+new z_about_classic.qs (2.0.0's notes in Classic: 44 px at 1.3 upright, 41.5 px at 1.15 sideways, the step from
+the list refreshing 340 40 1800 1780, the sheet from the margin above the top bar's buttons). The shots, from this head,
+are in the maintainer's lab folder (readall-fit-2026-11-07, with Classic's three new fonts for 2.0.0 upright).
+
+On the Scribe, with a build of this branch:
+
+1. **2.0.0 in Gothic, upright.** What's new, Read all, 2.0.0: the large type, as 2.1.0's, every bullet, the two
+   paragraphs and the signature on one sheet that starts at the top margin and reaches the bottom one. Say
+   whether the closer lines (1.19 against 1.3) read well, or crowded, at arm's length.
+2. **2.0.0 sideways.** In Gothic: the card's type (there is no room for the large one), the usual spacing. In
+   Classic: 41.5 px at the closest spacing, the sheet's top at the margin, not across the toolbar's buttons
+   (only slivers of their frames show above it). Say whether 1.15 is too tight there.
+3. **Bullets.** The diamonds and dots beside 44 px text are larger than before, in the card's proportion to its
+   text; beside the card-size text (Gothic sideways) they are the card's. Say if they look heavy.
+4. **The card sideways** (Gothic and Classic): it ends above the page buttons, which show whole with Page 1 of
+   1; its last item is the ninth bullet, and Read all has the paragraphs.
+5. **Classic's fonts.** In Atkinson, Noto Sans and Literata, 2.0.0's notes sideways keep 44 px, a little closer
+   (1.23, 1.27, 1.22); one sheet each, nothing cut. In Noto Sans, 2.0.0-beta.1's letter sideways: its sheet
+   starts just under the toolbar's buttons, the bat and every button whole above it, and reaches the bottom
+   margin; in the other fonts it starts at the top margin, nothing of the buttons cut but slivers.
+
+## Scribe checks: Links bar learning test (2.1.0)
+
+- No application behavior changes. With many notebooks and an empty backlinks cache, open Links before
+  learning finishes: Linked from rows should appear by themselves and still open the right pages.
+- Host check: run `z_links_3_bar_learns` normally and with `GRIMOIRE_SIM_LATE_MS=400`; it should continue
+  as soon as both incoming rows appear. An unknown probe or a never-ready probe must fail the runner.
+- Host check (waitfor): `z_waitfor_script_clock` (`GRIMOIRE_SIM_CLOCK=script`) waits for the update-failed
+  notice to go and passes in about 6 s, as app time moves on while it waits (held still, the notice would
+  stay and the `waitfor` fail at its 60 s bound). A `waitfor` on `display.presents`,
+  `main.longest_unpumped_ms`, `pump.calls`, `keyboard.draws` or `fshape.fired` fails at once with "waitfor
+  cannot wait on KEY, which starts again when read". Nothing to check on the Scribe.
+- Host check (the slow runner): `z_links_3_bar_learns` runs with `GRIMOIRE_SIM_BACKLINKS_STEP_MS=60`, so its
+  backlinks check takes over 11 s; the same script with the old `wait 9000` in place of its `waitfor` fails
+  (incoming 0, wanted 2). Nothing to check on the Scribe: the slowed check is the headless runner's only
+  (the Kindle build has none of it).
+- Host check (a touch held across a `waitfor`): docs/SIM.md's `touch down/move/up` row names `waitfor` with
+  `waitbg` and `hold` as reading the clock again, so `touch down`, `waitfor ...`, `wait 300`, `touch up` is a
+  press as long as the `waitfor` and the `wait` took; the unit test
+  `a_waitfor_hands_a_held_touch_back_to_the_clock_as_the_docs_say` pins the stamp and the row. Nothing to
+  check on the Scribe.
+
+## 2.1.0, a cleared page's old picture
+
+Found by a review on 2026-11-07 and confirmed by two reproductions: in every 2.0.0 beta, 2.0.0 and 2.0.1 (since
+the kept drawings of 2026-10-31), a page with a current kept drawing (`.page-previews/pN.full`: kept after a slow
+open, or by the previews job for a dense page) showed its old picture after Clear page or a new paper, template
+or photo, and the idle save kept that picture, with the Pages preview and the Library card made from it. The page
+files were right. Automated: tests/scenarios/z_keep_ghost_1_clear.qs, _2_paper, _3_template (a template the
+notebook has already), _4_photo (likewise), _5_redo (Redo of a Clear that took a link away) and _6_job (a drawing
+the previews job kept, at the editor's own threshold): after the change the page is pixel for pixel its strokes
+drawn afresh (`editor.live_matches_render`), and after the idle save, a page turn and an open of the notebook
+again so are the kept drawing, the Pages preview and the Library card (`editor.kept_matches_render`,
+`editor.preview_matches_render`, `editor.card_matches_render`, new probes: docs/SIM.md). Each fails on 2.0.1 (9
+or 10 of its checks), and so does editor.rs `a_kept_drawing_stands_for_the_page_only_while_the_page_is_its_file`
+(a page changed in memory, a new paper and Clear page each drawn from the strokes, and "Loading page..." due for
+a changed slow page), with any one of the fix's three parts put back.
+
+On the Scribe, with a scratch notebook (never one whose pages matter):
+
+1. **A dense scratch page.** Make a notebook, Scratch. In the Pages view of a notebook with a dense page (one
+   that says "Loading page..." as it first opens: the stress pages do), tick it and Copy to notebook... Scratch;
+   in Scratch's Pages view drag it before the blank page 1, so that the Library card shows it. On Scratch's other
+   page pick a template, then a photo, so that the notebook has both. Open the dense page and wait until it
+   shows, turn to the other page and back: it now comes up at once, with no "Loading page..." (its drawing is
+   kept).
+2. **A new paper.** Pick another paper: the whole page is drawn on it (seconds on a dense page, with nothing said,
+   as for any page drawn whole; 2.0.1 was at once, and showed the old paper). Wait 3 s, turn away and back
+   ("Loading page...": drawn, and its drawing kept), and again: on the new paper each time, the second time at
+   once. The same with the template, and with the photo (from the Paper sheet's More papers... and Photos...).
+3. **Clear page.** Clear it: the page goes blank at once (2.0.1 kept all the old ink on the screen, with Undo and
+   Clear greyed out). Wait 3 s, turn away and back: blank. Undo: the ink comes back (drawn whole: seconds on a
+   dense page); Redo: blank again. Wait 3 s, go to the Library: Scratch's card is blank; open Scratch: the page is
+   blank, and so is its tile in the Pages view.
+4. **Nothing else is slower.** A dense page that has not changed still comes up at once from its kept drawing,
+   on page turns and as the notebook opens.
+
+## 2.1.0, drawings kept by 2.0.0 and 2.0.1 set aside
+
+The fix above keeps no new old picture, but 2.0.0 and 2.0.1 may have kept some on the owner's Scribe and others'
+under a valid stamp (a cleared page's old ink, the old paper of a page given a new one). Nothing in such a tag
+tells it from a true one, and there is no exact check short of drawing the page, so 2.1.0's kept drawings carry
+their own version (`|k2`, store.rs RENDER_TAG_VERSION) and none of the earlier ones is read: every page that kept
+a drawing is drawn once more at its next open, and keeps its drawing again. Drawing such a page whole from its
+strokes, nothing unsaved and its picture there (as it opens, or as the Links bar or "Back to page N" stays on it),
+the editor removes the old drawing, current for the page file or not, and makes the page's Pages preview, and for
+page 1 the Library card, again from what it drew; the Pages view decodes that preview again (a tile goes by its
+preview file as well as its page file: kept by its page file alone, a tile of the old preview stayed until
+Grimoire was started again); the previews job keeps no drawing of its own over an old one. A page or notebook not
+opened since keeps its old preview or card (docs/BACKLOG.md). Automated: tests/test_render_keep.rs
+`drawings_kept_by_2_0_1_are_never_read_and_retired_once` (2.0.1's tag, layered or not, is never read; it is
+retired once, stamp and drawing, current for the page file or not; this build's never, nor a later version's; the
+test calls done() now, so a failed check fails it), bgjob.rs `a_preview_written_again_is_decoded_again` (a preview
+written again over the same page file is decoded again), editor.rs
+`a_drawing_kept_by_2_0_1_goes_with_the_preview_and_card_made_beside_it` (a cleared page with 2.0.1's ghost drawing,
+preview and card: drawn from its strokes, the drawing gone, the preview and the card made from the page drawn),
+`a_stale_drawing_kept_by_2_0_1_goes_with_the_preview_and_card_made_beside_it` (the same with a word written after
+the Clear, the drawing no longer current) and `a_drawing_kept_by_2_0_1_goes_as_the_links_bar_stays_on_its_page`,
+and the scenarios on tests/previews_fixture.py's "ghosts" notebooks: z_keep_ghost_7_pages (the Pages view's tile
+of page 1 shows the old ink, then, the page opened, the page drawn, at the view's next open and the notebook's),
+z_keep_ghost_8_stale (a page written on after the Clear: its preview and card made again),
+z_keep_ghost_9_job (the same on a dense page whose preview the previews job made first: the page is drawn from its
+strokes as it opens, and the card made again) and z_keep_ghost_10_bar (a page stayed on from the Links bar: its
+preview made again, and its tile). They fail without the version, and without their part of the retirement: the
+Pages view's tile check (z_keep_ghost_7, the bgjob test), retiring a drawing not current (z_keep_ghost_8 and _9,
+the stale editor test, test_render_keep), the job's (z_keep_ghost_9: the page opens from the job's drawing), the
+Links bar's (z_keep_ghost_10, the Links bar editor test).
+
+On the Scribe, with Scratch (2.1.0, a cleared page's old picture, step 1):
+
+1. **Ghosts from 2.0.0 or 2.0.1.** With 2.0.0 or 2.0.1 installed, open Scratch's dense page 1 until it comes up
+   at once, Clear it, wait 3 s, turn to page 2 and back (the old ink is back), turn to page 2 again and go to the
+   Library: Scratch's card shows the old ink. Make Scratch 2 with a dense page 1 as Scratch was made, open it until
+   it comes up at once, Clear it, wait 3 s, write a word at once (within 30 s of the Clear), wait 3 s and go to the
+   Library from page 1: Scratch 2's card shows the old ink and the word.
+2. **After the update.** Install this build. Both cards still show the old ink. Open Scratch (it opens on page 2)
+   and the Pages view: tile 1 shows the old ink too (page 1 has not been opened since). Double-tap tile 1: blank.
+   Open the Pages view again: tile 1 is blank. Go to the Library: Scratch's card is blank. Open Scratch 2: page 1
+   shows the word alone; go to the Library: its card shows the word alone.
+3. **Every kept page is drawn once.** A dense page not cleared says "Loading page..." the first time it opens
+   after the update (on the stress pages, about 11 s and 28 s), and comes up at once from then on.
+
+## Scribe checks: dense-page revisits (2.1.0)
+
+Automated: editor.rs `dense_written_from_blank_keeps_its_drawing_once_quiet_or_left_and_never_twice_in_a_window`
+(the idle save makes the preview and no drawing; the drawing follows once the window and the quiet time are over;
+Ctrl+S-style saves write the page and no cache, inside the window or out; leaving writes the drawing at once and
+only if it is not current; nothing is written twice; a partial canvas or a white picture keeps nothing),
+`pending_caches_run_no_autosave_while_they_cannot_be_made` (editor_tick's autosave for the caches alone: not while
+the canvas is not whole, its picture is white, or the page is read-only), `closing_keeps_an_unchanged_library_card_...`
+(a card of no known source is drawn again, from the strokes; a card noted as drawn from page 1 as it is stays),
+and the scenarios z_dense_first_revisit (a page left before its idle save), z_dense_saves_1_explicit (Ctrl+S and
+the Pages view write no drawing; leaving does), z_dense_saves_2_quiet (the idle save keeps the drawing only after
+the quiet time: GRIMOIRE_CACHE_WINDOW_MS shortens the 30 s), z_dense_card_stale (a card stale at the open is drawn
+again at the close from another page), and z_dense_leave_1_clear to _4_photo (Clear page, Undo, a new paper, a
+template or a photo, the page left or the notebook closed at once: the drawing kept, the Library card and the page
+read back are of the page as it is, never of the old picture). The z_keep_ghost scenarios that check the preview
+after an idle save run with the window at 0.
+
+1. From blank, write a page past 512 KB without opening Pages. Turn away at once, after the last stroke, and
+   back: the first revisit reads its kept drawing without a long Loading page notice. Compare all ink with the
+   page before. Repeat after pausing 2 seconds before the turn (the drawing is made at the turn, not at the
+   pause).
+2. Write in bursts with pauses of a few seconds for a minute, pressing Ctrl+S now and then, and open the Pages
+   view once: nothing is slower at the pauses or the presses. Stop writing for 30 s: the drawing is made then
+   (a short stall at most), and again only after more writing. Leave the page: its final changed drawing is
+   kept at once, and its next open shows every stroke. No cache is written on a reopen or a save with no change.
+   Check undo, redo, an image paper and floors as well.
+3. Open a notebook on another page, change that page and close it. Its existing page-1 Library card should
+   remain and closing should be quick. Edit page 1, leave it, edit another page and close: the card should
+   show page 1's new ink without drawing it twice. Reorder a different page into first place and check
+   that the card changes to that page; remove its caches and check the fallback draws the right card. A
+   notebook whose card was made by an older version has its card drawn again from page 1's strokes at its
+   first close from another page (seconds on a dense page), and not at the next.
+4. The PDF mirror still draws strokes (not done: docs/BACKLOG.md).
+
+## 2.1.0, L0 foundations
+
+Built for the 2.1 plan's lane L0 (the shared pieces every later 2.1 lane reuses; docs/DESIGN.md, Shared
+building blocks): one hold time (`ui::HOLD_MS`), one popout's place (`popout_place`), the staying notice
+(`app_notice`, with KOReader's book progress on it), one name order (`name_cmp`), a read-only storage layer
+(`fsview.rs`) and the Library reading each notebook.ini once. Nothing else should look or behave differently.
+
+Automated: rust/tests/test_ui.rs `every_hold_reads_hold_ms`; rust/tests/test_popout.rs (the long-press card's
+placement cases, avoid lists, sideways, no panel, and `the_link_card_places_as_it_did`, the same rect as
+2.0.0's `linkcard_place` for 190,000 cases); app.rs's notice tests (a redraw only for a new text and at most
+every 2 s, none counted, `App.screen` unchanged after a clear, a toast over it and back, each key on its
+screens, a 400-page book and a 10-minute import making no Full); store.rs `names_fold_accents_and_count_numbers`;
+rust/tests/test_fsview.rs (the hostile tree); library.rs `a_reload_reads_each_notebook_once`; the link card,
+count pad and book scenarios unchanged.
+
+On the Scribe:
+
+1. **A long book from KOReader.** In KOReader, open a PDF of 100 pages or more and use Open this book in
+   Grimoire. "Adding book pages: N of M" stays at the bottom, in the toast's place, its number changing about
+   every 2 s; the screen never flashes whole while it counts, and the editor opens on the reader's page with
+   "Added M book pages." as before. Say if 2 s between numbers feels too slow.
+2. **The long-press card where it was.** Hold a link near each edge of a page, upright and sideways, with the
+   toolbar panel on the left and then on the right: the card opens beside the link's border as in 2.0.0, off
+   the panel, never over the clock corner or the link. From a Links bar row it opens above the bar as before.
+3. **Holds unchanged.** Paste in Select, a link, a Library row, a page in the Pages view (its card, and a drag
+   after the shorter hold) and a Links bar row each still need the same 0.6 s hold.
+4. **The Library as before.** With many notebooks in several folders and subfolders: the Library opens,
+   changes folder and closes its sheets showing the same notebooks and folders as 2.0.0, and the Move to
+   folder list and the share page's folders are the same.
+
+## 2.1.0, L2 folders that meet
+
+On the Scribe, in a copy of a Library with folders:
+
+1. **Move onto a name.** Make folders A and B/A (B holds a notebook "Notes", A one too). Open B, the menu of
+   B/A, Move folder, Library (top level): the sheet "A folder named "A" is already there." opens with three
+   rows and no toast. Cancel changes nothing.
+2. **Merge into it.** The same, Merge into it: A holds both notebooks, the one that clashed named "Notes 2";
+   B's A is gone; a notebook's PDF under grimoire/PDFs follows its folder and name (the folder A in PDFs holds
+   both). Reopen Grimoire: nothing moved back.
+3. **Keep both.** The same, Keep both (as "A 2"): the folder is "A 2" beside A, its notebooks as they were.
+4. **Rename onto a name.** Rename a folder to the name of another at its level: the same sheet. Upright and
+   sideways, and in Spanish, the title and rows fit on one line each.
+
+## 2.1.0, L1 quick sizes
+
+Built for the 2.1 plan's lane L1: hold a pen on the toolbar for a card of its sizes (docs/DESIGN.md, Quick
+sizes). Automated: quicksize.rs's unit tests (the table, apply keeping the ratio, repeatability, labels, placement, the five-chip layout), test_store.rs `settings_upgrade_quick_size_pairs`,
+test_format.rs `quick_sizes_round_trip`, scenarios z_qsize_1 to z_qsize_6, every card in y_all_screens (upright
+and sideways, English, Spanish and Japanese, Gothic and Classic), y_menus_over_panel.
+
+On the Scribe:
+
+1. **600 ms with a finger and with the nib.** Hold a pinned pen, the eraser and the tool button (while it shows
+   a pen) for a moment: the card opens as you pass 0.6 s, level with the button and beside the toolbar, never
+   over the button or the clock corner. Does 0.6 s feel right with each? A quick tap still just picks the pen.
+2. **The hold picks the pen.** After the hold that pen is the one in use (the toolbar shows it); the lift does
+   not go back to the pen before the eraser and does not open the picker.
+3. **Slide to pick.** Keep the nib (or finger) down after the card opens, slide onto a size and lift: it is
+   picked. Lifting without moving picks nothing and the card stays; sliding off every size and lifting leaves it
+   open.
+4. **Tap to pick, tap elsewhere to close.** Tap a size: the card closes and the next stroke has that width (the
+   old strokes keep theirs, Undo takes the last stroke, not the size). A tap on the page or another toolbar
+   button only closes the card; the pen's down outside closes it and leaves no ink; the clock corner still toggles.
+5. **No residue.** Slide over the sizes back and forth and lift on none: no grey ghost of a size left behind, no
+   flash of the page. Opening and closing each take one refresh.
+6. **Look.** The samples read well in Gothic and Classic, white ink shows white on black, the eraser shows rings
+   (the 12 mm ring is cut by its box) and its Whole strokes / Precise row changes the eraser's mode and keeps the
+   card open. There is no Pen feel chip (Pen feel is in the tool picker and Settings).
+7. **The tip.** On a fresh settings file, open Pen feel from the toolbar once: "Hold a pen on the toolbar for its
+   sizes." once, and not again.
+8. **Sizes survive.** Pick a size, leave the notebook and Grimoire, come back: the width is kept, and Pen feel's
+   Max width shows it.
+9. **Live ink on the largest sizes.** With tools/bench-ink.c (docs/INK-PERFORMANCE.md) on charcoal 2 mm, marker
+   2.8 mm, highlighter 8 mm and the eraser's 12 mm: does live ink keep up? A size whose ink lags is to go.
+10. **Live view.** With Live view on, a pen on the card draws no fast ink; after a pick the next stroke's live ink
+    has the new width.
+11. **Five chips on each tool, no Pen feel chip.** Hold every pen and the eraser: five sizes each (the ISO series
+    for the pens, 1, 2, 4, 8 and 12 mm for the eraser), nothing else on the card but the eraser's mode row.
+12. **A tuned range survives a pick.** In Pen feel set a pen's minimum width well under its maximum, then pick a
+    size on its card: the maximum is the chip's, the minimum has scaled with it (Pen feel shows both), and
+    pressing lightly still gives the thin line.
+13. **After the update.** Update from 2.0.x with pens left at their factory widths: they are on the new
+    widths (pencil 0.13 to 0.35, fineliner 0.25, highlighter 5.6, eraser 2.86 to 8 mm) and the lit chip is the
+    middle or an end one as expected; a pen whose width you had changed is exactly as you left it.
+
+
+## 2.1.0-beta.1
+
+The first 2.1 beta: everything in CHANGELOG's 2.1.0-beta.1 section. Automated: the full gate on the release
+commit with the pinned toolchain. On the owner's Scribe: not yet checked; the sections above list each
+feature's device checks (Read all fitting each note, Classic fonts, the kept drawings and dense-page revisits,
+L0, the merge dialog, quick sizes). The What's new note is a draft the owner vets on the device.
+
+## 2.1.0-beta.2, L4 (document links)
+
+On the Scribe, with the user's planner (or one like it) opened through KOReader's Open this book in Grimoire,
+the plugin and Grimoire of this build (the first Open this book sends the links of the pages Grimoire already
+holds, so it takes a moment longer):
+
+1. **Tabs land on their boxes.** On a month page, tap a day cell and each tab: each goes to its page. Turn on
+   Areas: the dotted boxes sit on the printed tabs and cells, none numbered. A tap just outside a box but within
+   a finger's reach still goes to the nearest.
+2. **Load time.** A notebook whose `doclinks.ini` is at its cap (16,000 links) opens in at most 150 ms of
+   reading it (no log line gives the open time: judge it against a notebook without the file by eye, or by the
+   time to the first page). If it takes longer the plan is to load it in slices after the first page.
+3. **Copy page.** Copy page on a month page of a full planner takes under 300 ms and the copy's tabs work (the
+   10% the import's water level leaves is Copy page's to use); on a planner at the cap itself (16,000 links, or
+   1.5 MiB, or a page already at 1,024) the copy has no tabs and says "Copied without links: couldn't save them."
+4. **The hold arms Select on a month page.** Hold a finger on a day cell: the lasso arms (no card opens);
+   drawing around the writing in the cell picks up the writing and no link; a link you drew yourself there
+   still opens its card on a hold.
+5. **Links bar.** Open it on a month page: your own links as before, then "From the PDF (365)"; it opens as chips
+   grouped by page (six a screen, paged); a tap on a chip looks at its page, a second tap stays; X goes back to
+   the rows, a second X closes. A hold on a chip: a card with Rename the page only.
+6. **Clear and the Graph.** Clear page on a page of tabs and no ink does nothing (the broom is greyed); with ink
+   it clears the ink and keeps the tabs. The Graph shows the notebook with no link of its tabs.
+7. **A 2.0 build** (go back with the update file): the notebook opens, your own links work and are editable,
+   the tabs are not there; updating again brings them back.
+8. **The notebook PDF** (Notebook PDFs in KOReader): the tabs are links in the PDF.
+
+## 2.1.0-beta.2, L9 (the incremental, streamed notebook PDF; every child capped)
+
+On the Scribe, with Notebook PDFs on (Settings), a 400-page planner (or any notebook of a few hundred pages with
+image papers) and `grimoire.log` readable over USB or SSH. The mirror job logs one line when it finishes:
+`bg: export of <id>: N pages, D drawn, T ms, VmHWM K kB`.
+
+1. **First close draws everything.** Open the planner, write one stroke, close it. The line says `D` equal to `N`
+   (every page drawn) and a long `T` (minutes); `grimoire/.cache/pdf/<id>/` now has one `.z` file a page, and
+   `PDFs/<name>.pdf` is whole (open it on a computer: pages, outline, tabs as links).
+2. **One page edited.** Open the planner again, write on one page, close it. The line says `D` 1 and `T` in seconds
+   (the 400 pages' records are read, the one page drawn). The PDF on the computer shows the new writing and is the
+   size it would be from scratch (compare with the first: only the edited page's stream differs in size).
+3. **Memory flat.** In both lines `VmHWM` is within a few MB of each other whatever the page count (it was
+   hundreds of MB on a 2,000-page notebook before); try an import of 1,000 or more pages if you have one. No
+   `Killed` lines in the log, and the Library and the editor never stall while the mirror runs.
+4. **The cache is disposable.** Delete `grimoire/.cache` over USB, close the notebook after a stroke: it is drawn
+   in full again and the PDF is the same. Fill the storage nearly (leave a little more than the notebook's PDF
+   takes, since its temporary file is made beside the old PDF before it replaces it) and close a notebook: the
+   PDF is still made (the log may say `pdf cache: a write failed`); with less room than the PDF takes the old
+   PDF stays and the log says `bg: export of <id> failed`. Free the space and the next close fills the cache
+   again.
+5. **Share downloads.** On the Share screen, download a notebook's PDF and its zip from a computer: the browser's
+   progress bar counts as before (Preparing n of N, then the bytes), the file opens, and the zip's PDF entry opens
+   from the zip. While it runs the Kindle's editor stays responsive. `grimoire/.cache/pdf/` has no `share-*.spool`
+   left after (the file is unlinked at once).
+6. **Colour.** An imported page with colour, in the PDF mirror: still colour (gray pages gray); the Scribe shows it
+   in gray as before.
+7. **The caps.** Over SSH while a big mirror runs: `cat /proc/<pid>/oom_score_adj` of the `grimoire-bg` child is
+   `500`, and `grep 'Max address space' /proc/<pid>/limits` shows its soft limit about 128 MiB above the child's
+   `VmSize` at its start (64 MiB before the fix round: see its section at the end). Opening Share and downloading
+   a PDF: the render child (named `grimoire`, a child of Grimoire) shows `500` and about 128 MiB over its start
+   too. Nothing in the app misbehaves at those ceilings (a very dense page's mirror is the case to watch: it fails
+   with a line in the log if 128 MiB is too tight, and BACKLOG says what to loosen).
+## 2.1.0-beta.2, L5 (the safe loader and the PDF import)
+
+Automated: the unit tests (`rust/tests/test_pdfimport.rs` runs real workers over generated PDFs: pages, colour
+and gray, password, caps, hostile files, a page that kills or stalls its worker twice, resume, duplicates, bands
+against whole pages, the mapping against reading whole, the fit for every rotation and crop, the sandbox
+refusing a step; the fix round's: `test_import_queue.rs` for the scans, the lock and the picks), nine scenarios
+(`z_pdf_*.qs`), `tests/import_check.py`, the strings' fit (`test_pdf_strings.rs`), `cargo deny` and
+`tests/package_check.sh` (every crate in `rust-crates.txt`, the size guard). The crate-date check
+(`tools/check-crate-dates.py`) is run by hand for a tag: it needs the network.
+The tests of the sandbox's real steps (`rust/tests/test_sandbox_linux.rs`, which needs Linux and root) run in the
+CI job `sandbox`, which the gate requires; they first ran as root on 2026-11-10, in a VM. The test file itself has
+not run on a Scribe; the steps have, as they were in 2.1.0-beta.2 (S1 on 2026-11-09, and the imports of the
+section "2.1.0-beta.2" below), and the narrower system-call rules that came after have a check of their own
+("Hardening round (2026-11), sandbox", below). The owner's checks on the Scribe, as written before those runs
+(S1's numbers are in the header of `sandbox::s1`; the plan's values were kept):
+
+1. Copy a real planner PDF into `grimoire/import/` over USB, open Grimoire: "Importing: page N of M" stays at
+   the bottom of the Library and the cards stay usable; at the end the card appears and no toast says so.
+   Time a page from grimoire.log (each slice logs `import: <id>: pages A to B of M in T ms (MemAvailable K MB,
+   N band(s))`), and the worker's memory (`VmHWM` in `/proc/<pid>/status` while it runs: `grimoire --work pdf`).
+2. grimoire.log has `work: sandboxed (uid 62001, chroot, netns, no new privileges, seccomp, selinux ...)` and no
+   `the sandbox refused its step`. If a step is refused, send the log (the plan goes back to the owner, D21).
+   A line `made call N, which the sandbox does not allow` names a system call the allow-list must gain.
+   (Not 240, 192 or 125: see "Hardening round (2026-11), sandbox", below.)
+3. Sleep the Scribe in the middle of a big import: it must not fail (the watchdog counts monotonic time).
+   Quit Grimoire in the middle: the import finishes in the background; start it again and the notice shows the
+   coarse progress; the notebook appears once.
+4. An import across a restart resumes (kill Grimoire's process in the middle, start it: "goes on from page N").
+5. A colour PDF: its pages open in gray, the notebook's storage is larger than a gray one's, and the Library
+   and Pages view stay quick (no memory warning; the slice lines give `MemAvailable`).
+6. A PDF with a broken page (or a copy with one page's content stream damaged): the notebook appears with a
+   blank page and the toast "Imported notebook (N pages). Some pages couldn't be read."
+7. A PDF with a password: "PDF needs a password."; one over 2000 pages: "PDF too long: notebooks hold 2000
+   pages."; the same PDF twice: "PDF already imported."; a file being copied (copy a big one over USB and
+   watch) waits until it is whole.
+8. Does the private mapping of a file on `/mnt/us` work (`import: <id>: the device refuses the private mapping of
+   the PDF` would say not), and what does a 100 MB PDF do to the memory?
+
+
+## 2.1.0-beta.2, the file picker (lane L8)
+
+Run on the Scribe (the headless scenarios z_files_1 to z_files_5 and tests/l10n/files.qs cover the logic):
+
+1. Library > New > From a file...: the picker opens over the sheet with Import, Documents, Downloads (when the
+   folders exist) and All storage, and "Free: X of Y". Back at its root comes back to the sheet; Esc does too.
+2. **Listing and stat timings on a big `documents/`** (a few thousand files): open Documents and read grimoire.log:
+   `files: listed N entries (M usable) in T ms` (counts and timings only, never a name). Note T for the first
+   screen, whether "Loading..." appears (over 1 s), and whether the rows' sizes and dates arrive quickly after.
+   Send the log line and the folder's size. Also a folder of 5000+ files: "Showing the first 5000."
+3. A planner PDF in `documents/`: a tap on it opens its card beside the row ("14.2 MB, Oct 30", Import as
+   notebook, Cancel); the second tap imports it, the Library comes back with "Importing: page N of M" at the
+   bottom, and the card appears at the end. **The PDF is still in `documents/`, unchanged** (check over USB:
+   nothing new in `documents/`, no `.sdr`, no mark beside it; the mark lives in `grimoire/import/.marks/`).
+4. The same PDF again: the row says "has notes" and its card says Open its notebook. A name typed in New
+   notebook's Rename first becomes the notebook's name; without one, the file's name. The sheet's In: folder is
+   where the card appears.
+5. **Plant a symlink over SSH** (`ln -s /mnt/us/documents /mnt/us/documents/loop`, `ln -s /etc /mnt/us/documents/etc`,
+   `ln -s Planner.pdf /mnt/us/documents/Alias.pdf`, and `ln -s /mnt/us/grimoire/notebooks /mnt/us/Downloads/nb`),
+   then open the picker: none of them is listed (not as a folder, not as a PDF), All storage lists no `grimoire/
+   notebooks`, `PDFs` or `trash`, and `grimoire/PDFs/...` cannot be reached by typing a path (there is no field).
+   Does the Scribe's `/mnt/us` take symlinks at all? Say so either way.
+6. A folder of pictures in `documents/` (PNG or JPG, a few): its row says "N pictures"; its `...` (or a finger
+   held on it for 0.6 s) opens a card with Open and Import N pictures as notebook; the notebook appears and the
+   folder is unchanged.
+7. The Import place: a PDF copied to `grimoire/import` while Grimoire runs shows Waiting (until it has held still
+   5 s), then "Importing: page N of M", then the folder `done` says Imported. Look again scans now. No staying
+   notice shows while the Import place is up, and it shows on the Library and on the other picker screens.
+8. A PDF being copied over USB while its row is on screen is "File changed. Try again." if its card's action is
+   tapped after the size changed.
+9. Rotate the Scribe with the picker open: the rows, band and card lay out again.
+## 2.1.0-beta.2, L6 (links and page names from the PDF)
+
+Automated: `rust/tests/test_pdflinks_import.rs` runs real workers over generated PDFs (every destination and
+action kind, the name tree with `/Kids` and the PDF 1.1 `/Dests`, the four Named actions, QuadPoints, out-of-spec
+page numbers, hidden links, the outline in three encodings, loops and depth in the outline and the name tree, a
+200,000-entry name tree, a worker that dies or stalls in the walk, the area of every link on the box drawn under
+it for every rotation, a crop, landscape and A4, the year planner's water level, and a notebook exported by
+Grimoire and imported again), the scenario `z_pdf_9_tabs.qs` (a tab of an imported planner is tapped), the
+records' strictness (`pdfwork.rs`) and the new toast's fit (`test_pdf_strings.rs`). **Not run anywhere: a real
+planner on a Scribe.** The owner's checks:
+
+1. Copy the year planner PDF (the one with its tabs) into `grimoire/import/` over USB and open Grimoire. When the
+   notebook appears, open it: a tap on a month tab goes to that month, a tap on a day goes to the day, the
+   next-page and previous-page links (if the planner has them) work, and the outline's names are the page names
+   in the Index. If the end said "Imported notebook (%d pages). Some links were left out.", the planner has more
+   links than a notebook holds (14,400): the densest pages (the year at a glance) lost the last cells, every tab
+   survived.
+2. Time the import against one without links (grimoire.log, `import: ... N of M pages`): the walk runs once, in
+   the first slice, and adds under a second for a planner of 6,000 links. The log line
+   `document link(s) and ... page name(s); left out: ...` says how many web and other links were left out.
+3. Export a notebook with links and names as a PDF (Share, or KOReader), copy that PDF into `import/` and
+   compare: the same tabs in the same places, the same names.
+
+## 2.1.0-beta.2, L7 (pictures in the sandbox)
+
+Automated: `rust/tests/test_picwork.rs` (real workers: the worker's pixels equal the writer's decode byte for byte,
+a hostile corpus of truncated, enormous and decompression-bomb pictures is refused and the worker lives on, a
+worker that crashes or stalls on a picture fails that picture alone, 70 pictures cross slices, a template whose
+worker dies is marked bad), `test_picwork_fallback.rs` (a forced sandbox failure: pictures decode in the writer
+and the log says so once), and the template, photo and import tests of `test_templates.rs`, unchanged.
+`pictures_decode_in_the_real_sandbox` (in `test_sandbox_linux.rs`) runs in the CI job `sandbox`, as root; what
+has run on a Scribe is in the section "2.1.0-beta.2" below. The owner's checks:
+
+1. Copy a PNG and a JPEG into `grimoire/templates` and a photo into `grimoire/photos` over USB, open New notebook
+   > the template list and a page's paper sheet: they appear with their previews, and one of each still goes onto a
+   page (a template still imports; a photo still comes upright).
+2. grimoire.log has `work: sandboxed (uid 62001, ...)` once a background job that reads pictures (each job is a
+   process of its own; for PDFs it is once a session), and no `pictures decode in the writer` (since pictures
+   fail closed: no `pictures wait`) and no `made call N, which the sandbox does not allow`. If either shows, send
+   the log (the call is added to the allow-list, but for 240, 192 and 125 ("Hardening round (2026-11), sandbox",
+   below); the other line means the sandbox refused a step).
+3. Copy a folder of 20 phone photos (12 MP) into `grimoire/import/<Folder>`: it imports as before; time it from the
+   log (`import: ... N of M pages`) against 2.0.0, and watch `MemAvailable`: the slices are 32 pictures a worker.
+4. Put a broken `.png` (cut a real one in half) in `grimoire/templates`: it is listed as unusable as in 2.0, and
+   Grimoire stays quick; a folder with it among good pictures is refused whole, as in 2.0.
+5. Does a 40 MP JPEG (the cap) still decode on the Scribe within the worker's limits (`PICTURE_AS_MARGIN`,
+   `PICTURE_WATCHDOG_MS` are placeholders)? A refusal says why in the log.
+
+## 2.1.0-beta.2, L10 (your own fonts)
+
+Automated: `rust/tests/test_fontcheck.rs` (real workers: good TrueType, variable and CFF fonts pass with what
+the file says; the malformed-font corpus of `rust/tests/fontfix` gets verdicts and never a dead worker:
+truncations, a cmap past the end, composite glyphs that include each other, CFF subroutines nested past the
+format's ten, a symbol cmap, a web font, letters that draw nothing, wild glyphs, a line ten ems tall, random
+byte flips; a sparse 30 MB file is too big and never read; a killed worker leaves `.bad` and the others go on;
+a hung worker is "took too long"; many slices come to one slice's verdict and preview; a replaced file is
+checked again; the listing follows no link; a file still being copied waits; a font of 20,000 glyphs is checked,
+in about a quarter of a second on the Mac), `test_fontguard.rs` (the crash guard with the app killed at a custom
+font's first glyph: a strike and a start in Terminess, one more try, a second strike, Terminess until the file
+changes; one strike forgiven; Gothic holds no custom font), the unit tests of `font.rs` (skrifa's outlines
+through `stbtt_Rasterize` are stb's own bitmaps byte for byte, over 30,000 glyph bitmaps of the embedded text
+fonts; a custom font draws each character as the same file embedded; the glyph cache's byte cap),
+`fontcheck.rs` and `userfonts.rs` (the verdict and guard files read strictly), the scenarios
+`y_fonts_own_1_sheet`, `y_fonts_own_2_missing` and `z_fonts_own_kept`, and `make l10n-check`'s `fonts-own` and
+`fonts-own-slow` runs (every row note, the headings and the notice in every language, upright and sideways).
+`a_font_is_checked_in_the_real_sandbox` (in `test_sandbox_linux.rs`) runs in the CI job `sandbox`, as root; what
+has run on a Scribe is in the section "2.1.0-beta.2" below. The check's speed there, the load's time and memory
+and the look on e-ink are the owner's checks:
+
+1. Copy a downloaded `.ttf` (any text font: Inter, EB Garamond) into `grimoire/fonts` over USB, open Grimoire,
+   Settings (Classic) > Font. Under "Your fonts (grimoire/fonts)" the file first says "Checking..." with
+   "Checking 1 font..." above the buttons, then shows its name drawn in itself. Tap it: the sample card is drawn
+   in it. Done: every screen comes back in it with one flash, and the chip reads "Font: <its family>". Open a
+   notebook: its page, its paper labels and the clock corner are as before; the toolbar's sheets, the Pages
+   view, the Links bar and the keyboard are in your font.
+2. **E-ink look.** Read the Library, Settings and the keyboard's typing line in your font: are thin strokes
+   still there at the small size (34 px) and after a fast refresh (type a notebook's name)? Is its size right
+   next to Terminess's (the scale is in grimoire.log's check line only as a result: note whether it looks too
+   small or too large; the rule is in DESIGN.md, Your own fonts)? Do names in the Library end in "..." more
+   than in Terminess?
+3. **Bold.** A family unzipped into `grimoire/fonts/<Family>/` with its Regular and Bold files: pick the Regular;
+   titles and buttons are the Bold file's (grimoire.log: `font: custom font loaded: ... bold by a Bold file`).
+   A variable font with a weight axis (Inter's variable file): `bold by its weight axis`. A lone Regular:
+   `bold by overprint`, and bold text is the regular thickened.
+4. **Check time.** Copy a large CJK font (Noto Sans JP's variable file is about 9 MB with 17,000 glyphs; or any
+   font of about 20,000 glyphs) and time "Checking..." on the row, and from grimoire.log: `fonts: file I of N
+   passed: S KB, G glyphs, K from Terminess, checked in T ms`. It should pass well inside the 10 minutes a font
+   has (the slices are 20 s; `sandbox::s1::FONT_*` hold the numbers, placeholders until measured). Does the
+   Kindle stay responsive in the Font sheet meanwhile (the notice may lag: it redraws every 2 s at most)?
+5. **Load time and memory.** With a font of about 10 MB picked, restart Grimoire and read grimoire.log: `font:
+   custom font loaded: S KB in T ms, ..., VmRSS R kB`. Compare T with the launcher's 15 s watchdog (it should
+   be a fraction of a second), and R with the same line's R for a small font: the difference is about the
+   file's size. With two large fonts in the folder, tap one while the other is in use: the sample is still
+   drawn (both are held, up to 32 MB in all; past that the sample card shows the check's picture instead).
+6. **Japanese.** In Japanese (Settings > Language), with a Latin font picked: kana and kanji are DotGothic16's
+   as before. With a CJK font picked: its kana and kanji are drawn, in the room DotGothic16's take (no label
+   overflows that fitted before).
+7. **Refusals.** Copy a `.woff2`, a symbol font (Webdings or any dingbats font), a file that is not a font
+   renamed `.ttf`, and a font over 24 MB: their rows are greyed with "Use .ttf or .otf.", "No Latin letters.",
+   "Unreadable font." and "Too big (over 24 MB).", and a tap on them does nothing.
+8. **Getting back.** With your font in use, open Settings > Font: the sheet's own words (Font, Built in, Your
+   fonts, Cancel, Done) are in Terminess. Pick Terminess and Done: back. Pick your font again, close Grimoire,
+   delete the file over USB, open Grimoire: Terminess, and the sheet's row says "File missing."; copy the file
+   back and open Grimoire: your font again.
+9. **The sandbox.** grimoire.log has `work: sandboxed (uid 62001, ...)` and no `fonts: no worker for the check`
+   and no `made call N, which the sandbox does not allow` (if either shows, send the log: a call is then added
+   to the allow-list, but for 240, 192 and 125 ("Hardening round (2026-11), sandbox", below), with the spike's
+   numbers, and until then no font is checked, none is marked).
+10. **The crash guard** cannot be provoked without a font that crashes Grimoire; its marks can be watched:
+    while your font's first screen is being drawn `grimoire/.font-inuse` exists, and it is gone a moment after.
+    If Grimoire is ever killed in that moment (hold the power button the instant the first screen appears),
+    the next start is in Terminess once (the log says `the last start did not finish its first screen with your
+    font`), and the start after has your font back.
+
+## 2.1.0-beta.2, fix round, F1 (imports, the picker, the job queue)
+
+Automated: `rust/tests/test_import_queue.rs` (the scans, the lock, the picks that wait, the queue that drops a
+job, the notice), the fix round's tests at the end of `test_pdfimport.rs` (a pick never moved, a resume that makes
+lost pages again, a copy that waits, workers that cannot open or start, SIGPIPE, the CPU budget, a writer cut off,
+`links=1`, a stall after a wake), three in `test_browser.rs` (Back past a gone folder, a gone row, `done-old`), one
+in `test_pdflinks_import.rs` (QuadPoints), `tests/import_check.py` (a pick that waited is imported at the next
+start). On the Scribe, with grimoire.log readable over USB or SSH:
+
+1. **A refused PDF is told once.** Copy a PDF with a password into `grimoire/import/`, open the Library: "PDF needs
+   a password." once. Leave the Library and come back a few times over a minute: no second toast, and the log's
+   scan lines count it among "failed and have not changed since". Replace the file with an unlocked copy: it
+   imports.
+2. **A pick that has to wait.** Start a big import, close Grimoire in the middle (it goes on in the background),
+   open Grimoire again at once and pick another PDF in Documents: the toast "Another import is still going. This
+   one starts after it."; when the first ends (the notice goes within about 10 s of it), the picked one imports by
+   itself, and stays in Documents.
+3. **Nothing holds the lock after the last import.** Import a small PDF and, while it runs, close a big notebook
+   you wrote in (its mirror or compaction queues behind): as soon as the import ends, pick another PDF: it starts
+   at once (no wait toast; the log has no "an import from an earlier run is still going").
+4. **A file picked in Import itself** goes to `import/done/` when its notebook is made, with the name typed in the
+   sheet; the Import place, after Look again, shows it in done.
+5. **Cut off and resumed.** In the middle of a 300-page import, hold the power button until the Kindle restarts
+   (or kill Grimoire's process over SSH twice, a minute apart): the import goes on from where it was ("goes on
+   from page N"), and at the end every page has its picture (turn through the first pages). After three cuts in
+   a row the import gives up with "Couldn't import PDF (see grimoire.log)." and the log says "stopped 3 times".
+6. **Storage.** With under about 150 MB free, drop a scanned PDF of large pages: it is refused with "Couldn't import
+   PDF. Is the storage full?" before the storage runs low (the slices check the floor every 5 pages), no work folder
+   is left, and after freeing 20 MB or more the next Library visit imports it.
+7. **Sleep and wake in the middle** of an import: if the log ever says `stalled right after a wake; tried again (no
+   strike)`, the page after it should still import (send the lines around it).
+8. **Two copies of one PDF** dropped together: one notebook, one toast "PDF already imported." a moment after the
+   first import ends, both files in `done/`.
+9. **Timing a page** now comes from the slice lines: `import: <id>: pages A to B of M in T ms (MemAvailable K MB,
+   N band(s))`. Send a few for a planner and for a scanned book: they set S1's slice and CPU numbers.
+
+## 2.1.0-beta.2, fix round, F2 (the notebook PDF, its cache, pictures and the caps)
+
+Automated: `rust/tests/test_pdf_colour_memory.rs` (Scribe-sized colour pages, flat and photo-like, on pictures of
+their own and on one picture: the mirror's live memory against one or two RGB copies of a page, and the margin's
+headroom), `test_pdfcache_pictures.rs` (a page drawn before its picture existed is drawn again once it does; a
+picture replaced; a picture job's end; a missing page and the notebook's paper), `test_pdfcache_cap.rs` (whole
+notebooks by last use; a notebook alone over the cap writes nothing at each close; the daily prune),
+`test_pdf_mirror_writers.rs` (a second mirror of one notebook waits and publishes last, whole; a killed writer's
+temporary file is swept), `test_zip_limit.rs` (a zip past 4 GiB, or with a broken entry, fails),
+`test_picture_jobs.rs` (a picked picture's header goes to the worker; one worker death is tried again and never
+refuses a folder; a template with no preview yet starts no worker on the UI thread), and in the CI job `sandbox`
+two more (`test_sandbox_linux.rs`): a Scribe-sized colour page mirrored under the real cap, and a worker's clean
+end under the filter. Those two run there, as root; what has run on a Scribe is in the section "2.1.0-beta.2"
+below.
+
+1. **A colour notebook's PDF.** Import a PDF with colour pages (a colour planner, a magazine of photos), open the
+   notebook, write a stroke, close it: `PDFs/<name>.pdf` is there and its colour pages are in colour, and the log
+   says `bg: export of <id>: N pages, N drawn, T ms, VmHWM K kB` (no `bg: export of <id> failed`). Note `K`: it
+   is what the 128 MiB margin must hold beside the child's size at its start; send it with the page count.
+2. **A template picked a moment after it was copied in.** Copy a new PNG into `grimoire/templates` over USB, open
+   a page's paper sheet and tap its tile while it still shows the hourglass: the toast says "Not ready yet. Try
+   again in a moment." and nothing changes; once the tile shows its picture, a tap puts it on the page at once.
+   Grimoire never pauses on the tap (it used to start a reader right there for files up to 4 MB).
+3. **A page drawn before its picture.** With Notebook PDFs on, close a big notebook whose PDF is not made yet (a
+   few hundred pages: the export runs for minutes), open it again at once, give its last page a template (one
+   whose tile shows its picture) and write on it, and close it. The running export reaches that page before the
+   template's picture is made (its job waits behind the export) and draws it on white; when the log has the
+   second export line, open the PDF on a computer: the last page has its template (0c26d912 kept the white page
+   in the cache, and every later PDF showed it bare until the page was saved again).
+4. **Two Grimoires, one notebook.** Open a big notebook (a few hundred pages), write, close it, and at once open
+   it from KOReader (Open this book in Grimoire, which starts Grimoire again) and close it after another stroke.
+   The log says `bg: export of <id> waits for the one running`, then two export lines; the PDF on the computer
+   opens and has both strokes. `grimoire/PDFs` has no `*.tmp` file once both are done.
+5. **Pictures under memory pressure.** Copy a folder of 20 phone photos into `grimoire/import/<Folder>` while a
+   big PDF import runs: if the log says `work: a picture's worker ended (...); a fresh worker tries it again`,
+   the folder still imports (or, after two deaths in a row, waits for the next scan: `.attempts` counts one try);
+   it is never marked as refused for that.
+6. **The worker's end.** Over SSH, after an import: no `E sigsys 186` line in grimoire.log; a `made call 175`
+   line means a worker ran out of memory or panicked (send the log).
+7. **Live view.** While a browser watches Live view: `cat /proc/<pid>/oom_score_adj` of each viewer child (a
+   child of Grimoire named `grimoire`) is `500`, and its `Max address space` soft limit is about 64 MiB above its
+   `VmSize` at its start.
+
+## 2.1.0-beta.2, fix round, F3 (your own fonts and document links)
+
+None of this has run on a Scribe. Nothing here needs a debugger; read grimoire.log with `ssh` or USB.
+
+1. **A font that cannot be checked is not asked for in a loop.** Copy a font into `grimoire/fonts/` and choose it
+   (Settings > Font). Then change its time to an hour ahead of the Kindle's clock (set the file's date on the Mac
+   and copy it over USB) and start Grimoire. The Library draws in Terminess. In grimoire.log look for `bg: font
+   check of a folder (pid ...)`: one at the start, a retry about 3 s later (`fonts: the check ended with no
+   verdict ...: tried again in 3 s`), then 15 s and 60 s, and after the fifth `no font is checked until Grimoire
+   starts again`. Never a line every few hundred milliseconds. Put the clock right (or the file's date): the
+   next start checks the font and draws it.
+2. **One font at a time.** Copy five or six fonts in at once and open the Font sheet: the rows fill in one by one
+   (`fonts: file I of N done; more are left for the next job`). While they check, start an export (Share's PDF) or
+   a PDF import: it should not wait for every font. Time a notebook's PDF export with and without the five fonts
+   checking.
+3. **Terminess and Done after a crash.** If a font ever stops Grimoire before its first screen (the next start is
+   in Terminess): Settings > Font, tap Terminess (even though it already shows), Done. settings.ini has no
+   `font=file:` line any more, and the next start does not load the font. (To try it without a crashing font:
+   make a font file, choose it, hold the power button for 4 s as its first screen appears, repeat once.)
+4. **A font whose check ran out twice.** A font that takes too long (the check's watchdog is 30 s of silence, 10
+   minutes of CPU) says "Checking..." for a minute after its first timeout, then is tried once more, and only
+   then says "Took too long to read.".
+5. **A Done that cannot load.** With little memory free (many apps open on the Kindle's framework, or a 24 MB
+   font held as a sample) pick a font and Done: if it cannot load, a toast says "Couldn't use that font." and
+   Terminess draws; the choice stays in settings.ini.
+6. **A name in a font that has the letters only in its regular.** A notebook named with Cyrillic or Greek letters,
+   a font whose Regular has them and whose Bold file does not: the name is drawn by Terminess's letters where it
+   has them, and is a box where nothing has them (2.1.0-beta.2, missing characters, below).
+7. **A tab under the clock corner.** A planner with a home tab in the top left corner (the clock's default corner):
+   tap the tab: it goes to its page, the clock does not toggle. Tap in the corner where no tab lies: the clock
+   toggles. Move the clock to a free corner (Display > Corner) if the tab is in the way.
+8. **Open this book in Grimoire again** on a planner already in Grimoire, after deleting a page in Grimoire and
+   opening the book once more: the page comes back and the tabs that go to it work again (the plugin asks every
+   held page's links whenever pages are added; time the "Preparing" step on a 400-page planner: it is the
+   links' walk of every page, about the first import's cost). With a book whose links are over the cap, or whose
+   `import/.book/links.txt` does not read: the toast says "Added N book pages. Some links were left out." With
+   only the links filled (no new page), the notebook's PDF in `PDFs/` is made again (its time changes).
+9. **Copy to notebook... into a notebook with no room for tabs.** The toast says "Copied N pages to X, without
+   their document links." and not "without their names and links" when the names and links did save.
+
+## 2.1.0-beta.2, pictures fail closed
+
+The owner's ruling of 2026-11-10: where the sandbox is required (the Kindle) a picture is never decoded outside
+it. When no sandboxed worker can be had, a template or photo is not ready yet (never marked unusable), a picture
+folder in `import/` counts no try and is taken again at every later scan, and grimoire.log says why once a
+process. Off the Kindle the 2.0 fallback stays. Automated: `rust/tests/test_picwork_closed.rs` (GRIMOIRE_SANDBOX=
+require with a failing sandbox step, and with an exec that does not start: no preview, no `.bad`, no try counted
+over four scans, nothing decoded in the writer even for a picture a worker died on, the log line once a process;
+with a worker back, the previews, the notebook's picture and the folder's notebook are made) and
+`test_picwork_fallback.rs` (not required: the fallback still decodes). **Not run on a Scribe.** The owner's check:
+
+1. With the sandbox working (the normal case), nothing changes: copy a PNG into `grimoire/templates`, a photo into
+   `grimoire/photos` and a folder of three pictures into `grimoire/import/<Folder>`. The previews appear, the
+   folder becomes a notebook, and grimoire.log has `work: sandboxed (uid 62001, ...)` and neither `pictures wait`
+   nor `pictures decode in the writer`. If `work: pictures wait (<why>)` shows, send the log: the templates stay
+   without previews and the folder stays in `import/` (it is tried again at each scan, the Library's toast
+   "Couldn't import page folder" each time) until the sandbox works again.
+
+## 2.1.0-beta.2, missing characters
+
+None of this has run on a Scribe. Read the screens; nothing here needs grimoire.log.
+
+1. **The owner's notebook.** The notebook imported from 会议记录.pdf: its card in the Library reads 会 and then
+   three hollow boxes (one for each of 议, 记 and 录), no longer 会 alone, and so wherever else the name is drawn
+   (the Pages view, Copy to notebook..., the Graph). Try it in Classic and in Gothic, and with each Classic font
+   (Settings > Font): the boxes look the same in every one (not thickened in bold or in titles), each about as wide
+   as a letter of the text around it. With a long name of boxes, the "..." comes after whole boxes.
+2. **Characters that are meant to be unseen.** On the Mac, name a PDF `Family 👨‍👩‍👧 🏳️‍🌈 🏴󠁧󠁢󠁥󠁮󠁧󠁿.pdf` (from
+   the emoji picker: the family of three, the rainbow flag and the flag of England, which hide joiners, a
+   variation selector and tags inside them) and drop it in `grimoire/import/`. Its card shows `Family` and one box
+   for each pictograph: three, two and one, with no box for what joins them (a joiner keeps the blank width of a
+   letter between two boxes, as Terminess has always drawn it).
+3. **Chinese with a font of your own.** Copy a font that has simplified Chinese and Latin (Noto Sans SC, for one)
+   into `grimoire/fonts` and choose it in Classic (Settings > Font): 会议记录 shows all four letters. Back in
+   Terminess the boxes return. Note how long the font's check takes on the Scribe (a Chinese font has tens of
+   thousands of glyphs), and whether it ends in "Took too long to read.".
+4. **Nothing else moved.** Japanese names, accented names, the clock and every screen in Spanish and Japanese
+   draw as in 2.1.0-beta.1.
+
+## 2.1.0-beta.2, last round, lane M (nebuff's main merged, and Clear page)
+
+Public `main` (nebuff's work on 2.1.0-beta.1) is merged into the line, and the pen button's hold no longer clears
+the page by default. Automated: test_gesturemap (`the_built_ins`, `old_clear_page_defaults_read_as_none`),
+editor's `clear_page_from_a_gesture_or_a_key_says_so_and_undo_takes_it_back` and
+`a_resize_handle_scales_the_selection_about_its_opposite_corner`, library's
+`recording_contacts_buttons_timeout_and_rotation` (Disable), test_store and test_probe (`clock_12h`), the
+scenarios v_gestures_4b_clear, v_gestures_4_pen, v_controller_actions, z_lasso_22_resize, z_book_8_links,
+z_pages_footer_delete and i_display. **Not run on a Scribe.** The owner's check:
+
+1. **The hold does nothing now.** On a page with ink, hold the pen's button with the nib a few millimetres above
+   the screen for two seconds, then rest a finger on the button while writing: the ink stays, no toast. If the
+   page still clears, open Settings > Gestures > Editing: the Clear page row names the gesture that does it (a
+   gesture you recorded stays yours). Look in `grimoire/gestures.ini` too: a `pen.Button.hold=clear-page` there
+   alone is kept as a choice; beside `pen.Button.triple=clear-page` or `pen.Button.triple=nothing` (the old
+   built-ins an earlier version wrote) both lines are gone after the next change in Settings > Gestures.
+2. **Clear page with a gesture says so.** Settings > Gestures > Editing > Clear page, record a hold of the pen's
+   button, Use. On a page with ink, hold the button over it: the page clears and a toast at the bottom says "Page
+   cleared. Undo brings it back." for about four seconds; the toolbar's Undo brings every stroke and link back
+   at once. The broom on the toolbar clears without a toast. In Spanish the toast reads "Página limpiada.
+   Deshacer la recupera."
+3. **Disable.** Settings > Gestures > Pages > Previous / next page, then Disable on the card: the card closes,
+   a toast says "No gestures for Previous / next page now.", the row says "no gesture", and two fingers left or
+   right (or one finger) no longer turn the page. Reset brings them back. In Spanish and Japanese the card's four
+   buttons fit (Japanese shows Disable in English until nebuff translates it).
+4. **Resize a selection.** Lasso a word: four black squares sit on the box's corners. Drag the bottom-right one
+   outward: the outline follows the pen, the word is drawn larger at the lift, Undo puts it back as it was, and
+   a tap on a square that never moves changes nothing. On an imported planner, lasso writing in a day cell and
+   resize it: the cell's tab still goes where it went. A read-only page shows no squares.
+5. **The 12-hour clock.** Settings > Display, tick "Display time as 12 hour": the clock corner on a page says
+   `Nov 14, 10:13 PM`; the Library's cards keep the 24-hour time. Untick: back to `22:13`. In Spanish `p. m.`.
+6. **Pages: Delete from the bottom row.** In the Pages view, tick two pages (Multi-select): a trash button joins
+   the bottom row and deletes them; a page tapped again (not a quick double tap) unticks. Hold a page: its card
+   lists Open, Add a link, Rename, Move to..., Copy to notebook..., Delete and Cancel, each with its icon, and
+   Cancel is inside the card upright and sideways.
+
+## 2.1.0-beta.2, Wi-Fi networks (lane W)
+
+Settings > Wi-Fi (issue #40). Automated: `tests/test_wifi_sh.py` (make wifi-check: the helper's networks,
+current, join, scan, add, delete and disconnect verbs against a fake lipc whose profileData holds passwords:
+none comes out, in text or in hex; a format it does not know and a failed read list no name; join refuses
+anything but a saved network before any change; add sends only the derived PSK on stdin and its profile hash holds
+only that PSK; a WPA3 add sends the passphrase only on stdin, with SAE and PMF required; an EAP add sends the
+username and password only on stdin, offers the SHA-256 AKM with optional PMF (or falls back when the
+supplicant lacks it), and its profile need not be in wifid's list; disconnect keeps the radio on, sets the manager's manual mode first, tries `cmDisconnect` with and without the current profile and then `wpa_cli`, pins the drop and disables the supplicant's network once the link is down, re-enables it and restores auto when it cannot, and its exit names the failed step; hostile names stay data), `rust/src/wifi.rs`'s
+tests (reports fail closed; a switch's states, its hex argument, exit during a switch; add's stdin and delete's
+name; a saved report that brackets the connected profile is shown once and plainly, in its own order; a quiet
+scan keeps order and only adds/removes names; a change cancels a running scan; an Add failure
+is named) and `tests/scenarios/z_wifi_networks.qs` (the sheet from the scenario helper: the automatic scan,
+Rescan, add Open, the row's trash, switch, disconnect, reconnect, scroll to Far away and refuse, and Other...
+with a hidden WPA/WPA2 password; also run in every language and style by make l10n-check). PSK add/delete were checked on the owner's
+Scribe; EAP and WPA3 are not yet checked on a device.
+
+**Probes first** (read only; the maintainer runs them over SSH with the owner's OK). Run
+`sh tools/kindle-wifi-probe.sh > wifi-probe.txt`; it never scans, changes the radio, or creates, changes or
+deletes a profile, and masks every value. Paste the result into the table in `docs/WIFI-PHASE0.md`. It reports
+the firmware and radio, `profileCount`, `scanState`, whether `wpa_passphrase` exists (Grimoire derives its
+own PSK, so add does not need it; the helper's direct passphrase path does), which LIPC properties
+are present, and the masked shape of `currentEssid`, `profileData` and `scanList`. The helper's reader needs
+quoted values and bare numbers (an unquoted value makes it list no name); a `list=0` or a scan that does not
+parse means the reader needs that shape. Also check the same `networks` and `scan` verbs with the radio off:
+`list=1` or `list=0`, and `scan=off`, say whether wifid answers while the radio is off (the sheet asks to
+turn Wi-Fi on first when it does not).
+
+**The owner's checks** (after the probes; English, then Spanish and Japanese for the words):
+
+1. Settings' Wi-Fi row opens the sheet on Nearby; its status, top buttons and rows fit upright and sideways,
+   in Gothic and Classic, in English, Spanish and Japanese, with every word whole. Esc goes back to Settings.
+2. Connected to Wi-Fi, open Settings > Wi-Fi: it scans without a tap, names the network connected to, and
+   lists what is near. Each row's three-bar icon fills for its strength, and secured networks have the small
+   drawn lock (not a missing-glyph box); the connected row is filled black with a white rule inside it and
+   white bars. Rescan replaces the list.
+3. Leave Nearby idle for 20 s or more: the list stays up and does not reload or jump. A network that appears
+   is added at the end, one that leaves disappears, and the changed bars update in place. A failed quiet scan
+   leaves the list as it was; Rescan still clears and scans afresh. While it is refreshing, tap a network:
+   the action must happen at once, not after the scan, and the next refresh waits 20 s after that scan.
+4. Tap an unsaved Open network and an unsaved WPA2-Personal one: Open is added at once, WPA2 opens the masked
+   keyboard over the still-visible Wi-Fi page. A password with a quote, a backslash and a space works; an
+   8-character and a 63-character password work. The network appears in Saved, and the Kindle connects to it.
+   Wrong password: the profile is still added (the Kindle's service refuses the connection), and the sheet
+   says "Could not connect to <it>." within 45 seconds. If the hidden add itself fails, the status says "Could not add the network.", not the generic
+   "Could not read or change Wi-Fi." The `wifi:` log line then names the helper's exit: 18 the passphrase never
+   became a PSK, 19 wifid refused the profile, 20 no read came back. A WPA3-Personal network (hostapd
+   `wpa_key_mgmt=SAE`, `ieee80211w=2`) asks for its password on the masked page and joins; a supplicant that
+   does not list SAE exits 28 and adds nothing.
+4b. On a school WPA2- or WPA3-Enterprise network: choose it (or Other... > WPA2/WPA3-Enterprise), type the
+   username, then the password on the masked keyboard. The helper offers the SHA-256 AKM with PMF optional, so
+   the same profile joins WPA2-Enterprise and WPA3-Enterprise (non-192-bit; hostapd `wpa_key_mgmt=WPA-EAP-SHA256`,
+   `ieee80211w=2`). The network connects and is watched like a switch; the log names no username or password.
+   Without wpa_cli the helper exits 26; a supplicant refusal, 27. The profile appears in Saved; tapping it
+   rejoins it through `wpa_cli`, and its trash button removes both the supplicant network and the marker.
+   WPA3-Enterprise 192-bit is not created: it needs EAP-TLS.
+   For a local test AP, `make wifieap` starts hostapd on a second virtual interface on this computer's
+   current Wi-Fi channel using WPA2/WPA3-Enterprise (`WPA-EAP` and `WPA-EAP-SHA256`, PMF optional),
+   SSID `Grimoire-Test-EAP`, identity `student` and password `test-password`; `WIFI_EAP_WPA3_ONLY=1`
+   makes it WPA3-Enterprise only (`WPA-EAP-SHA256`, PMF required). It needs hostapd, iw and openssl,
+   and keeps the existing connection up when the driver supports AP + managed on one channel.
+5. Saved networks: the profiles in the Kindle's order, each an ordinary row with the trash button at its right;
+   the connected one is named in the status line, not moved or marked in the list. Tap one
+   trash: that profile leaves the Kindle's list at once, with no question; the Kindle's own Wi-Fi menu agrees.
+   If the delete fails, the status says "Could not forget the network." (not the generic read error) and the
+   `wifi:` log line names the helper's exit: 21 the radio, 23 no read came back, 24 no netid could be
+   read, 25 wifid still had the profile after the netid write. The list scrolls by dragging; there is no
+   More networks row.
+6. Tap another saved network that is in range: "Connecting to <it>..." and then "Connected to <it>" with its
+   row filled, within about 10 seconds. Share's address is the new network's; Live view pairs on it.
+7. Tap the filled connected row again: it disconnects with the radio still on and its row no longer filled.
+   Tap it again (or another saved network) to reconnect; SSH, Share and Live view follow the connection.
+8. Tap a saved network that is out of range: "Could not connect to <it>." within 45 seconds. Note what the
+   Kindle connects to afterwards on its own (the old network, none?): Grimoire switches nothing back.
+9. Wi-Fi off, open the sheet: "Wi-Fi is off", Nearby asks to turn it on, and Saved says it cannot be read.
+   Turn on Wi-Fi connects and starts the scan by itself; the lists appear. Opening the sheet never turns the
+   radio on.
+10. Other...: type a hidden network's name; the Wi-Fi page stays under the keyboard. Choose Open, WPA/WPA2
+   and its masked password, or WPA2-Enterprise and its username then masked password. A hidden WPA2 network
+   joins and appears in Saved; a wrong password is reported as any other failed connection.
+11. Turn off Wi-Fi from the sheet: "Wi-Fi is off", SSH and Share drop as with the Share card's button.
+12. Leave Grimoire (Exit) right after tapping a network: the Kindle still connects to it; KOReader's network
+   menu agrees.
+13. From a notebook: the toolbar's cog > Wi-Fi works the same; Back comes back to the notebook.
+14. Afterwards, grimoire.log names no network and holds no password: only lines such as `wifi: switched to a
+   saved network`. The Kindle's own Wi-Fi list differs only by the networks added and the one deleted above.
+
+## 2.1.0-beta.2, last round, lane K: the keyboard's caret, and copy and paste
+
+From issue #36. Automated: the keyboard's unit tests (rust/src/keyboard.rs: typing and delete at the caret,
+the kana modifier, selections, Cut, Copy and Paste, the edit page, the text line's keys, the arrows' hold, a tap
+and a drag on the text, the line keeping the caret in view, the paired keyboard's keys, the edit page's words in
+every language), tests/scenarios/u_keyboard_caret.qs (the Library's keyboard, upright and sideways, its refreshes,
+the clipboard across keyboards, a paired keyboard's keys), u_keyboard_caret_classic.qs (Classic's shots),
+u_keyboard_caret_ja.qs and u_keyboard_caret_es.qs (the kana pad, Spanish, the fit checks) and z_find_5_caret.qs
+(Find's rows follow a paste and not a move of the caret; the lasso's ink clipboard apart). **Not run on a
+Scribe.** The owner's check, in Classic and Gothic, upright and sideways, in English, Spanish and Japanese:
+
+1. **The arrows.** Library > Folder: type a name, tap ◀ three times and type a letter: it goes in where the caret
+   is. Hold ◀: the caret steps back after about 0.4 s, then quickly, and stops at the start; hold ▶ to go back.
+   Delete takes the letter before the caret. Each tap should feel as quick as a letter key (one refresh of the
+   text line and the key, no flash of the keyboard).
+2. **A tap and a drag on the text.** Tap between two letters with the pen: the caret goes there. Draw the pen
+   across a few letters: they show white on black; type a letter and it replaces them. Try with a finger too.
+3. **The edit page.** Tap the key beside ◀ (the copy icon): Select all, Cut, Copy, Paste, Start and End.
+   Select all, Copy, then abc and type more; open the edit page and Paste. Cancel, then rename a notebook and
+   Paste there: the text is still on the clipboard. Lasso some ink and Copy it, then Paste in a keyboard: the
+   text pastes, not the ink; Select mode's Paste still pastes the ink.
+4. **Every keyboard.** The same in a notebook's Find (its rows follow a paste, not the arrows), the Pages view's
+   Name this page and Go to page (Paste there takes the digits alone), the Graph's Rename, New page..., a link
+   card's Rename, and in Japanese on the kana pad (the edit page's way back is あ; ゛小 changes the kana before
+   the caret). The count pad (New page held) has no arrows and works as before.
+5. **A paired keyboard** (Settings > Shortcuts on): in any of those keyboards, Left and Right, Home and End move
+   the caret, Shift with them selects, Ctrl+A (Cmd+A on an Apple keyboard) selects all, Ctrl+C, Ctrl+X and
+   Ctrl+V copy, cut and paste; none of them turns a page or changes a tool under the keyboard. An arrow held
+   down moves one letter (no repeat on a paired keyboard yet).
+6. **Long names.** A name longer than the line: ◀ moves the shown part when the caret reaches its left end, and
+   Start and End jump; the text never shows "...".
+
+## 2.1.0-beta.2
+
+The second 2.1 beta: everything in CHANGELOG's 2.1.0-beta.2 section. Automated: the full gate on the release
+commit with the pinned toolchain; the Linux sandbox tests ran as root for the first time (10 of 11 in a VM on
+2026-11-10, the eleventh a test's own race, rewritten since; CI's `sandbox` job is their first run there). S1 ran on
+the owner's Scribe on 2026-11-09 (every sandbox step works; a planner page in 90 ms). On the owner's Scribe, with
+the development builds of 2026-11-09 to 2026-11-11 (the last, `f8de55aa`, is this release's code but for this
+commit): a 74-page gray planner dropped in `import/` became a notebook in the sandbox with its 1,161 tabs working; a
+second copy was recognised as imported before; two colour PDFs imported and their notebooks' PDFs came out in
+colour; a PDF with a password was refused once, without a second toast; three fonts of his own were checked one
+job each and used; a PDF and a picture folder with Chinese and Japanese names imported; a 380-page planner opened
+from KOReader (Open this book in Grimoire) came in with its 6,363 tabs; everything else he used looked right. The
+What's new note was vetted by the owner, and an earlier bundle of this release (build `fafe26798d86`, before the last
+round) was checked by him on his Scribe that day: good. The owner then made this the last beta of 2.1 and put in the
+last round (the sections above: nebuff's main with the lasso resize, Disable and the 12-hour clock; the pen button's
+hold no longer clearing the page; Settings > Wi-Fi; the keyboard's caret, cursor keys and copy and paste). Read-only
+probes on his Scribe (2026-11-11, values masked) settled the Wi-Fi helper's reader, which then listed his 10 saved
+networks and named the current one. The extended What's new was vetted by him. This release's bundle with the
+last round (build `e52d37dbdf51`, from `be5a0886`, its binary byte for byte the one the gate tested) was installed
+on the owner's Scribe (firmware 5.20.1.0.2) on 2026-11-11, after a backup, with the notebooks unchanged and
+KOReader left alone. The owner then tried the last round on it: a lasso selection resized from a corner; the pen
+button held with the pen near the screen, the page staying; Disable in Settings > Gestures; the 12-hour clock; the
+keyboard's ◀ ▶ and edit keys in a rename and in Find, and its narrower text box; Settings > Wi-Fi with the saved
+networks, a switch to another and back, and the sheet with Wi-Fi off. The owner's verdict, 2026-11-12: "all good".
+
+## 2.1.0
+
+The first stable release of 2.1: 2.1.0-beta.2 (above) with everything in CHANGELOG's 2.1.0 section, released from
+`main`. Automated: the full gate on the release commit with the pinned toolchain. On 2026-11-13 the owner reported
+"the current beta has been checked and is ready", and chose to release `main` as 2.1.0 on the stable channel. The
+crate-age rule (two weeks at the tag) was waived again for this release by the owner on 2026-11-13: crc32fast 1.5.4,
+hayro-cmap 0.1.1 and hayro-postscript 0.2.0 are younger (all are two weeks old on 2026-11-16). They are three of the
+four of 2.1.0-beta.2's waiver; the fourth, log 0.4.35 (2026-10-30), is two weeks old at this tag
+(`tools/check-crate-dates.py --tag-date 2026-11-13` lists these three alone). This release's bundle (build `7df9b236a418`, from `1a7f306e`, its binary byte for byte
+the one the gate tested) was installed on the owner's Scribe (firmware 5.20.1.0.2) on 2026-11-13, after a backup,
+with the notebooks unchanged and KOReader left alone. Until then that Scribe ran 2.1.0-beta.2's build
+`e52d37dbdf51`, so this was its first run of what came after that beta. The owner was asked to look at What's new
+on the first start, page turns at the fitted view and back a page or two, the lasso's bar and a dragged
+selection, and whatever else is in daily use. The owner's verdict, 2026-11-13: "it looks fine."
+
+## Hardening round (2026-11), sandbox: the worker's system calls, its start and its handshake
+
+The worker that reads PDFs, pictures and fonts is held to a narrower use of three system calls (futex only
+as a private wait or wake; mmap and mprotect only for a mapping not asked executable), is started only with
+all six of its descriptors in place, and is taken by the writers only when it says it is sandboxed where
+the sandbox is required. Before its handshake the worker makes one allowed call of each of the three kinds,
+so a kernel on which the rule is wrong ends it there, before a file is read: nothing is then marked and no
+try is counted. Automated: the unit tests of `sandbox.rs` (the filter of all three architectures, evaluated
+with arguments), `rust/tests/test_sec_spawn_fds.rs`, `rust/tests/test_sec_handshake.rs`, and in CI's
+`sandbox` job `rust/tests/test_sandbox_linux.rs` (the rule refusing and allowing under a real kernel, and
+real PDFs, pictures and fonts under it, on x86-64).
+
+**Not run on a Scribe, and it must be before a release**: CI runs x86-64, another C library and a
+development build; the Scribe runs armv7, a static release build and kernel 4.9. What the run below shows:
+that the Scribe's kernel takes the filter, that it sees the three calls' arguments where the filter reads
+them, and that real imports, pictures and fonts never meet the rule. What it cannot show: that a refused
+operation is refused on the Scribe (the Kindle build has no test hooks); that rests on the tests of the ARM
+table and on CI's kernel run. Use the bundle built with the pinned toolchain (docs/RELEASING.md), and
+**copies under new names** for every file below, so that a mark made by a failing check lands on a copy.
+
+1. **A worker starts.** Copy one PNG under a new name (`check-1.png`) into `grimoire/templates`. Open
+   Grimoire, New notebook, the template list: its preview appears. grimoire.log has `work: sandboxed (uid
+   62001, chroot, netns, no new privileges, seccomp, ...)` and none of: `made call`, `pictures wait`,
+   `refused its step`. If one of them shows, stop here and go to step 9: nothing of yours was marked.
+2. **A photo.** Copy a phone photo under a new name into `grimoire/photos`: its preview appears, upright.
+3. **A planner.** Copy a PDF that imported before, under a new name, into `grimoire/import/`: it becomes a
+   notebook with every page drawn (no "Some pages couldn't be read."), and its tabs work.
+4. **Colour, and a password.** A colour or photo PDF under a new name imports; a PDF with a password says
+   "PDF needs a password." once, as before.
+5. **A picture folder.** A folder of three pictures under a new name in `grimoire/import/` becomes a
+   notebook.
+6. **Fonts.** Copy one TTF and one OTF font you use, under new names, into `grimoire/fonts`: each is
+   checked and can be picked, as before (the section "2.1.0-beta.2, L10" says where).
+7. **The log, after all of it.** No line with `made call` (240, 192 or 125 would be this round's rule; any
+   other number is as before), `the PDF could not be opened`, `a worker could not open the PDF`, `a worker
+   could not be started`, `pictures wait`, `fonts: no worker for the check` or `refused its step`.
+8. **Two values to note** (over SSH, with Grimoire running; they change nothing): `cat
+   /proc/sys/net/core/bpf_jit_enable` (a number, or no such file), and `for p in $(pidof grimoire); do cat
+   /proc/$p/personality; done` (expected `00800000` on every line; if a line reads `00c00000`, send it: a
+   follow-up waits on that value, docs/BACKLOG.md).
+9. **If any step failed:** do not release. Send grimoire.log. Then delete the copies (and the notebooks
+   made from them), and delete the `.bad` files made during the check in `grimoire/templates/.cache`,
+   `grimoire/photos/.cache` and `grimoire/fonts/.cache` (empty files; the caches lose nothing). A copy's
+   line in `import/.attempts` goes with the copy. Install the build without this round's two filter
+   commits before judging anything else.
+10. **Later.** The same steps again whenever the build's rustc or zig version moves (docs/RELEASING.md).
+
+## Hardening round (2026-11), storage reads and temporaries: device checks
+
+Automated: the unit tests of `util.rs`, `store.rs` and `bgwork_template.rs`, `rust/tests/test_sec_read_links.rs`,
+`test_sec_pid_tmp.rs` and `test_sec_work_links.rs` (links, FIFOs, folders and sizes on the host's file system).
+What they cannot show is the Scribe's own storage, so this round ships only once these are done on a Scribe:
+
+1. **Before installing, over SSH.** Keep a copy of the settings:
+   `cp /mnt/us/grimoire/settings.ini /mnt/us/grimoire/settings.ini.before`. Then ask the storage what it
+   takes, in a folder of its own, with Grimoire closed:
+   `mkdir /mnt/us/grimoire/.probe && cd /mnt/us/grimoire/.probe && echo x > f`, then
+   `ln -s f s; echo "symlink $?"`, `ln f h; echo "hard link $?"`, `mkfifo p || mknod p p; echo "fifo $?"`,
+   `ls -la`, and to tidy: `rm -f s h p f; cd /; rmdir /mnt/us/grimoire/.probe`. Write the three answers
+   into docs/KINDLE.md (this also answers item 5 of "the file picker (lane L8)" above). If all three are
+   refused, links and FIFOs cannot exist on the Scribe's storage: steps 2 to 8 are then a check that
+   nothing changed, and of this round only the size limits act there.
+2. **Install, start once, and touch nothing yet.** Do not change a setting and do not write on a page.
+   Read `grimoire.log`: there must be no line `settings: settings.ini is there but was not read`, no
+   `store: skipping unreadable notebook`, and no `is no plain file`. The Library lists every notebook, as
+   many as before. The battery and the clock corner show, and the language is as before.
+   If any of that is wrong: close Grimoire, install the previous build, and if
+   `/mnt/us/grimoire/settings.ini.unread` exists, `mv` it back over `settings.ini` (or use
+   `settings.ini.before`). Send the log.
+3. Open a notebook with ink: the ink is there, the pen lands where it points (the calibration was read),
+   pages turn. Open the Pages view of the largest notebook: the tiles fill as fast as before. Add a page
+   and undo it.
+4. A page on a template and a page of an imported picture or PDF show their pictures. New notebook, Paper:
+   Templates and Photos list their files with previews.
+5. Copy a folder of two or three pictures into `grimoire/import/`: it becomes a notebook as before.
+6. Change a notebook with the PDF mirror on and close it: `grimoire/PDFs/<name>.pdf` is new, no `.tmp` is
+   left in `PDFs/`, and the log has no `write ... .tmp` line.
+7. Leave a dense page and open it again: it comes back as fast as before (its kept drawing), and the
+   notebook's card in the Library is current.
+8. Change a setting, close Grimoire, start it again: the setting is kept, and there is no
+   `settings.ini.unread` in `/mnt/us/grimoire`. Remove `settings.ini.before`.
+9. Only if step 1 said the storage takes symlinks, with Grimoire closed:
+   `ln -s /etc/hostname /mnt/us/grimoire/templates/linked.png`, start Grimoire, New notebook, Paper: no
+   `linked` among the templates. Remove the link.
+
+## Hardening round (2026-11), invariants: the documents and the build's crate rule
+
+What the documents and comments say of the safe loader was brought in line with the code (the limit on a
+worker's record lines, what a build off the Kindle takes of the sandbox, what the UI reads of a PDF, the
+font check's second try and its mark, who writes `fonts/.cache`, where the sandbox's tests have run), and
+`rust/deny.toml` now bans the one crate that would bring a second skrifa into the build. No code path
+changes: the app behaves as before. Automated: `rust/tests/test_sec_invariants.rs` (the sentences, the
+allow-list's of the sandbox round among them, `Cargo.lock` against `deny.toml`, and the skrifa pin),
+`rust/tests/test_sec_records_cap.rs` (a worker past the cap is ended and the next starts afresh), and
+CI's `deny` job.
+
+No check on a Scribe is needed for this round's invariants. One look, for the owner, at the one shipped
+text that changed:
+
+1. Install the build. Connect the Scribe over USB and open `grimoire/app/licenses/rust-crates.txt` on the
+   computer.
+2. The file begins "From the Rust crates Cargo.lock names for the Grimoire binary." and then says that
+   every crate is listed, the ones not compiled in among them. Of the crates' age it gives the rule for a
+   release (two weeks old on the day of the tag) and where an exception is recorded, and no longer says
+   that each crate was that old.
+3. Search the file for `hayro `: its entry is there, with the version `rust/Cargo.lock` names. Nothing
+   else in the file changed.
+
+## Hardening round (2026-11), import: the file record, names, the import folder, the first look and the lock
+
+"PDF already imported." is said of the very file: a notebook made from a PDF keeps the SHA-256 and the size of
+its file, and a PDF that has a notebook's key is compared with that record. The path of a file being imported
+is kept as it is, and a path with a line break in a name is left where it is. A folder spelled like
+`grimoire/import` in another case counts as the import folder only when it is that folder. The scan's first look
+at a dropped PDF, and the import's lock file, are opened without following a link and checked to be the file at
+their name. Automated: the unit tests of `pdfimport.rs` (the record's grammar, the decision over the notebooks
+that hold a key, the two "same folder" functions, the paths a mark and a state keep);
+`rust/tests/test_sec_import_key.rs` (three PDFs of one book key: the record, the second notebook, a notebook
+without a record, the picker's cards, KOReader's request by the key, and a file that takes a PDF's name while
+that PDF is read, which is left for the next scan); `rust/tests/test_sec_import_io.rs` (a
+folder spelled like import, the look after a link, another file or a FIFO was put at the name, the lock file
+as a link, a FIFO, a folder or a file with a second name, a pick while the lock cannot be taken, and what
+reads as an import still going); `rust/tests/test_sec_import_names.rs`, `rust/tests/test_import_queue.rs`,
+`rust/tests/test_pdfimport.rs` and `rust/tests/test_browser.rs` (names with a line break, a tab or a C1
+character; in `test_import_queue.rs` also the scan that imports a file which took the name of a PDF being
+imported); and the scenario
+`tests/scenarios/z_files_3_imports.qs` (the has-notes card, and Import as notebook on it). CI's `sandbox` job
+also runs `test_sec_import_names.rs` and `test_sec_import_io.rs`, on Linux as root, where the file system tells
+names apart by case; the unit jobs run on a file system that folds case.
+
+**Not run on a Scribe.**
+
+Three things only the Scribe can say: how long a big PDF takes to read whole, and whether its storage gives
+a file one identity by its name and by an open file (the scan's look, the import lock and the move to
+`import/done` all compare the two). Steps 1 to 3, 7 and 8 must pass before a release holds this round's
+import commits. The owner's check:
+
+1. **A big PDF, the first time.** Copy the biggest PDF at hand (300 MB or more if there is one) into
+   `grimoire/import`. It is taken within about 10 s of the copy ending, as before. When the notice reaches
+   its last page ("Importing: page N of N") it stays there while the file is read once more: note for how
+   long. Afterwards `grimoire.log` has `import: <id>: its file read for its record: N KB in T ms`. Write T
+   down (the estimate is 20 to 45 s for 512 MB; it was not measured). No line says `its last slice was cut
+   off`.
+2. **Writing meanwhile.** During that last page, write a line with the pen in another notebook: it feels as
+   usual.
+3. **The same PDF again.** Copy the same file into `grimoire/import` under another name. It says "PDF
+   already imported." and goes to `import/done`; for a big file only after
+   `import: <id>: its file read to compare with a notebook's record: N KB in T ms`. Note the wait.
+4. **The record stays.** `grimoire/notebooks/<id>/source.ini` of step 1's notebook has a line starting
+   `file=sha256:`. Open that PDF in KOReader and use Open this book in Grimoire: it opens that notebook, and
+   the line is still there afterwards.
+5. **A notebook from an earlier version.** Copy in the PDF of a notebook that 2.1.0 or 2.1.0-beta.2
+   imported: "PDF already imported.", as before, and its `source.ini` gets no `file=` line.
+6. **Files.** Library > New > From a file..., to a folder holding a copy of step 1's PDF: its row says "has
+   notes" and its card offers Open its notebook, Import as notebook and Cancel. Open its notebook opens it;
+   Import as notebook says "PDF already imported.". The PDF of step 5 offers Open its notebook and Cancel
+   only.
+7. **A small PDF after a restart.** Start Grimoire and copy a small PDF into `grimoire/import`: it is taken
+   within about 10 s, and once it is a notebook the file is in `import/done`. `grimoire.log` has no
+   `the import lock cannot be taken` line, no `differs from its listing` line and no
+   `no longer holds the file that was read` line, and the scan's line counts `0 that differ from their
+   listing`. This step decides whether the three checks suit the Scribe's storage: the first line would mean
+   that no import starts there, the second that every PDF waits a minute, the third that an imported PDF
+   stays in `import/` and is read again up to three times.
+8. **A second start during an import.** Start a long import, close Grimoire while it runs and open it
+   again: the notice goes on. Pick another PDF in Files: "Another import is still going. This one starts
+   after it.", and it starts once the first has ended.
+9. **A pick in the import folder.** Files > All storage > grimoire > import, pick a PDF there: it becomes a
+   notebook, the file is in `import/done` afterwards, and it is not imported a second time.
+10. **Optional, another spelling.** With Grimoire closed, rename `grimoire/import` to `Import` (in two
+    steps, through another name). Start Grimoire, Files > All storage > grimoire > Import: pick a PDF, then
+    a folder of pictures. One notebook each, both filed in `done`, and none a second time after leaving the
+    Library and coming back. Rename the folder back.
+11. **Optional, an edited copy.** A copy of step 1's PDF, saved again by another program with something
+    appended, can have the book's key and another content (the key reads 1 KiB at a few fixed places: a copy
+    that changed one of them, or grew past the next, has a key of its own). Copy it into `grimoire/import`:
+    it becomes a notebook of its own ("<Name> 2"). The step counts only when `grimoire.log` then has
+    `import: <id>: a notebook holds this PDF's key but was made from another file; this one is imported`:
+    without that line the copy had another key and the step showed nothing. With it, open step 1's PDF (the
+    first file, not the copy) in KOReader and use Open this book in Grimoire: it opens step 1's notebook,
+    not the copy's.
+
+If step 1's T is long enough to matter, or step 2 shows the pen lagging, see the BACKLOG entry on the import's
+whole-file read ("Hardening round (2026-11), import: what waits"). If step 7 shows any of its three lines, do
+not release: send grimoire.log.
+
+## 2.2 work, the Font sheet in the new Settings menu (#115, #116)
+
+Since the new Settings menu (#115, which the owner checked on a Kindle Scribe), Settings > Font is the Font row
+of Settings' Display category, and its sheet works as Language does: a tap on a font applies it at once and
+saves it (with one Full refresh, as a style change); Back and Esc return to Settings and the X closes all of
+Settings, each keeping the font tapped. That replaces "Done applies, Cancel leaves the font as it was" in the
+sections "2.1.0, Classic fonts", "2.1.0-beta.2, L10 (your own fonts)" (step 8) and "2.1.0-beta.2, fix round,
+F3" (step 3), which describe the 2.1.0 builds.
+
+Automated: tests/scenarios/y_fonts.qs (a tap applies the family and saves it with a Full refresh; Back and Esc
+keep it; the X closes Settings with one ui refresh; Gothic has no Font row), z_fonts_kept.qs (the font y_fonts
+tapped last is there at the next start: y_fonts quits with the storage full after that tap, so the tap saved
+it), y_fonts_unknown.qs (an unknown `font=` line stays while the sheet is left with no tap, and a font tapped
+replaces it at once), y_fonts_own_1_sheet.qs and z_fonts_own_kept.qs (a font of the owner's own applied and
+saved at the tap, kept by Back and by the X, and there at the next start), and rust/tests/test_fontguard.rs
+`terminess_tapped_after_a_strike_takes_the_font_away_at_once` (after a start in Terminess that a crash made,
+Terminess tapped, then Back: no `font=file:` line is left, and the next start does not load the font).
+
+On the Scribe:
+
+1. **A tap applies.** In Classic, Settings, the Display category, Font: tap Atkinson. One full refresh, and the
+   sheet is in Atkinson; Back: Settings is in Atkinson and its row reads "Font: Atkinson"; restart Grimoire:
+   still Atkinson.
+2. **Back keeps the font tapped.** Tap Literata, then Back: Settings stays in Literata. Tap Atkinson, then the
+   X: the Library is in Atkinson.
+3. **Terminess after a crash.** As step 3 of "2.1.0-beta.2, fix round, F3", but tap Terminess and then Back:
+   settings.ini has no `font=file:` line any more, and the next start does not load the font.

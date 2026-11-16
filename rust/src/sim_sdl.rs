@@ -17,6 +17,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 
 // Exercise the evdev frame adapters on the host as well as cross-checking the Kindle build.
 #[cfg(test)]
@@ -68,6 +69,8 @@ const EXPECT_VALUE_CAP: usize = 512;
 struct Expect {
     /// read, not checked yet
     pending: bool,
+    /// waitfor: retry a known probe until it matches or this bounded deadline passes.
+    until: Option<Instant>,
     /// the line could not be read: it fails when its turn comes
     bad: bool,
     line: i32,
@@ -102,6 +105,10 @@ struct State {
     // shortcuts are on, but watched, listed and announced only while they are, as on the Kindle.
     hids: [InputHid; 4],
     nhids: usize,
+    /// "hid keys NAME": the attached device the script's key, keyup and axis lines come from from then on
+    /// (its name and numbers on each event, so its shortcuts profile applies), until "hid keys" alone or
+    /// its detach; None: the script's own keyboard, no device (the default shortcuts)
+    key_dev: Option<InputHid>,
 
     // input_sample_hook's (Live view's): called for each pen event as it is queued, and before
     // each event is taken. They run under this module's borrow: by input.h's rule they only store
@@ -125,9 +132,9 @@ struct State {
     sim_invert: bool,
     /// what the simulated panel shows
     eink: Vec<u8>,
-    stats: [i32; 3],
+    stats: [i32; 4],
     ink_frames: i32,
-    area: [i64; 3],
+    area: [i64; 4],
     // Live ink as display_fbink.c keeps it, for the script's display.* checks: whether a colour panel
     // would wait after the last fast refresh, and whether the app asks for the pen mode.
     ink: LiveInk,
@@ -159,12 +166,32 @@ struct State {
     // ---- script mode ----
     script: Option<BufReader<File>>,
     wait_until: u32,
+    // App time at the end of a wait; waitbg holds it still until the job has finished.
+    wait_script_until: Option<u32>,
     /// hold's PATH: the script resumes once that file exists ("" for none)
     hold_file: FixedStr<256>,
     /// external test driver owns lifetime after the hold command
     script_hold: bool,
     /// waitbg: the wait ends early once no background job is queued or running
     wait_bg: bool,
+    /// GRIMOIRE_SIM_LATE_MS: every `wait` ends this much late, as on a loaded machine whose timers
+    /// wake late (the release runner's did, by 60 ms and more): what a script times by its waits
+    /// must hold all the same
+    late_ms: u32,
+    /// `mods N`: the KEYMOD_* bits every pen and touch event carries from then on (a paired keyboard's
+    /// Shift held while tapping, say), 0 for none
+    ptr_mods: u32,
+    /// The modifier keys a script's `key` holds (29, 42, 54, 56, 97, 100, 125, 126) until its `keyup`:
+    /// as input_evdev.rs, a modifier alone is no event, and every pen and touch event and key carries them
+    mod_keys: HidKeys,
+    /// Where the script's own clock is in a held legacy `touch` contact: its `touch down`'s time,
+    /// then on by each `wait`'s MS. A `touch move` or `touch up` is stamped with it (never later
+    /// than now), as the Kindle's kernel stamps a sample when the finger moved, not when the app got
+    /// to it. The real time between two lines is the waits plus whatever the machine took besides:
+    /// stamped with that, a 700 ms press read as more than 800 on a slow runner. None: no contact
+    /// held, or a `waitfor`, `waitbg` or `hold` since (their time is the machine's, so the next touch
+    /// line reads the clock: docs/SIM.md's touch row says so of all three).
+    touch_at: Option<u32>,
     pending_shot: FixedStr<128>,
     script_done: bool,
     /// last pen position
@@ -230,6 +257,7 @@ impl Default for State {
             shortcuts_enabled: false,
             hids: [InputHid::default(); 4],
             nhids: 0,
+            key_dev: None,
             sample_fn: None,
             sample_batch: None,
             raw_fd: -1,
@@ -239,9 +267,9 @@ impl Default for State {
             presented: false,
             sim_invert: false,
             eink: Vec::new(),
-            stats: [0; 3],
+            stats: [0; 4],
             ink_frames: 0,
-            area: [0; 3],
+            area: [0; 4],
             ink: LiveInk::default(),
             last_fast: -1,
             last_fast_rect: RECT_EMPTY,
@@ -257,6 +285,11 @@ impl Default for State {
             battery: Battery { percent: 100, charging: false },
             script: None,
             wait_until: 0,
+            wait_script_until: None,
+            late_ms: 0,
+            ptr_mods: 0,
+            mod_keys: HidKeys::default(),
+            touch_at: None,
             hold_file: FixedStr::new(),
             script_hold: false,
             wait_bg: false,
@@ -324,12 +357,23 @@ fn with<R>(f: impl FnOnce(&mut State) -> R) -> R {
 }
 
 impl State {
+    /// A key's device: the one "hid keys" named (its name and numbers), else none.
+    fn key_from(&self, e: &mut InEvent) {
+        if let Some(h) = self.key_dev {
+            e.hid_name = h.name;
+            e.hid_vendor = h.vendor;
+            e.hid_product = h.product;
+        }
+    }
     fn q_push(&mut self, mut e: InEvent) {
         let n = (self.qt + 1) % QN;
         if n == self.qh {
             return; // full: drop
         }
         let t = e.type_ as i32;
+        if t >= InType::PenDown as i32 && t <= InType::TouchUp as i32 {
+            e.key_mods = self.ptr_mods | hidkeys_pointer_mods(e.type_, [&self.mod_keys]);
+        }
         if let Some(f) = self.sample_fn {
             if t >= InType::PenDown as i32 && t <= InType::PenLeave as i32 {
                 f(&mut e);
@@ -770,7 +814,15 @@ impl State {
     }
 
     fn touch_ev(&mut self, t: InType, x: f32, y: f32) {
-        let e = self.make_ev(t, x, y, false);
+        let mut e = self.make_ev(t, x, y, false);
+        if t != InType::TouchDown {
+            if let Some(at) = self.touch_at {
+                if (e.t_ms.wrapping_sub(at) as i32) >= 0 {
+                    e.t_ms = at;
+                }
+            }
+        }
+        self.touch_at = if t == InType::TouchUp { None } else { Some(e.t_ms) };
         self.q_push(e);
     }
 
@@ -990,8 +1042,9 @@ pub fn display_set_invert(on: bool) {
 
 // ---- light.h: the simulated front light and power service ----
 
+/// There is one, unless GRIMOIRE_SIM_NO_LIGHT is set (docs/SIM.md): a device without a front light.
 pub fn light_available() -> bool {
-    true
+    std::env::var_os("GRIMOIRE_SIM_NO_LIGHT").is_none()
 }
 pub fn light_refresh() {}
 pub fn light_get(intensity: &mut i32, warmth: &mut i32) {
@@ -1088,6 +1141,23 @@ pub fn sys_battery_reap() {}
 pub fn sys_wall_clock() -> i64 {
     with(|st| st.clock).unwrap_or_else(wall_time)
 }
+/// All of them, as on the Kindle, but the ones GRIMOIRE_SIM_NO_SERVICES names (docs/SIM.md): a
+/// platform that leaves those to its system, for the scenarios of Settings without their rows.
+pub fn sys_services() -> Services {
+    match std::env::var("GRIMOIRE_SIM_NO_SERVICES") {
+        Ok(off) => Services::without(&off),
+        Err(_) => Services::ALL,
+    }
+}
+/// "Kindle", or what GRIMOIRE_SIM_DEVICE_NAME says (docs/SIM.md): a platform whose device has
+/// another name, for the scenarios of the texts that name it.
+pub fn sys_device_name() -> &'static str {
+    static NAME: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+    NAME.get_or_init(|| match std::env::var("GRIMOIRE_SIM_DEVICE_NAME") {
+        Ok(name) if !name.is_empty() => Box::leak(name.into_boxed_str()),
+        _ => "Kindle",
+    })
+}
 pub fn display_broken() -> bool {
     false
 }
@@ -1139,14 +1209,17 @@ fn wait_for_exports() {
 pub fn display_close() {
     let (headless, stats, area) = with(|st| (st.headless, st.stats, st.area));
     if headless || std::env::var_os("GRIMOIRE_SIM_STATS").is_some() {
+        // (the C's line, and the Rust build's Clean refreshes after it only when there were some)
+        let clean = if stats[3] > 0 { cformat!(", clean %d (%.1f MP)", stats[3], area[3] as f64 / 1e6) } else { String::new() };
         err(cformat!(
-            "refreshes: fast %d (%.1f MP), ui %d (%.1f MP), full %d (%.1f MP)\n",
+            "refreshes: fast %d (%.1f MP), ui %d (%.1f MP), full %d (%.1f MP)%s\n",
             stats[0],
             area[0] as f64 / 1e6,
             stats[1],
             area[1] as f64 / 1e6,
             stats[2],
-            area[2] as f64 / 1e6
+            area[2] as f64 / 1e6,
+            &clean
         )
         .as_bytes());
     }
@@ -1160,11 +1233,13 @@ pub fn display_close() {
 // ---- expect ----
 
 impl State {
-    // Reads "expect KEY OP VALUE" (s starts at "expect") into g_expect.
+    // Reads expect or waitfor KEY OP VALUE into the pending assertion.
     fn expect_read(&mut self, s: &[u8]) {
-        self.expect = Expect { pending: true, line: self.line_no, ..Default::default() };
+        self.expect = Expect { pending: true, line: self.line_no,
+            until: s.starts_with(b"waitfor").then(|| Instant::now() + Duration::from_secs(60)),
+            ..Default::default() };
         let at = |i: usize| -> u8 { s.get(i).copied().unwrap_or(0) };
-        let mut k = 6;
+        let mut k = strcspn(s, b" \t\r\n");
         while at(k) == b' ' || at(k) == b'\t' {
             k += 1;
         }
@@ -1199,12 +1274,12 @@ impl State {
     // "display.last_fast" "ink" when the last fast refresh was live ink, "wait" when a colour panel
     // would have waited for the driver's read after it (display_fbink.c), empty before any;
     // "display.last_fast_rect" where that refresh was, "x y w h", empty before any; "display.presents"
-    // the refreshes sent since this key was last checked, each "fast", "ui" or "full" and its "x y w h",
+    // the refreshes sent since this key was last checked, each "fast", "ui", "full" or "clean" and its "x y w h",
     // joined by ", " ("fast 50 1510 1760 120, fast 138 1970 167 150"), with ", and N more" past the
     // eighth, empty for none; the check starts the count again, so a first one only clears it.
     fn display_probe(&mut self, key: &[u8], out: &mut String, cap: usize) -> bool {
         if key == b"display.presents" {
-            const NAMES: [&str; 3] = ["fast", "ui", "full"];
+            const NAMES: [&str; 4] = ["fast", "ui", "full", "clean"];
             let mut n = 0usize;
             out.clear();
             let mut piece = String::new();
@@ -1275,7 +1350,8 @@ impl State {
 // (sys_activity), which it does at most once a minute. "pump.calls": how many times long work called
 // the work pump (work_pump, common.h) since this key was last checked, so a check counts what the
 // lines before it did. "keyboard.draws": how many times an on-screen keyboard was drawn
-// (keyboard_draw, keyboard.h) since this key was last checked, the same way.
+// (keyboard_draw, keyboard.h) since this key was last checked, the same way. "keyboard.clipboard": what the
+// keyboard's Cut or Copy took last (keyboard_clipboard), empty before the first.
 fn power_probe(key: &[u8], out: &mut String, cap: usize) -> bool {
     if key.starts_with(b"touch.") {
         // touchgest's: what the contact lines' fingers are doing (touchgest_probe)
@@ -1306,10 +1382,165 @@ fn power_probe(key: &[u8], out: &mut String, cap: usize) -> bool {
         csnprintf!(out, cap, "%u", keyboard_draws_take());
         return true;
     }
+    if key == b"keyboard.clipboard" {
+        csnprintf!(out, cap, "%s", &keyboard_clipboard());
+        return true;
+    }
     if key != b"power.pokes" {
         return false;
     }
     csnprintf!(out, cap, "%d", with(|st| st.pokes));
+    true
+}
+
+/// "display.stale.X.Y.W.H": how many pixels of that screen rect the simulated panel shows other than
+/// the app's screen holds them now, as a grayscale refresh would show them (fast refreshes leave
+/// grays dithered, and a rect no refresh reached keeps what was there). 0 where every change went
+/// out and was settled. The rect should keep clear of the toast and the clock corner, which the
+/// panel shows over the screen. -1 (unknown key) before there is an App or a panel, or for a key
+/// that is not four numbers.
+fn display_stale(a: Option<&mut App>, key: &[u8], out: &mut String, cap: usize) -> bool {
+    let Some(rest) = key.strip_prefix(b"display.stale.") else { return false };
+    let Some(a) = a else { return false };
+    let v: Vec<i32> = std::str::from_utf8(rest).unwrap_or("").split('.').filter_map(|t| t.parse().ok()).collect();
+    if v.len() != 4 {
+        return false;
+    }
+    with(|st| {
+        let ew = st.w;
+        if st.eink.is_empty() || a.screen.w != ew || a.screen.h != st.h {
+            return false;
+        }
+        let r = rect_intersect(Rect { x: v[0], y: v[1], w: v[2], h: v[3] }, Rect { x: 0, y: 0, w: ew, h: st.h });
+        let mut n = 0i64;
+        for y in r.y..r.y + r.h {
+            for x in r.x..r.x + r.w {
+                let want = a.screen.px[y as usize * a.screen.stride as usize + x as usize];
+                let want = if st.sim_invert { 255 - want } else { want };
+                if st.eink[y as usize * ew as usize + x as usize] != want {
+                    n += 1;
+                }
+            }
+        }
+        csnprintf!(out, cap, "%lld", n);
+        true
+    })
+}
+
+/// "live.stale.X.Y.W.H": how many pixels of that screen rect the browser's picture (live_picture_now: the
+/// frame's tiles with the toolbar's and the corner's layers over them and the toast with its alpha, every
+/// layer switched on) shows more than a unit of gray off what the simulated panel shows there, the panel's
+/// colors as drawn (Invert colors undone): 0 where a browser shows what the Kindle does (2.0.0, issue #16:
+/// the toolbar gone from the browser while the Kindle showed it beside a menu). "none" while Live view is
+/// off or the rect is not inside the screen. Keep the rect clear of the live chip, which the panel shows
+/// and the stream never holds, and of a refresh's dithered grays.
+fn live_stale(a: Option<&mut App>, key: &[u8], out: &mut String, cap: usize) -> bool {
+    let Some(rest) = key.strip_prefix(b"live.stale.") else { return false };
+    let Some(a) = a else { return false };
+    let v: Vec<i32> = std::str::from_utf8(rest).unwrap_or("").split('.').filter_map(|t| t.parse().ok()).collect();
+    if v.len() != 4 {
+        return false;
+    }
+    let r = Rect { x: v[0], y: v[1], w: v[2], h: v[3] };
+    let Some(seen) = live_picture_now(r) else {
+        csnprintf!(out, cap, "%s", "none");
+        return true;
+    };
+    with(|st| {
+        let ew = st.w;
+        if st.eink.is_empty() || a.screen.w != ew || a.screen.h != st.h || r.x + r.w > ew || r.y + r.h > st.h {
+            return false;
+        }
+        let mut n = 0i64;
+        for y in 0..r.h {
+            for x in 0..r.w {
+                let shown = st.eink[(r.y + y) as usize * ew as usize + (r.x + x) as usize];
+                let shown = if st.sim_invert { 255 - shown } else { shown };
+                if (seen[(y * r.w + x) as usize] as i32 - shown as i32).abs() > 1 {
+                    n += 1;
+                }
+            }
+        }
+        csnprintf!(out, cap, "%lld", n);
+        true
+    })
+}
+
+/// "live.toast.stale": how many pixels of Live view's toast layer (live_layer_now: gray and alpha), drawn
+/// over the app's screen as the browser draws it over its picture, differ by more than a unit of gray
+/// from what the simulated panel shows there, the panel's colors as drawn (Invert colors undone): 0
+/// when the browser shows the toast as the Kindle does; "none" while the layer holds none. (The app's
+/// screen after a present holds neither the toast nor the live chip nor the clock corner, which the
+/// panel shows over it: keep the toast clear of the chip and the corner. A toast shown by a fast
+/// refresh is dithered on the panel.)
+fn live_toast_stale(a: Option<&mut App>, key: &[u8], out: &mut String, cap: usize) -> bool {
+    if key != b"live.toast.stale" {
+        return false;
+    }
+    let Some(a) = a else { return false };
+    let (r, px) = live_layer_now(LIVE_LAYER_TOAST);
+    if rect_is_empty(r) {
+        csnprintf!(out, cap, "%s", "none");
+        return true;
+    }
+    with(|st| {
+        let ew = st.w;
+        if st.eink.is_empty() || a.screen.w != ew || a.screen.h != st.h || r.x < 0 || r.y < 0 || r.x + r.w > ew || r.y + r.h > st.h {
+            return false;
+        }
+        let mut n = 0i64;
+        for y in 0..r.h {
+            for x in 0..r.w {
+                let at = (r.y + y) as usize * ew as usize + (r.x + x) as usize;
+                let shown = st.eink[at];
+                let shown = if st.sim_invert { 255 - shown } else { shown };
+                let k = 2 * (y * r.w + x) as usize;
+                let (g, al) = (px[k] as i32, px[k + 1] as i32);
+                let under = a.screen.px[(r.y + y) as usize * a.screen.stride as usize + (r.x + x) as usize] as i32;
+                let seen = (g * al + under * (255 - al) + 127) / 255;
+                if (seen - shown as i32).abs() > 1 {
+                    n += 1;
+                }
+            }
+        }
+        csnprintf!(out, cap, "%lld", n);
+        true
+    })
+}
+
+/// "live.frame.stale": how many pixels of Live view's frame (what a browser is sent) differ from the app's
+/// screen, the editor's panel left out (the frame holds the page under it, the panel being a layer of its
+/// own): 0 when every change on the screen went out to the frame with its present; "none" while Live view
+/// is off.
+fn live_frame_stale(a: Option<&mut App>, key: &[u8], out: &mut String, cap: usize) -> bool {
+    if key != b"live.frame.stale" {
+        return false;
+    }
+    let Some(a) = a else { return false };
+    let skip = if a.scr == ScreenId::Editor { editor_live_hole(a) } else { RECT_EMPTY };
+    match live_frame_differs(&a.screen, skip) {
+        Some(n) => csnprintf!(out, cap, "%lld", n),
+        None => csnprintf!(out, cap, "%s", "none"),
+    };
+    true
+}
+
+/// "libindex.*": how far the library index (libindex.rs: every notebook's pages, names and links, for
+/// the Graph of all notebooks) has got, whatever screen is up. "libindex.complete" 1 once its check of
+/// every notebook is through (opening a notebook starts one), 0 before the first and while one runs;
+/// "libindex.reads" how many times it has read a notebook from its files since Grimoire started (the
+/// backlinks cache's check comes first, so 0 until that is through); "libindex.books" the notebooks it
+/// holds read. A waitfor on them waits for the index itself, where a fixed wait guessed how many idle
+/// ticks the machine would give it. Read only: no file is read, nothing is counted again.
+fn libindex_probe(key: &[u8], out: &mut String, cap: usize) -> bool {
+    let Some(key) = key.strip_prefix(b"libindex.") else { return false };
+    let v = match key {
+        b"complete" => libindex_complete() as usize,
+        b"reads" => libindex_reads() as usize,
+        b"books" => libindex_with(|e| e.iter().filter(|e| e.readable()).count()),
+        _ => return false,
+    };
+    csnprintf!(out, cap, "%u", v as u32);
     true
 }
 
@@ -1323,25 +1554,46 @@ fn probe_app(a: Option<&mut App>, key: &[u8], out: &mut String, cap: usize) -> i
     }
 }
 
+/// The keys whose check starts their count again (docs/SIM.md says so of each): display.presents,
+/// main.longest_unpumped_ms, pump.calls and keyboard.draws (here) and fshape.fired (editor_probe, under
+/// both its names). waitfor refuses them: it tries its check again and again, and each try would clear
+/// what it waits for. (sim_reset_on_read_keys_are_the_docs checks the list against docs/SIM.md.)
+const RESET_ON_READ: [&[u8]; 6] = [
+    b"display.presents",
+    b"main.longest_unpumped_ms",
+    b"pump.calls",
+    b"keyboard.draws",
+    b"fshape.fired",
+    b"editor.fshape.fired",
+];
+
 // Checks the expect just read. gone: the app quit before the script got to it, so only "running"
 // has an answer (0); any other key fails as not run.
-fn expect_check_as(gone: bool, a: Option<&mut App>) {
-    let (bad, line, op, key, value, watch_fd) = with(|st| {
-        st.expect.pending = false;
-        st.expect_total += 1;
-        (st.expect.bad, st.expect.line, st.expect.op, st.expect.key.clone(), st.expect.value.clone(), st.watch_fd)
+fn expect_check_as(gone: bool, mut a: Option<&mut App>) {
+    let (bad, line, op, key, value, watch_fd, until) = with(|st| {
+        (st.expect.bad, st.expect.line, st.expect.op, st.expect.key.clone(), st.expect.value.clone(), st.watch_fd, st.expect.until)
     });
     let mut got = String::new();
     let running = key == b"running";
     let watching = key == b"watching";
     if bad {
         err(&bformat("expect failed (line %d): cannot read it (expect KEY is|has|not VALUE)\n", &[B::D(line)]));
+    } else if until.is_some() && RESET_ON_READ.contains(&key.as_slice()) {
+        // (each try would start the count again: a waitfor could pass on what it cleared itself, or never
+        // see a count reach its value; not read, so the count is left for an expect)
+        err(&bformat("expect failed (line %d): waitfor cannot wait on %s, which starts again when read (wait, then expect it)\n",
+            &[B::D(line), B::S(&key)]));
     } else if gone && !running {
         err(&bformat("expect failed (line %d): not run (the app quit before the script got here)\n", &[B::D(line)]));
     } else if !running
         && !watching
         && !with(|st| st.display_probe(&key, &mut got, GOT_CAP))
+        && !display_stale(a.as_deref_mut(), &key, &mut got, GOT_CAP)
+        && !live_toast_stale(a.as_deref_mut(), &key, &mut got, GOT_CAP)
+        && !live_frame_stale(a.as_deref_mut(), &key, &mut got, GOT_CAP)
+        && !live_stale(a.as_deref_mut(), &key, &mut got, GOT_CAP)
         && !power_probe(&key, &mut got, GOT_CAP)
+        && !libindex_probe(&key, &mut got, GOT_CAP)
         && probe_app(a, &key, &mut got, GOT_CAP) != 0
     {
         err(&bformat("expect failed (line %d): unknown key \"%s\"\n", &[B::D(line), B::S(&key)]));
@@ -1359,14 +1611,26 @@ fn expect_check_as(gone: bool, a: Option<&mut App>) {
             ExpectOp::Not => g != value.as_slice(),
         };
         if ok {
+            expect_done(false);
             return;
+        }
+        if !gone && until.is_some_and(|end| Instant::now() < end) {
+            return; // timers keep running; this one assertion is counted only when it ends
         }
         err(&bformat(
             "expect failed (line %d): %s is \"%s\", wanted %s \"%s\"\n",
             &[B::D(line), B::S(&key), B::S(g), B::S(K_EXPECT_OPS[op as usize].as_bytes()), B::S(&value)],
         ));
     }
-    with(|st| st.expect_failed += 1);
+    expect_done(true);
+}
+
+fn expect_done(failed: bool) {
+    with(|st| {
+        st.expect.pending = false;
+        st.expect_total += 1;
+        st.expect_failed += i32::from(failed);
+    });
 }
 
 fn expect_check(a: Option<&mut App>) {
@@ -1384,7 +1648,8 @@ fn expect_unrun() {
         let read = with(|st| {
             let line = st.script_line()?;
             let s = skip_space(c_str(&line));
-            let is_expect = s.starts_with(b"expect") && (s.len() == 6 || isspace(s[6]));
+            let is_expect = (s.starts_with(b"expect") && (s.len() == 6 || isspace(s[6])))
+                || (s.starts_with(b"waitfor") && (s.len() == 7 || isspace(s[7])));
             if is_expect {
                 st.expect_read(s);
             }
@@ -1457,11 +1722,11 @@ enum Step {
     /// `tap panel NAME` / `pentap panel NAME` (true: the pen): the panel's button NAME is found where the
     /// App is (script_step), then tapped like `tap` and `pentap` do, and the batch ends
     Panel(FixedStr<32>, bool),
-    MapNode(u32, bool),
+    MapNode(FixedStr<48>, bool),
     Library(FixedStr<96>,bool),
     Share(FixedStr<96>,bool),
     LibraryContact(FixedStr<96>,InType),
-    Strokes(FixedStr<512>,usize,u32),
+    Strokes(FixedStr<512>,usize,u32,usize),
 }
 
 // Reads script lines until a batch boundary (wait/shot/end). Returns false at EOF.
@@ -1558,7 +1823,8 @@ fn script_step_in(st: &mut State) -> Step {
                 if st.qh!=st.qt {st.unread=Some(line.clone());st.line_no-=1;return Step::Batch;}
                 let mut path=FixedStr::new();path.set_bytes(sc.word(511).unwrap_or(b""));
                 let n=sc.float().unwrap_or(usize::MAX as f32) as usize;let hold=sc.float().unwrap_or(0.0) as u32;
-                return Step::Strokes(path,n,hold);
+                let from=sc.float().unwrap_or(0.0).max(0.0) as usize;
+                return Step::Strokes(path,n,hold,from);
             }
             st.eraser = a == b"eraser";
             let k = scan_floats(s, 2, &mut v);
@@ -1620,17 +1886,41 @@ fn script_step_in(st: &mut State) -> Step {
                 st.pen_ev(InType::PenUp, px, py, 0.0, 0.0, 0.0, ((steps + 1) as u32).wrapping_mul(5));
             }
             st.eraser = false;
+        } else if a == b"mods" {
+            // mods N: the keyboard's modifiers held now (KEYMOD_*: 1 Ctrl, 2 Shift, 4 Alt, 8 Meta), as a
+            // modifier key's press or release leaves them (hidkeys_mods_held); 0 lets go. In order with the
+            // events before it: they reach the app first.
+            if st.qh != st.qt {
+                st.unread = Some(line.clone());
+                st.line_no -= 1;
+                return Step::Batch;
+            }
+            let mut iv = [0i32; 1];
+            scan_ints(s, 1, &mut iv);
+            // (both readers: what Select's lasso reads as it begins, hidkeys_mods_held, and what every pen
+            // and touch event carries from here on, as a paired keyboard's Shift held while tapping)
+            hidkeys_set_mods_held(iv[0]);
+            st.ptr_mods = iv[0].max(0) as u32;
         } else if a == b"key" || a == b"keyup" {
             let mut iv = [0i32; 3]; // code, mods, pad
             scan_ints(s, 1, &mut iv);
-            let e = InEvent {
+            if iv[2] == 0 && hidkeys_modifier(iv[0]) {
+                // A modifier is held (key) or let go (keyup), no event of its own (input_evdev.rs).
+                let mut none = [HidPress::default(); 2];
+                hidkeys_event(&mut st.mod_keys, HidKind::Keyboard, 1, iv[0], (a.len() == 3) as i32, &mut none);
+                // (and what the keyboards hold, as input_evdev.rs sets it after each key event)
+                hidkeys_set_mods_held(hidkeys_mods(&st.mod_keys) | (st.ptr_mods as i32));
+                continue;
+            }
+            let mut e = InEvent {
                 type_: if a.len() > 3 { InType::KeyUp } else { InType::Key },
                 value: iv[0],
-                key_mods: iv[1] as u32,
+                key_mods: iv[1] as u32 | hidkeys_mods(&st.mod_keys) as u32,
                 gamepad: iv[2] != 0,
                 t_ms: now_ms(),
                 ..Default::default()
             };
+            st.key_from(&mut e);
             st.q_push(e);
         } else if a == b"axis" {
             // axis CODE VALUE: an axis of a controller as Linux's generic driver reports an Xbox One
@@ -1662,7 +1952,7 @@ fn script_step_in(st: &mut State) -> Step {
             }
             let trig = st.axis_trig;
             if hidkeys_trigger_event(&mut st.axis_keys, &trig, iv[0], iv[1], &mut p) != 0 {
-                let e = InEvent {
+                let mut e = InEvent {
                     type_: if p.up { InType::KeyUp } else { InType::Key },
                     value: p.code,
                     key_mods: p.mods as u32,
@@ -1670,15 +1960,35 @@ fn script_step_in(st: &mut State) -> Step {
                     t_ms: now_ms(),
                     ..Default::default()
                 };
+                st.key_from(&mut e);
                 st.q_push(e);
             }
+        } else if a == b"hid" && b == b"keys" {
+            // hid keys NAME: the key, keyup and axis lines from here on come from that attached device
+            // (shortcuts profiles); hid keys alone: from the script's own keyboard again.
+            let raw = scan_hid_detach(s);
+            if raw.is_empty() {
+                st.key_dev = None;
+                continue;
+            }
+            let mut name = String::new();
+            hidkeys_name(&mut name, FixedStr::<41>::CAP, raw);
+            match st.hids[..st.nhids].iter().find(|h| h.name.as_str() == name) {
+                Some(h) => st.key_dev = Some(*h),
+                None => {
+                    err(&bformat("script: hid keys names no device attached: %s", &[B::S(s)]));
+                    st.expect_unknown_line();
+                }
+            }
         } else if a == b"hid" {
-            // hid attach pad|key|held NAME, hid detach NAME: a controller (held: one another app
-            // grabs), or a keyboard or page turner, comes or goes, as input_evdev.c reports it. A
-            // controller has sixteen buttons from BTN_A, as Linux's generic driver gives one, so its
-            // name alone makes it a Switch-mode one ("Pro Controller", hidkeys_switch).
+            // hid attach pad|key|held[:VVVV:PPPP] NAME, hid detach NAME: a controller (held: one another
+            // app grabs), or a keyboard or page turner, comes or goes, as input_evdev.c reports it, with
+            // its vendor and product numbers in hex (EVIOCGID; 0 without). A controller has sixteen
+            // buttons from BTN_A, as Linux's generic driver gives one, so its name alone makes it a
+            // Switch-mode one ("Pro Controller", hidkeys_switch).
             let attach = b == b"attach";
             let (kind, raw) = if attach { scan_hid_attach(s) } else { (&b""[..], scan_hid_detach(s)) };
+            let (kind, ids) = split_hid_ids(kind);
             let mut e = InEvent {
                 type_: if attach { InType::HidAttach } else { InType::HidDetach },
                 t_ms: now_ms(),
@@ -1691,9 +2001,12 @@ fn script_step_in(st: &mut State) -> Step {
             while i < st.nhids && st.hids[i].name != e.hid_name {
                 i += 1;
             }
-            if attach && st.nhids < 4 && (kind == b"pad" || kind == b"key" || kind == b"held") {
-                let mut h = InputHid { gamepad: kind != b"key", held: kind == b"held", ..Default::default() };
+            if attach && st.nhids < 4 && (kind == b"pad" || kind == b"key" || kind == b"held") && ids.is_some() {
+                let (vendor, product) = ids.unwrap_or((0, 0));
+                let mut h = InputHid { gamepad: kind != b"key", held: kind == b"held", vendor, product, ..Default::default() };
                 h.name = e.hid_name;
+                e.hid_vendor = vendor;
+                e.hid_product = product;
                 let mut buttons = [0u8; HID_KEY_BYTES];
                 for code in 304..=319usize {
                     buttons[code / 8] |= 1u8 << (code % 8);
@@ -1705,6 +2018,11 @@ fn script_step_in(st: &mut State) -> Step {
                 e.value = h.held as i32;
             } else if !attach && b == b"detach" && i < st.nhids {
                 e.gamepad = st.hids[i].gamepad;
+                e.hid_vendor = st.hids[i].vendor;
+                e.hid_product = st.hids[i].product;
+                if st.key_dev.is_some_and(|k| k.name == st.hids[i].name) {
+                    st.key_dev = None; // (its keys cannot come any more)
+                }
                 st.nhids -= 1;
                 st.hids[i] = st.hids[st.nhids];
             } else {
@@ -1788,8 +2106,11 @@ fn script_step_in(st: &mut State) -> Step {
                     st.line_no -= 1;
                     return Step::Batch;
                 }
-                let pid = std::str::from_utf8(sc.word(15).unwrap_or(b"0")).ok().and_then(|s| s.parse().ok()).unwrap_or(0);
-                return Step::MapNode(pid, a == b"pentap");
+                // (a page of the notebook shown, or of the editor's in the Graph of all notebooks: <page id>; any
+                // notebook's: <notebook id>:<page id>)
+                let mut spec = FixedStr::<48>::new();
+                spec.set_bytes(sc.word(47).unwrap_or(b"0"));
+                return Step::MapNode(spec, a == b"pentap");
             }
             if b == b"panel" || b==b"editor" {
                 // The buttons are those the app drew from what is queued ahead of this line (a stroke
@@ -1840,21 +2161,31 @@ fn script_step_in(st: &mut State) -> Step {
             }
             return Step::Batch;
         } else if a == b"wait" {
-            st.wait_until = now_ms().wrapping_add(atoi(b) as u32);
+            let ms = atoi(b).max(0) as u32;
+            st.wait_until = real_now_ms().wrapping_add(ms).wrapping_add(st.late_ms);
+            st.wait_script_until = crate::util::sim_clock().map(|at| at.wrapping_add(ms));
             st.wait_bg = false;
+            st.touch_at = st.touch_at.map(|at| at.wrapping_add(ms));
             return Step::Batch;
         } else if a == b"hold" {
+            st.touch_at = None;
             st.script_hold = true;
             st.hold_file.set_bytes(b);
             return Step::Batch;
         } else if a == b"waitbg" {
             // Background work (an import, a template's picture, a PDF) takes as long as the machine
             // lets it: wait for it to end, not a time that holds on a quiet machine only.
-            st.wait_until = now_ms().wrapping_add((if !b.is_empty() { atoi(b) } else { 60000 }) as u32);
+            st.wait_script_until = None;
+            st.wait_until = real_now_ms().wrapping_add((if !b.is_empty() { atoi(b) } else { 60000 }) as u32);
             st.wait_bg = true;
+            st.touch_at = None;
             return Step::Batch;
         } else if a == b"shot" {
             st.pending_shot.set_bytes(b);
+            return Step::Batch;
+        } else if a == b"waitfor" {
+            st.expect_read(s);
+            st.touch_at = None; // elapsed time belongs to the real clock, as with waitbg
             return Step::Batch;
         } else if a == b"expect" {
             st.expect_read(s);
@@ -1923,6 +2254,23 @@ fn script_step_in(st: &mut State) -> Step {
             SIM_STORAGE_FULL.store(b == b"full", Ordering::Relaxed);
             if b != b"full" && b != b"ok" {
                 st.expect_unknown_line();
+            }
+        } else if a == b"pdfimport" {
+            // pdfimport PATH [NAME [FOLDER]]: the picker's entry (lane L8) with no picker: imports the PDF at
+            // PATH (relative to the storage root, GRIMOIRE_STORAGE or the folder around the data root), read
+            // in place and never moved, named NAME (words joined by _ for spaces) into Library folder FOLDER.
+            // A lock held by a detached import leaves it waiting (the Import place's Waiting).
+            let t = String::from_utf8_lossy(b).into_owned();
+            let w: Vec<&str> = t.split_whitespace().collect();
+            let unspace = |x: &str| x.replace('_', " ");
+            match w.first().and_then(|p| crate::fsview::StoragePath::new(p.as_bytes())) {
+                Some(sp) => {
+                    let name = w.get(1).map(|x| unspace(x));
+                    let folder = w.get(2).map(|x| unspace(x));
+                    let r = crate::pdfimport::pdf_import_queue(&sp, name.as_deref(), folder.as_deref(), store_dpi());
+                    qlog!("script: pdfimport: %s", &format!("{r:?}"));
+                }
+                None => st.expect_unknown_line(),
             }
         } else if a == b"powerd" {
             // powerd STATE: what the power service reports from now on (active, screenSaver, ...)
@@ -2048,15 +2396,15 @@ fn script_step(mut a: Option<&mut App>) {
                 });
                 break;
             }
-            Step::Strokes(path,n,hold)=>{
+            Step::Strokes(path,n,hold,from)=>{
                 let mut page=None;
-                let data=read_file(path.as_str());
+                let data=read_system_file(path.as_str());
                 if data.is_none() || page_deserialize(data.as_deref().unwrap_or(&[]),&mut page)!=0 || page.as_ref().is_none_or(|p|p.readonly) || a.as_ref().is_none_or(|a|a.scr!=ScreenId::Editor) {
                     with(|st|{err(format!("expect failed (line {}): cannot replay strokes from {}\n",st.line_no,path.as_str()).as_bytes());st.expect_total+=1;st.expect_failed+=1;});
                     continue;
                 }
                 let page=page.unwrap();let mut lines=std::collections::VecDeque::new();
-                for stroke in page.strokes.iter().take(n) {
+                for stroke in page.strokes.iter().skip(from).take(n) {
                     for (i,p) in stroke.pts.iter().enumerate() {
                         let (x,y)=crate::editor::editor_replay_point(a.as_deref().unwrap(),p.x,p.y);
                         if i>0 {let dt=p.t_ms.wrapping_sub(stroke.pts[i-1].t_ms).min(1000);if dt>0 {lines.push_back(format!("wait {}",dt).into_bytes());}}
@@ -2090,12 +2438,12 @@ fn script_step(mut a: Option<&mut App>) {
                     err(format!("expect failed (line {}): no library control {}\n",st.line_no,name.as_str()).as_bytes());st.expect_total+=1;st.expect_failed+=1;
                 }});break;
             }
-            Step::MapNode(pid, pen) => {
-                let at = a.as_deref_mut().and_then(|a| crate::editor::editor_map_point(a, pid));
+            Step::MapNode(spec, pen) => {
+                let at = a.as_deref_mut().and_then(|a| crate::editor::editor_map_point(a, spec.as_str()));
                 with(|st| match at {
                     Some((x, y)) => st.tap_events(x, y, pen),
                     None => {
-                        err(format!("expect failed (line {}): no map node {}\n", st.line_no, pid).as_bytes());
+                        err(format!("expect failed (line {}): no map node {}\n", st.line_no, spec.as_str()).as_bytes());
                         st.expect_total += 1;
                         st.expect_failed += 1;
                     }
@@ -2164,6 +2512,20 @@ pub fn input_open(screen_w: i32, screen_h: i32, dpi: f32, pen: Option<&InputCali
         let stall = std::env::var_os("GRIMOIRE_SIM_STALL_MS").map_or(0, |v| atoi(v.as_bytes()));
         with(|st| st.raw_stall_ms = stall.max(0));
     }
+    if std::env::var("GRIMOIRE_SIM_CLOCK").as_deref() == Ok("script") {
+        // GRIMOIRE_SIM_UPTIME_MS: the scripted clock starts there, as on a machine up that long, in
+        // place of the host's own time since it started.
+        let start = std::env::var_os("GRIMOIRE_SIM_UPTIME_MS").map_or_else(real_now_ms, |v| atoi(v.as_bytes()).max(0) as u32);
+        crate::util::sim_clock_set(Some(start));
+    }
+    if let Some(late) = std::env::var_os("GRIMOIRE_SIM_LATE_MS") {
+        let late = atoi(late.as_bytes()).max(0) as u32;
+        with(|st| st.late_ms = late);
+    }
+    // (the backlinks cache's check slowed, a tick at a time: backlinks.rs)
+    if let Some(ms) = std::env::var_os("GRIMOIRE_SIM_BACKLINKS_STEP_MS") {
+        crate::backlinks::backlinks_sim_step_ms_set(atoi(ms.as_bytes()).max(0) as u32);
+    }
     if let Some(sp) = std::env::var_os("GRIMOIRE_SIM_PRESSURE") {
         let p = clampf(atof(sp.as_bytes()) as f32, 0.0, 1.0);
         with(|st| st.pressure = p);
@@ -2175,7 +2537,7 @@ pub fn input_open(screen_w: i32, screen_h: i32, dpi: f32, pen: Option<&InputCali
             // so once CLOCK_MONOTONIC passes 2^31 ms, 24.8 days up, every run waited forever.)
             Ok(f) => with(|st| {
                 st.script = Some(BufReader::new(f));
-                st.wait_until = now_ms();
+                st.wait_until = real_now_ms();
             }),
             Err(_) => {
                 err(&bformat("cannot open script %s\n", &[B::S(script.as_bytes())]));
@@ -2254,6 +2616,7 @@ pub fn input_close() {
     work_pump_set(None);
     work_pump_mark_set(None);
     expect_unrun();
+    crate::util::sim_clock_set(None);
     with(|st| st.script = None);
 }
 
@@ -2357,7 +2720,16 @@ fn poll_in(ev: &mut InEvent, timeout_ms: i32, mut a: Option<&mut App>) -> i32 {
         // timeout 0 still drains every due event, including releases after a slow frame.
         if timeout_ms != 0 {
             let left = due.wrapping_sub(now_ms()) as i32;
-            if left > 0 { sleep_ms(if timeout_ms < 0 { left } else { left.min(timeout_ms) }); }
+            if left > 0 {
+                let step = if timeout_ms < 0 { left } else { left.min(timeout_ms) };
+                sleep_ms(step);
+                // GRIMOIRE_SIM_CLOCK=script: app time stands still while the runner sleeps, and the
+                // click's events are stamped by it, so the click's own time moves it on, as a wait's
+                // does (else its release would never come due, and no line after it be read).
+                if let Some(at) = crate::util::sim_clock() {
+                    crate::util::sim_clock_set(Some(at.wrapping_add(step as u32)));
+                }
+            }
             if with(|st| st.q_pop(ev)) { return 1; }
         }
         return 0;
@@ -2393,6 +2765,10 @@ fn poll_in(ev: &mut InEvent, timeout_ms: i32, mut a: Option<&mut App>) -> i32 {
         });
         if with(|st| st.expect.pending) {
             expect_check(a.as_deref_mut()); // an expect waits for the same moment
+            if let Some(end) = with(|st| st.expect.until.filter(|_| st.expect.pending)) {
+                waitfor_idle(end, timeout_ms);
+                return 0;
+            }
         }
         with(|st| {
             if st.script_hold && !st.hold_file.is_empty() && access_exists(st.hold_file.as_bytes()) {
@@ -2413,22 +2789,33 @@ fn poll_in(ev: &mut InEvent, timeout_ms: i32, mut a: Option<&mut App>) -> i32 {
         if with(|st| st.wait_bg) && !bg_busy() {
             with(|st| {
                 st.wait_bg = false;
-                st.wait_until = now_ms(); // (reaped: its toast is up)
+                st.wait_until = real_now_ms(); // (reaped: its toast is up)
             });
         }
         let (wait_until, wait_bg) = with(|st| (st.wait_until, st.wait_bg));
         // (One reading of the clock for both: the wait is over once the signed difference from it
         // is no longer negative, and what is left is measured from that same reading, so a wait
         // that ended between two readings never comes out as 2^32 ms still to go.)
-        let now = now_ms();
+        let now = real_now_ms();
         if (now.wrapping_sub(wait_until) as i32) < 0 {
             let mut left = wait_until.wrapping_sub(now);
             if wait_bg && left > 20 {
                 left = 20; // look again soon
             }
             let t = timeout_ms as u32;
-            sleep_ms((if left < t { left } else { t }) as i32);
+            let step = left.min(t);
+            sleep_ms(step as i32);
+            if let Some(end) = with(|st| st.wait_script_until) {
+                let at = now_ms();
+                crate::util::sim_clock_set(Some(at.wrapping_add(end.wrapping_sub(at).min(step))));
+            }
             return 0;
+        }
+        if let Some(end) = with(|st| st.wait_script_until.take()) {
+            if now_ms() != end {
+                crate::util::sim_clock_set(Some(end));
+                return 0; // let the app tick at the wait's end before reading the next check
+            }
         }
         if !with(|st| st.script_done) {
             script_step(a);
@@ -2439,8 +2826,32 @@ fn poll_in(ev: &mut InEvent, timeout_ms: i32, mut a: Option<&mut App>) -> i32 {
     0
 }
 
+/// A waitfor not ready yet idles as a wait does: the poll's timeout at a time (the main loop's 30 ms, so
+/// the app's idle ticks come as often as in a wait or on the Kindle at rest), cut at the waitfor's
+/// deadline, and with GRIMOIRE_SIM_CLOCK=script app time moved on by what was slept, as a wait moves it
+/// (else a waitfor on what a timer does would see app time stand still until its deadline).
+fn waitfor_idle(end: Instant, timeout_ms: i32) {
+    let left = end.saturating_duration_since(Instant::now()).as_millis().min(u32::MAX as u128) as u32;
+    let step = left.min(timeout_ms as u32).max(1);
+    sleep_ms(step as i32);
+    if let Some(at) = crate::util::sim_clock() {
+        crate::util::sim_clock_set(Some(at.wrapping_add(step)));
+    }
+}
+
 pub fn input_poll(ev: &mut InEvent, timeout_ms: i32) -> i32 {
     poll(ev, timeout_ms, None)
+}
+
+/// Whether the main loop's batch is the script's (docs/SIM.md: the lines up to the next tap, wait,
+/// shot... are one batch), which it then never ends at its 8 ms: a loaded machine (a CI runner) took
+/// longer than that over a tap's press and handed its lift to the next batch, a refresh of its own
+/// the scenarios do not count on an idle one (the pressed key or button refreshed, then again). The
+/// 64 events still end a batch (tests/scenarios/y_ink_backlog.qs), and input from the stand-in raw
+/// digitizer (GRIMOIRE_SIM_RAWPEN_MAIN) comes in its own time, as the Kindle's, so its batches keep
+/// the 8 ms.
+pub fn input_script_batch() -> bool {
+    with(|st| st.headless && st.raw_fd < 0)
 }
 
 // access(path, F_OK) == 0
@@ -2641,6 +3052,18 @@ fn scan_hid_attach(s: &[u8]) -> (&[u8], &[u8]) {
     let Some(kind) = sc.word(15) else { return (b"", b"") };
     sc.space();
     (kind, sc.up_to_newline(255).unwrap_or(b""))
+}
+
+/// "pad", "pad:057e:2009": the kind of "hid attach" and its vendor and product numbers (hex; 0 and 0
+/// without), None for numbers that do not read.
+fn split_hid_ids(kind: &[u8]) -> (&[u8], Option<(u16, u16)>) {
+    let Some(colon) = kind.iter().position(|&c| c == b':') else { return (kind, Some((0, 0))) };
+    let ids = std::str::from_utf8(&kind[colon + 1..]).ok().and_then(|t| {
+        let (v, p) = t.split_once(':')?;
+        let hex = |x: &str| if x.len() == 4 { u16::from_str_radix(x, 16).ok() } else { None };
+        Some((hex(v)?, hex(p)?))
+    });
+    (&kind[..colon], ids)
 }
 
 /// sscanf(s, "%*s %*s %255[^\n]", raw): the name of "hid detach".
@@ -3151,6 +3574,290 @@ mod tests {
     }
 
     #[test]
+    fn waitfor_keeps_ticking_and_counts_one_assertion_when_ready_or_timed_out() {
+        fresh();
+        with(|st| st.expect_read(b"waitfor watching is 1"));
+        for _ in 0..4 { expect_check(None); }
+        assert!(with(|st| st.expect.pending));
+        assert_eq!(with(|st| (st.expect_total, st.expect_failed)), (0, 0));
+        with(|st| st.watch_fd = 123);
+        expect_check(None);
+        assert!(!with(|st| st.expect.pending));
+        assert_eq!(with(|st| (st.expect_total, st.expect_failed)), (1, 0));
+        // An already ready probe finishes at once, without waiting for the deadline.
+        with(|st| st.expect_read(b"waitfor watching is 1"));
+        expect_check(None);
+        assert!(!with(|st| st.expect.pending));
+        assert_eq!(with(|st| st.expect_total), 2);
+        // A bounded wait fails as one assertion; malformed and unknown probes fail at once too.
+        with(|st| {
+            st.expect_read(b"waitfor watching is 0");
+            st.expect.until = Some(Instant::now());
+        });
+        expect_check(None);
+        assert!(!with(|st| st.expect.pending));
+        assert_eq!(with(|st| (st.expect_total, st.expect_failed)), (3, 1));
+        for line in [b"waitfor typo is 1".as_slice(), b"waitfor running nope 1"] {
+            with(|st| st.expect_read(line));
+            expect_check(None);
+            assert!(!with(|st| st.expect.pending));
+        }
+        assert_eq!(with(|st| (st.expect_total, st.expect_failed)), (5, 3));
+    }
+
+    #[test]
+    fn waitfor_holds_script_input_but_resumes_as_soon_as_the_probe_matches() {
+        fresh();
+        script("waitfor-poll", "waitfor watching is 1\nkey 30 0\nquit\n");
+        let mut ev = InEvent::default();
+        assert_eq!(input_poll(&mut ev, 1), 0);
+        assert!(with(|st| st.expect.pending));
+        assert_eq!(input_poll(&mut ev, 1), 0);
+        assert_eq!(with(|st| st.line_no), 1); // no later input leaks through the wait
+        with(|st| st.watch_fd = 123);
+        assert_eq!(input_poll(&mut ev, 1), 1);
+        assert_eq!(ev.type_, InType::Key);
+        assert_eq!(with(|st| (st.expect_total, st.expect_failed)), (1, 0));
+        assert!(!with(|st| st.expect.pending));
+    }
+
+    #[test]
+    fn an_unreached_waitfor_fails_if_the_app_exits_first() {
+        fresh();
+        script("waitfor-unrun", "waitfor watching is 1\n");
+        expect_unrun();
+        assert_eq!(with(|st| (st.expect_total, st.expect_failed)), (1, 1));
+    }
+
+    /// The script clock back to host time when a test ends, a failed one too.
+    struct ScriptClock;
+    impl Drop for ScriptClock {
+        fn drop(&mut self) {
+            crate::util::sim_clock_set(None);
+        }
+    }
+
+    #[test]
+    fn waitfor_idles_a_poll_timeout_a_round_and_moves_the_script_clock_as_wait_does() {
+        fresh();
+        script("waitfor-clock", "waitfor watching is 1\nwait 50\nquit\n");
+        let _clock = ScriptClock;
+        crate::util::sim_clock_set(Some(1000));
+        let mut ev = InEvent::default();
+        assert_eq!(input_poll(&mut ev, 30), 0); // the waitfor read
+        assert!(with(|st| st.expect.pending));
+        assert_eq!(now_ms(), 1000);
+        // Not ready: each round sleeps the poll's timeout (the main loop's 30 ms), as a wait does, so the
+        // app's idle ticks come no faster than in a wait, and app time moves on by just that.
+        let real = Instant::now();
+        for round in 1..=3 {
+            assert_eq!(input_poll(&mut ev, 30), 0);
+            assert_eq!(now_ms(), 1000 + 30 * round);
+        }
+        assert!(real.elapsed() >= Duration::from_millis(90), "{:?}", real.elapsed());
+        assert_eq!(with(|st| st.line_no), 1);
+        // Ready: the next line is read at once, and the wait after it moves app time on as before.
+        with(|st| st.watch_fd = 123);
+        assert_eq!(input_poll(&mut ev, 30), 0);
+        assert_eq!(with(|st| (st.line_no, st.expect_total, st.expect_failed)), (2, 1, 0));
+        assert_eq!(now_ms(), 1090);
+        for _ in 0..100 {
+            if with(|st| st.line_no) == 3 {
+                break;
+            }
+            input_poll(&mut ev, 30);
+            assert!(now_ms().wrapping_sub(1090) <= 50);
+        }
+        assert_eq!((with(|st| st.line_no), now_ms()), (3, 1140));
+    }
+
+    #[test]
+    fn a_side_click_moves_the_script_clock_by_its_own_time_and_the_script_reads_on() {
+        fresh();
+        script("side-clock", "side click 2 150 80\nwait 200\nquit\n");
+        let _clock = ScriptClock;
+        crate::util::sim_clock_set(Some(5000));
+        // The hover and the first press come at once; each later event when the runner has slept up to
+        // it, app time moved on to just its stamp, however long the host took over each round. (Without
+        // that the first release never came due: app time stood at the press, and nothing after the
+        // click was read.)
+        let mut ev = InEvent::default();
+        let mut got = Vec::new();
+        for _ in 0..60 {
+            if got.len() == 5 {
+                break;
+            }
+            if input_poll(&mut ev, 30) == 1 {
+                got.push((ev.type_, ev.side_button, ev.t_ms - 5000, now_ms() - 5000));
+            }
+        }
+        assert_eq!(got, [
+            (InType::PenHover, false, 0, 0),
+            (InType::PenButton, true, 0, 0),
+            (InType::PenButton, false, 80, 80),
+            (InType::PenButton, true, 230, 230),
+            (InType::PenButton, false, 310, 310),
+        ]);
+        assert!(with(|st| st.side_click_until.is_none()));
+        // The wait after it moves app time on by its 200 ms and no more: what the app times from the
+        // release (a single click's wait for a second one) is as far along at the next line as the
+        // script says, on any machine.
+        for _ in 0..100 {
+            if input_poll(&mut ev, 30) == 1 {
+                break;
+            }
+            assert!(now_ms() - 5000 <= 510, "{}", now_ms());
+        }
+        assert_eq!((ev.type_, now_ms() - 5000), (InType::Quit, 510));
+        // docs/SIM.md says so where it describes the scripted clock
+        let doc = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../docs/SIM.md")).unwrap();
+        let para = doc.split("\n\n").find(|p| p.starts_with("`GRIMOIRE_SIM_CLOCK=script`")).unwrap();
+        assert!(para.contains("`side click`"), "the scripted clock's paragraph does not name side click: {para}");
+    }
+
+    #[test]
+    fn the_library_index_probes_follow_its_check() {
+        fresh();
+        let base = std::env::var("GRIMOIRE_TEST_TMP").map(std::path::PathBuf::from).unwrap_or_else(|_| std::env::temp_dir());
+        let root = base.join(format!("sim-libindex-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(store_init(root.to_str().unwrap()), 0);
+        let probe = |key: &str| {
+            let mut got = String::new();
+            libindex_probe(key.as_bytes(), &mut got, GOT_CAP).then_some(got)
+        };
+        for name in ["A", "B", "C"] {
+            let mut nb = NotebookInfo::default();
+            assert_eq!(store_create(name, "", PAPER_BLANK, &mut nb), 0);
+        }
+        // Before its first check: nothing read, not complete.
+        assert_eq!((probe("libindex.complete"), probe("libindex.reads"), probe("libindex.books")),
+            (Some("0".into()), Some("0".into()), Some("0".into())));
+        // One notebook read a tick: the count follows, and complete comes with the check's end alone.
+        let mut seen = vec![0u32];
+        let mut ticks = 0;
+        while libindex_step() {
+            ticks += 1;
+            assert!(ticks < 1000);
+            let reads: u32 = probe("libindex.reads").unwrap().parse().unwrap();
+            assert!(reads == *seen.last().unwrap() || reads == seen.last().unwrap() + 1, "{reads} after {seen:?}");
+            if reads != *seen.last().unwrap() {
+                seen.push(reads);
+            }
+            if reads < 3 {
+                assert_eq!(probe("libindex.complete"), Some("0".into()));
+            }
+        }
+        assert_eq!(seen, [0, 1, 2, 3]);
+        assert_eq!((probe("libindex.complete"), probe("libindex.reads"), probe("libindex.books")),
+            (Some("1".into()), Some("3".into()), Some("3".into())));
+        // A notebook opened starts a check again (editor_open_notebook: libindex_revalidate): not complete
+        // until it is through, and nothing is read again where no file changed.
+        libindex_revalidate();
+        assert_eq!(probe("libindex.complete"), Some("0".into()));
+        while libindex_step() {}
+        assert_eq!((probe("libindex.complete"), probe("libindex.reads")), (Some("1".into()), Some("3".into())));
+        // An expect and a waitfor read them (the runner answers these keys, with no App); an unknown one fails.
+        for (line, failed) in [("expect libindex.books is 3", 0), ("waitfor libindex.complete is 1", 0), ("expect libindex.nope is 1", 1)] {
+            let before = with(|st| st.expect_failed);
+            with(|st| st.expect_read(line.as_bytes()));
+            expect_check(None);
+            assert!(!with(|st| st.expect.pending), "{line}");
+            assert_eq!(with(|st| st.expect_failed) - before, failed, "{line}");
+        }
+        // and docs/SIM.md lists the three
+        let doc = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../docs/SIM.md")).unwrap();
+        let row = doc.lines().find(|l| l.starts_with("| `libindex.complete`")).expect("docs/SIM.md has no libindex row");
+        for key in ["`libindex.reads`", "`libindex.books`"] {
+            assert!(row.contains(key), "the libindex row does not name {key}: {row}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_waitfor_hands_a_held_touch_back_to_the_clock_as_the_docs_say() {
+        fresh();
+        script("waitfor-touch", "touch down 100 100\nwaitfor watching is 1\nwait 300\ntouch up 100 100\nquit\n");
+        let _clock = ScriptClock;
+        crate::util::sim_clock_set(Some(1000));
+        let mut ev = InEvent::default();
+        assert_eq!(input_poll(&mut ev, 30), 1);
+        assert_eq!((ev.type_, ev.t_ms), (InType::TouchDown, 1000));
+        for _ in 0..3 {
+            assert_eq!(input_poll(&mut ev, 30), 0);
+        }
+        assert!(with(|st| st.expect.pending));
+        with(|st| st.watch_fd = 123);
+        assert_eq!(input_poll(&mut ev, 30), 0);
+        let ready = now_ms();
+        assert!(ready > 1000, "{ready}"); // the waitfor idled with the finger down
+        let mut up = None;
+        for _ in 0..100 {
+            if input_poll(&mut ev, 30) == 1 && ev.type_ == InType::TouchUp {
+                up = Some(ev.t_ms);
+                break;
+            }
+        }
+        // The press lasted the waitfor and the wait: not the touch down plus the wait alone (1300), as if
+        // no time went by while the waitfor held the finger down.
+        assert_eq!(up, Some(ready + 300));
+        // and the touch row of docs/SIM.md says so, with the other two that do it
+        let doc = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../docs/SIM.md")).unwrap();
+        let row = doc.lines().find(|l| l.starts_with("| `touch down/move/up")).unwrap();
+        for line in ["`waitfor`", "`waitbg`", "`hold`"] {
+            assert!(row.contains(line), "the touch row does not name {line}: {row}");
+        }
+    }
+
+    #[test]
+    fn waitfor_refuses_the_keys_a_check_starts_again_and_leaves_their_counts() {
+        fresh();
+        // Each try of pump.calls would take the count: refused at once, one failed check, the count left
+        // for the expect that reads it after.
+        G_PUMPS.with(|p| p.set(3));
+        with(|st| st.expect_read(b"waitfor pump.calls is 3"));
+        expect_check(None);
+        assert!(!with(|st| st.expect.pending));
+        assert_eq!(with(|st| (st.expect_total, st.expect_failed)), (1, 1));
+        assert_eq!(G_PUMPS.with(|p| p.get()), 3);
+        with(|st| st.expect_read(b"expect pump.calls is 3"));
+        expect_check(None);
+        assert_eq!(with(|st| (st.expect_total, st.expect_failed)), (2, 1));
+        // Nothing to wait for on any of them, not even what a first try would clear and then pass on.
+        for key in RESET_ON_READ {
+            for check in [b" is ".as_slice(), b" not x"] {
+                with(|st| st.expect_read(&[b"waitfor ".as_slice(), key, check].concat()));
+                expect_check(None);
+                assert!(!with(|st| st.expect.pending), "{}", String::from_utf8_lossy(key));
+            }
+        }
+        assert_eq!(with(|st| (st.expect_total, st.expect_failed)), (14, 13));
+        // An expect still reads them (the count starts again).
+        with(|st| st.expect_read(b"expect display.presents is "));
+        expect_check(None);
+        assert_eq!(with(|st| (st.expect_total, st.expect_failed)), (15, 13));
+    }
+
+    #[test]
+    fn sim_reset_on_read_keys_are_the_docs() {
+        let doc = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../docs/SIM.md")).unwrap();
+        let says = ["since this key was last checked", "reading consumes", "starts the count again"];
+        let mut documented: Vec<&str> = doc
+            .lines()
+            .filter(|l| l.starts_with("| `") && says.iter().any(|s| l.contains(s)))
+            .filter_map(|l| l[3..].split('`').next())
+            .collect();
+        documented.sort_unstable();
+        let mut listed: Vec<&str> = RESET_ON_READ
+            .iter()
+            .map(|k| std::str::from_utf8(k).unwrap())
+            .filter(|k| !k.starts_with("editor.")) // (fshape.fired by its other name)
+            .collect();
+        listed.sort_unstable();
+        assert_eq!(documented, listed);
+    }
+
+    #[test]
     fn tap_panel_is_read_before_the_floats_and_fails_without_a_button() {
         fresh();
         // `panel` is no float: the tap arm's own test comes first, so it is never `tap 0 0` (the clock
@@ -3227,8 +3934,13 @@ mod tests {
         with(|st| st.display_probe(b"display.ink_frames", &mut got, GOT_CAP));
         assert_eq!(got, "9");
         assert!(!with(|st| st.display_probe(b"display.nonsense", &mut got, GOT_CAP)));
-        assert_eq!(with(|st| st.stats), [9, 1, 0]);
+        assert_eq!(with(|st| st.stats), [9, 1, 0, 0]);
         assert_eq!(with(|st| st.area[1]), 500);
+        // a Clean (a flash of its rect alone) is named and counted apart
+        display_present(&c, Rect { x: 5, y: 6, w: 7, h: 8 }, RefreshMode::Clean);
+        assert!(with(|st| st.display_probe(b"display.presents", &mut got, GOT_CAP)));
+        assert_eq!(got, "clean 5 6 7 8");
+        assert_eq!(with(|st| (st.stats[3], st.area[3])), (1, 56));
     }
 
     #[test]
@@ -3297,6 +4009,44 @@ mod tests {
         assert_eq!(input_hids(&mut hids), 1);
         assert_eq!(hids[0].name.as_str(), "Page Turner");
         // "hid detach Nobody" failed as an unknown line
+        assert_eq!(with(|st| (st.expect_total, st.expect_failed)), (1, 1));
+    }
+
+    // A device's numbers ("hid attach pad:2dc8:6006 NAME"), and "hid keys NAME": the key lines after it come
+    // from that device (its name and numbers on each, as input_evdev.rs sends them), until "hid keys" alone
+    // or its detach; before it they come from no device. A name not attached fails the line.
+    #[test]
+    fn hid_keys_come_from_a_device() {
+        assert_eq!(split_hid_ids(b"pad"), (&b"pad"[..], Some((0, 0))));
+        assert_eq!(split_hid_ids(b"key:05ac:0256"), (&b"key"[..], Some((0x05ac, 0x0256))));
+        assert_eq!(split_hid_ids(b"pad:5ac:256"), (&b"pad"[..], None));
+        fresh();
+        script(
+            "hid-keys",
+            "hid attach pad:2dc8:6006 Pro 2\nkey 304 0 1\nhid keys Pro 2\nkey 304 0 1\nkeyup 304 0 1\n\
+             hid keys\nkey 30 0\nhid keys Pro 2\nhid detach Pro 2\nkey 31 0\nhid keys Nobody\nwait 0\n",
+        );
+        input_shortcuts_enable(true);
+        let got: Vec<_> = batch()
+            .iter()
+            .map(|ev| (ev.type_, ev.value, ev.hid_name.as_str().to_string(), ev.hid_vendor, ev.hid_product))
+            .collect();
+        let pro = |t, v| (t, v, "Pro 2".to_string(), 0x2dc8, 0x6006);
+        let none = |t, v| (t, v, String::new(), 0, 0);
+        assert_eq!(
+            got,
+            vec![
+                pro(InType::HidAttach, 0),
+                none(InType::Key, 304),
+                pro(InType::Key, 304),
+                pro(InType::KeyUp, 304),
+                none(InType::Key, 30),
+                pro(InType::HidDetach, 0),
+                none(InType::Key, 31),
+            ]
+        );
+        let mut hids = [InputHid::default(); 4];
+        assert_eq!(input_hids(&mut hids), 0);
         assert_eq!(with(|st| (st.expect_total, st.expect_failed)), (1, 1));
     }
 
@@ -3452,6 +4202,43 @@ mod tests {
         err(b"(not reached: a check failed)\n");
     }
 
+    // The fixture came from ARM64's fused multiply-adds. Other CPUs use separate operations
+    // (util::fmla), so only the event's float fields may differ by the measured subpixel tolerance.
+    fn probe_line_matches(got: &str, want: &str, rounding: bool) -> bool {
+        if got == want { return true; }
+        if !got.starts_with("ev ") || !want.starts_with("ev ") { return false; }
+        let (g, w): (Vec<_>, Vec<_>) = (got.split(' ').collect(), want.split(' ').collect());
+        if g.len() != w.len() { return false; }
+        for i in 0..g.len() {
+            if g[i] == w[i] { continue; }
+            if i == 0 || !matches!(w[i - 1], "x" | "y" | "nx" | "ny" | "p" | "tx" | "ty" | "x2" | "y2") { return false; }
+            let (Ok(a), Ok(b)) = (u32::from_str_radix(g[i], 16), u32::from_str_radix(w[i], 16)) else { return false };
+            // The x86_64 Mac run differs by at most 1/8192 px, or 1/8388608 in normalized
+            // coordinates and pressure. Cancellation can turn that into more than a few ULPs.
+            let tolerance = if matches!(w[i - 1], "x" | "y") { 1.0 / 8192.0 } else { 1.0 / 8388608.0 };
+            let (a, b) = (f32::from_bits(a), f32::from_bits(b));
+            // NaN's sign is not specified across CPUs; it must still be NaN on both.
+            if rounding && a.is_nan() && b.is_nan() { continue; }
+            if !rounding || !a.is_finite() || !b.is_finite() || (a - b).abs() > tolerance { return false; }
+        }
+        true
+    }
+
+    #[test]
+    fn probe_tolerance_is_only_for_float_rounding() {
+        let want = "ev 2 nx 3f800000 y 40000000 v 0 dt 5";
+        assert!(probe_line_matches("ev 2 nx 3f800001 y 40000000 v 0 dt 5", want, true));
+        assert!(!probe_line_matches("ev 2 nx 3f800002 y 40000000 v 0 dt 5", want, true));
+        assert!(!probe_line_matches("ev 2 nx 3f800001 y 40000000 v 0 dt 5", want, false));
+        assert!(!probe_line_matches("ev 3 nx 3f800000 y 40000000 v 0 dt 5", want, true));
+        assert!(!probe_line_matches("ev 2 nx 3f800000 y 40000000 v 0 dt 6", want, true));
+        assert!(!probe_line_matches("ev 2 nx 7f800000 y 40000000 v 0 dt 5", want, true));
+        assert!(probe_line_matches("ev 1 x ffc00000", "ev 1 x 7fc00000", true));
+        assert!(!probe_line_matches("ev 1 x ffc00000", "ev 1 x 7fc00000", false));
+        assert!(!probe_line_matches("ev 1 x 7fc00000", "ev 1 x 3f800000", true));
+        assert!(!probe_line_matches("tally 2 0", "tally 1 0", true));
+    }
+
     #[test]
     fn sim_probe_matches_the_c() {
         let dir = std::env::var("GRIMOIRE_TEST_TMP").unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().into());
@@ -3470,15 +4257,12 @@ mod tests {
             .output()
             .unwrap();
         let want: &[u8] = include_bytes!("../tests/fixtures/sim_probe_c.txt");
-        if out.stderr != want {
-            let (g, w) = (String::from_utf8_lossy(&out.stderr), String::from_utf8_lossy(want));
-            for (i, (a, b)) in g.lines().zip(w.lines()).enumerate() {
-                if a != b {
-                    panic!("line {}:\n  rust: {a}\n  c:    {b}", i + 1);
-                }
-            }
-            panic!("the outputs differ in length: rust {} lines, c {} lines", g.lines().count(), w.lines().count());
+        let (g, w) = (String::from_utf8_lossy(&out.stderr), String::from_utf8_lossy(want));
+        let rounding = !cfg!(target_arch = "aarch64");
+        for (i, (a, b)) in g.lines().zip(w.lines()).enumerate() {
+            assert!(probe_line_matches(a, b, rounding), "line {}:\n  rust: {a}\n  c:    {b}", i + 1);
         }
+        assert_eq!(g.lines().count(), w.lines().count(), "the outputs differ in length");
         assert_eq!(out.status.code(), Some(3));
         // The shots the C stand-in left unwritten: one gray plane of the panel's size.
         let png = std::fs::read(cwd.join("shots-sim-probe/first.png")).unwrap();

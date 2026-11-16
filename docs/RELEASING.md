@@ -30,10 +30,13 @@ them.
 
 ## Before the tag
 
-1. **One branch, one commit.** Merge everything the release holds. Betas have been tagged on the
-   branch that built them while `main` stayed on the last stable release (v2.0.0-beta.3), and once
-   `main` was moved to the tag (v2.0.0-beta.1); which one is the owner's call. The workflow checks
-   out the tag, so either works. A stable release goes to `main` first, on both remotes.
+1. **One branch, one commit.** Merge everything the release holds. Since 2026-11-12 (#57) `main` is
+   the one line: finished work lands there through pull requests, and a release branch is cut from
+   `main` (`release/VERSION`), so the bump, What's new and TESTING commits are made there and merged
+   back into `main` once the release is out. (Before, betas were tagged on the branch that built them
+   while `main` stayed on the last stable release, or `main` was moved to the tag.) The workflow checks
+   out the tag, so the branch it sits on does not matter to it. A stable release goes to `main` first,
+   on both remotes.
 
 2. **The toolchain is the workflow's.** The three versions at the top of the workflow
    (`RUST_VERSION`, `ZIG_VERSION`, `CARGO_ZIGBUILD_VERSION`) must be what the Mac builds with, or
@@ -58,6 +61,11 @@ them.
    done)
    ```
 
+   `tools/check-crate-dates.py --tag-date YYYY-MM-DD` (the day the tag will be made) does the same for every
+   crate in the lock, lists those younger than two weeks at that date with the newest version old enough
+   and the `cargo update` line for each, and exits 1 if there are any. `cargo deny check` (the deny job and
+   `rust/deny.toml`) holds the licenses, the versions that appear twice and the sources.
+
    A crate that is younger goes back to its newest version older than that:
    `(cd rust && cargo update -p CRATE --precise VERSION)`, then the gate again. A crate is only ever
    moved to a version that is old enough. Both commands are in a subshell on purpose: the next step
@@ -72,12 +80,61 @@ them.
    - `README.md`: the banner, `Pre-release VERSION.` (a stable release has no banner).
    - `docs/TESTING.md`: a `## VERSION` section, with what the owner checked on a Kindle and what
      still needs a device. Claim only what the owner reported.
+   - `docs/whatsnew/VERSION.md`, this version's What's new (`docs/whatsnew/2.1.0.md`): every release
+     has one, at least a basic one (the owner's rule of 2026-11-05: "every update with changes by
+     default has at least a basic what's new"), since the first start after an update opens it by
+     itself. Each version's notes are a file of their own in `docs/whatsnew/` (since 2.1.0), and the
+     earlier ones stay as they were: What's new's Read all lists them all, newest first (the owner,
+     2026-11-06: "some of them are important"). Write the note while the CHANGELOG section is still
+     `(unreleased)` if you like; it is dated by the CHANGELOG, whose heading this commit dates (the
+     list shows `unreleased` until then), so the note itself has no date to write. Its title is
+     `# What's new (since PREVIOUS VERSION)` (the release before, as `2.0.0`), then the user-visible
+     changes in short bullets from the CHANGELOG, then the owner's closing and the `{signature}` line
+     as the last notes had them. The app compiles the folder in (build.rs lists it: a file there not
+     named `VERSION.md` stops the build), so the note is part of the build the owner tests. For a
+     release the owner vets the note and makes his changes to it: send it to him, and put his changes
+     in, before the gate (step 5) and his test (step 6). A change after his test is a new gate and a
+     new test, and the build he tested has already recorded the version as seen on his Scribe, so
+     changed notes would not open there by themselves. Every version released has a file of its own:
+     the preflight refuses a release without one, or with the release before's notes again, and the
+     gate's unit test (about.rs, `the_current_note_is_this_versions_else_the_newest`) fails a build
+     whose `VERSION` has none. Notes that are word for word an older release's (one that is not the
+     release before) show as one row naming each version. The card falls back to the newest notes
+     for a version without a file, which only a build made with another `VERSION` by hand can be.
+     `tests/scenarios/z_about.qs` states the notes' shape, in its comment and in
+     its checks: the card's `library.about.card_notes` and `card_blocks`, upright and sideways, and
+     the notes on the sheet, from the row `about.row.VERSION`, upright and sideways: one page
+     (`pages`; every version's notes fit one screen since 2.1.0, about.rs's
+     `every_note_fits_one_page_upright_and_sideways` fails a note that does not) at the size and the
+     leading that fit them (`body_px`, `lead`), and `tests/scenarios/z_about_classic.qs` the same in
+     Classic. `tests/scenarios/z_about_list.qs` states the list:
+     its rows (`library.about.row.N` and `row_date.N`, newest first), the row marked as this version's
+     (`library.about.marked`), and the refreshes its steps send. Set them to the new notes':
+     `make scenarios SCENARIOS="tests/scenarios/z_about.qs tests/scenarios/z_about_list.qs
+     tests/scenarios/z_about_classic.qs" SCEN_NO_SELFTEST=1` names each check that differs, with the
+     value it found, and `build/shots/z_about/`, `build/shots/z_about_list/` and
+     `build/shots/z_about_classic/` show the card, which must end at a whole item, the list and the
+     notes. Notes too long to fit even at the floor (34 px) would take pages
+     at it: shorten them, or that test's rule is the owner's to change.
+   - `docs/screens/whatsnew.png`, the README's picture of the card, when its look or the notes
+     changed: `build/shots/z_about/01-card.png` from the gate of step 5, made 620x827 in grey
+     (`magick 01-card.png -colorspace Gray -filter Lanczos -resize '620x827!' -depth 8 whatsnew.png`).
+     The picture is not in the build, so it can come in the docs commit of step 6.
    - `po/grimoire.pot` carries the version in its header: `make l10n` (needs GNU gettext) rewrites
      it, and the .po and .mo files with it. A stale header does no harm.
 
    Then `tools/release-preflight.sh` checks the version, the changelog's dated heading, the
-   placeholders, the README banner, the TESTING section and a clean tree. The workflow runs it again
-   on the release's tag, first thing.
+   placeholders, the README banner, the TESTING section, that `docs/whatsnew/VERSION.md` is there with
+   notes in it (a line besides its title and `{signature}`) and that they are not the release before's
+   again, spaces and line breaks aside (the newest `vVERSION` tag among the commit's ancestors, other
+   than its own tag; its notes are its own `docs/whatsnew/` file, or `docs/WHATSNEW.md` for a release
+   before 2.1.0), and a clean tree. The workflow runs it again on the release's tag, first thing; its
+   checkout holds the tag's commit alone, so the step fetches the history and the `v*` tags first (a
+   failed fetch fails the step). Where neither can tell the release before (a shallow clone, a clone
+   without tags), the preflight says `docs/whatsnew/VERSION.md not compared: could not tell the
+   previous release` with the reason, and does not fail for that (the file and its notes are still
+   checked): fetch them as it says (`git fetch --unshallow --tags`, or `git fetch --tags`) and run it
+   again.
 
 5. **The gate on the bump commit.** The version is in the binary, so the gate runs after the bump,
    with the pinned toolchain and no skipped part:
@@ -134,8 +191,11 @@ gh run list -R ganten1998/grimoire-scribe --workflow release.yml --limit 3
 gh run watch RUN -R ganten1998/grimoire-scribe --exit-status
 ```
 
-(A draft pull request into `main` runs it too, on the pull request's commit.) Then compare what CI
-built with what the owner tested, byte for byte:
+(A pull request runs the checks too, split over parallel jobs, but neither the two clean builds nor
+the `grimoire-release` artifact: the dry run is this manual run, which does everything a push to
+`main` does; docs/TESTING.md, The automated checks, has the jobs. Branch protection on `main` must
+require the `gate` job, the one that sums them up, not `package`: docs/TESTING.md, The required check.) Then compare what CI built with
+what the owner tested, byte for byte:
 
 ```sh
 (
@@ -159,10 +219,10 @@ would publish. The usual causes are a different rustc, zig or cargo-zigbuild ver
 crate in `Cargo.lock`, or a path or environment that reached the binary (tests/repro_check.sh
 looks for the last kind). Fix the cause, gate, test again.
 
-The Rust workflow was written on a Mac and had not run on a GitHub runner when this was written.
-The first dry run is where its mistakes show: the toolchain steps, the time (the C workflow took
-about 28 minutes, `timeout-minutes` is 120), the disk on the runner. Delete this paragraph once it
-has passed.
+A job that fails on the runner rather than on the code (a timing check on a busy runner, or "The job was not
+acquired by Runner" when GitHub has no macOS runner free) is run again alone, with the files of the first attempt
+kept: `gh run rerun RUN --failed -R ganten1998/grimoire-scribe`. A check that fails a second time is a failure.
+The publish job's first real run was 2.1.0-beta.2's (2026-11-12): it uploaded the files and wrote the preview feed.
 
 ## Tag and publish
 
@@ -272,6 +332,10 @@ change together, and the dry run above compares them.
 | the app's crates | `rust/Cargo.lock` (`cargo fetch --locked` fails on a lockfile that would change) | crates.io's checksums |
 | actions | commit SHAs: `actions/checkout` v4.4.0, `setup-python` v5.6.0, `upload-artifact` v4.6.2, `download-artifact` v4.3.0 | the SHA |
 | the vendored C | `third_party/`, in the tree | git |
+
+After moving `RUST_VERSION` or `ZIG_VERSION`, run the Scribe check of docs/TESTING.md, "Hardening round
+(2026-11), sandbox", again before a tag: the system calls a worker makes come from the standard library
+and the C library those two bring.
 
 Not pinned: the Homebrew test tools (gettext, luajit, ImageMagick, ShellCheck, luacheck) and the
 runner image's Node and Xcode. They run checks and the host build; none of them makes a byte of a

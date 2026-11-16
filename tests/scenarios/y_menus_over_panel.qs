@@ -72,6 +72,24 @@ expect editor.layers is ok
 shot 05-tools-over-panel
 tap panel tool-picker
 wait 400
+# The quick sizes card (an eraser held 600 ms) beside the panel at the left, over the page: five chips (the fifth
+# at 12 mm), no Pen feel chip, the whole 912 x 416 card on the screen.
+touch down 164 992
+wait 700
+touch up 164 992
+wait 300
+expect editor.modal is quick-size
+expect editor.layers is ok
+expect editor.quicksize.rect is 238 942 912 416
+expect editor.quicksize.chip.4 is 12 mm
+expect editor.at.quicksize.4 is 1046 1127
+expect editor.at.quicksize.5 is
+expect editor.at.quicksize.pen-feel is
+shot 05-quick-sizes-over-panel
+tap 1500 300
+wait 400
+expect editor.modal is none
+expect editor.layers is ok
 # The Pages view covers the whole screen: no panel on it at all.
 tap panel pages
 wait 500
@@ -93,6 +111,22 @@ expect editor.layers is ok
 shot 07-display-covers-the-panel
 tap 70 70
 wait 400
+expect editor.layers is ok
+# The same with the panel in the middle of the page: the card goes beside it, never over the held button.
+touch down 864 978
+wait 700
+touch up 864 978
+wait 300
+expect editor.modal is quick-size
+expect editor.layers is ok
+expect editor.quicksize.rect is 814 1052 912 416
+expect editor.at.quicksize.4 is 1622 1237
+expect editor.at.quicksize.5 is
+expect editor.at.quicksize.pen-feel is
+shot 07-quick-sizes-panel-in-the-middle
+tap 1500 300
+wait 400
+expect editor.modal is none
 expect editor.layers is ok
 # Sideways the panel and the Links bar overlap more. A stroke that just ended leaves the panel stale, and its
 # repaint (at the settle, 150 ms after the pen left) used to land on whatever a shortcut had opened over the

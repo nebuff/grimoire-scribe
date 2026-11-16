@@ -5,16 +5,19 @@ wait 200
 expect pen.gesture is
 tap 1535 95
 wait 100
-expect library.ui_at.890.1930 is gestures
-tap 890 1930
+expect library.ui_at.329.830 is settings.cat.4
+tap 329 830
+wait 100
+expect library.ui_at.1233.639 is gestures
+tap 1233 639
 wait 100
 expect library.sheet is gestures
-expect library.ui_at.930.1229 is gestures.group.index
-tap 930 1229
+expect library.ui_at.930.1076 is gestures.group.index
+tap 930 1076
 wait 100
 expect library.gestures_group is index
-expect library.ui_at.930.520 is gestures.row.1
-tap 930 520
+expect library.ui_at.930.296 is gestures.row.1
+tap 930 296
 wait 100
 expect library.gestures.learning is links
 expect library.record is wait
@@ -31,14 +34,14 @@ expect library.record is 0
 expect gestures.links is touch.2.up
 expect library.gestures.1 is Links on this page: 2 fingers up +1
 pen leave
-expect library.ui_at.930.1690 is done
-tap 930 1690
+expect library.ui_at.125.95 is done
+tap 125 95
 wait 100
-expect library.ui_at.930.2030 is done
-tap 930 2030
+expect library.ui_at.125.95 is settings.back
+tap 125 95
 wait 100
-expect library.ui_at.1550.1930 is done
-tap 1550 1930
+expect library.ui_at.1735.95 is done
+tap 1735 95
 wait 100
 expect library.sheet is none
 tap 965 95
@@ -67,10 +70,12 @@ expect pen.gesture is Button.triple
 expect editor.strokes is 1
 pen line 300 700 1300 700 20 0.6 0.6
 expect editor.strokes is 2
+# A hovering hold has no built-in action either (2.1.0-beta.2: it cleared the page, issue #39): the ink stays.
 pen hover 930 1100
 side on
 wait 1300
 expect pen.gesture is Button.hold
-expect editor.strokes is 0
+expect editor.strokes is 2
+expect toast is
 side off
 expect editor.hold_eraser is 0

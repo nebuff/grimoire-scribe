@@ -13,6 +13,7 @@ expect settings.landscape_fit is 1
 expect settings.hints is 0
 expect settings.link_areas is 0
 expect notebook.last_page is 0
+expect libindex.reads is 0
 expect main.longest_unpumped_ms not -1
 expect touch.contacts is 0
 expect touch.class is none
@@ -28,6 +29,10 @@ expect touch.class is none
 expect touch.suppressed is 0
 expect screen is library
 expect library.sheet is none
+# (two fingers down over the Library open the Graph, 2.0.0-beta.2; its Back returns to the Library)
+expect library.map is graph
+tap library map.back
+expect library.map is 0
 expect main.longest_unpumped_ms is ok
 # the panel's names: a stroke makes Undo a button, found by name and at a point
 tap 965 95

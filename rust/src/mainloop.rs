@@ -39,7 +39,9 @@ fn heartbeat() {
     // SAFETY: open/write/close on a NUL-terminated path we own and the fd open returns; write reads
     // one byte of a static.
     unsafe {
-        let fd = libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC, 0o644 as libc::c_uint);
+        // (O_NOFOLLOW: /tmp is every user's, and a link planted there must not make root truncate and write its
+        // target every 2 s; security review 2026-11)
+        let fd = libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_NOFOLLOW | libc::O_CLOEXEC, 0o644 as libc::c_uint);
         if fd >= 0 {
             if libc::write(fd, b"1".as_ptr() as *const libc::c_void, 1) < 0 { /* best effort */ }
             libc::close(fd);
@@ -335,6 +337,11 @@ pub fn main(args: Vec<String>) -> i32 {
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
+    // The safe loader's worker (sandbox.rs): a fresh exec of this binary, which takes --work before any UI
+    // start-up (no display, input, settings or log) and parses what it is given.
+    if args.get(1).is_some_and(|a| a == "--work") {
+        return crate::sandbox::work_main(&args);
+    }
     for a in args.iter().skip(1) {
         if a == "--version" {
             println!("{GRIMOIRE_VERSION}");
@@ -358,6 +365,17 @@ fn poll(ev: &mut InEvent, timeout_ms: i32, a: &mut App) -> i32 {
 fn poll(ev: &mut InEvent, timeout_ms: i32, a: &mut App) -> i32 {
     let _ = a;
     input_poll(ev, timeout_ms)
+}
+
+// The headless runner's script batch is one batch however long it takes (sim_sdl::input_script_batch):
+// a scenario counts the same refreshes on a loaded machine as on an idle one.
+#[cfg(feature = "sim")]
+fn script_batch() -> bool {
+    crate::sim_sdl::input_script_batch()
+}
+#[cfg(not(feature = "sim"))]
+fn script_batch() -> bool {
+    false
 }
 
 // Everything after the command line: the data root, the language, the display and input, the App,
@@ -418,6 +436,12 @@ fn run() -> i32 {
     }
     app_flush(&mut app);
     qlog!("first frame presented");
+    // Grimoire's own Terminess in KOReader's fonts/Grimoire follows this build's (an update can
+    // bring smaller fonts): written again only where it differs, and only where it is there or the
+    // Terminess patch is applied (koreader.rs). Once a start, after the first frame. Then an earlier
+    // Grimoire's Terminess patch there, byte for byte, becomes this build's (one someone changed stays).
+    koreader_fonts_refresh();
+    koreader_patch_refresh();
     // The Kindle UI may repaint once more after we start (the scriptlet "book" closing, a
     // late home-screen refresh). Check the panel still shows us; if not, repaint everything.
     let started = now_ms();
@@ -451,6 +475,7 @@ fn run() -> i32 {
         // queue empties. Leave remaining events queued, in order, for the next iteration.
         // (input_drained: the batch ended because nothing more was queued, not at its 64 events or
         // 8 ms: the prefetch and the Links bar's hold timer wait for a quiet moment.)
+        // (The headless runner's script batch never ends at the 8 ms: script_batch.)
         if poll(&mut ev, 30, &mut app) != 0 {
             phase!("reading input", &mut phase, 30);
             let batch_at = now_ms();
@@ -459,7 +484,7 @@ fn run() -> i32 {
             loop {
                 event_timed(&mut app, &ev, &mut slow);
                 count += 1;
-                if !(app.running && count < 64 && now_ms().wrapping_sub(batch_at) < 8) {
+                if !(app.running && count < 64 && (now_ms().wrapping_sub(batch_at) < 8 || script_batch())) {
                     app.input_drained = false;
                     break;
                 }
@@ -483,7 +508,7 @@ fn run() -> i32 {
             last_guard = t;
             // The Kindle's status bar strip (clock, battery) lives at the top of the panel: check
             // that band densely, and repaint just it (no flash) when something drew there.
-            let skip = if app.toast_visible { app.toast_rect } else { RECT_EMPTY };
+            let skip = app_overlay_rect(&app); // (the toast and the staying notice are not in app.screen)
             let top = Rect { x: 0, y: 0, w: app.w, h: ui_px(150.0) };
             let mut where_ = RECT_EMPTY;
             let before = guards;

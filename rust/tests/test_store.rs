@@ -526,8 +526,8 @@ fn settings_upgrade_keeps_tweaks() {
     let mut s = Settings::default();
     settings_load(&mut s);
     let (pencil, mech) = (TOOL_PENCIL.0 as usize, TOOL_MECH_PENCIL.0 as usize);
-    check_near!(s.tools[pencil].size_min_mm, 0.12f32, 1e-3);
-    check_near!(s.tools[pencil].size_max_mm, 0.32f32, 1e-3);
+    check_near!(s.tools[pencil].size_min_mm, 0.13f32, 1e-3);
+    check_near!(s.tools[pencil].size_max_mm, 0.35f32, 1e-3);
     check_near!(s.tools[pencil].tilt_size, 3.10f32, 1e-3); // the owner's own value stays
     check_near!(s.tools[mech].grain, 0.50f32, 1e-3);
     check!(s.version == SETTINGS_VERSION);
@@ -569,6 +569,40 @@ fn settings_upgrade_ballpoint_smoothing() {
     settings_load(&mut u);
     check_near!(u.tools[ball].smoothing, 0.50f32, 1e-3);
     check_near!(u.tools[pencil].smoothing, 0.00f32, 1e-3);
+}
+
+// Version 4 (quick sizes): a tool's widths move to the new default only when BOTH still equal the old default
+// pair; a pair changed in either field stays exactly as it is.
+fn settings_upgrade_quick_size_pairs() {
+    let path = format!("{}/settings.ini", store_root());
+    let ini = "settings_version=3\n\
+        pencil.size_min_mm=0.12\npencil.size_max_mm=0.32\n\
+        charcoal.size_min_mm=0.30\ncharcoal.size_max_mm=0.60\n\
+        ballpoint.size_min_mm=0.25\nballpoint.size_max_mm=0.48\n\
+        fineliner.size_min_mm=0.28\nfineliner.size_max_mm=0.28\n\
+        calligraphy.size_min_mm=1.75\ncalligraphy.size_max_mm=1.75\n\
+        highlighter.size_min_mm=5.0\nhighlighter.size_max_mm=5.0\n\
+        eraser.size_min_mm=2.5\neraser.size_max_mm=7.0\n";
+    write_file_atomic(&path, ini.as_bytes());
+    let mut s = Settings::default();
+    settings_load(&mut s);
+    let w = |t: ToolKind| (s.tools[t.0 as usize].size_min_mm, s.tools[t.0 as usize].size_max_mm);
+    let near = |a: (f32, f32), b: (f32, f32)| (a.0 - b.0).abs() < 1e-3 && (a.1 - b.1).abs() < 1e-3;
+    check!(near(w(TOOL_PENCIL), (0.13, 0.35)));
+    check!(near(w(TOOL_FINELINER), (0.25, 0.25)));
+    check!(near(w(TOOL_CALLIGRAPHY), (2.0, 2.0)));
+    check!(near(w(TOOL_HIGHLIGHTER), (5.6, 5.6)));
+    check!(near(w(TOOL_ERASER), (2.86, 8.0)));
+    // only the max changed (charcoal), only the min changed (ballpoint): left alone
+    check!(near(w(TOOL_CHARCOAL), (0.30, 0.60)));
+    check!(near(w(TOOL_BALLPOINT), (0.25, 0.48)));
+    check!(s.version == SETTINGS_VERSION);
+    // a version-4 file is not moved again
+    let again = "settings_version=4\npencil.size_min_mm=0.12\npencil.size_max_mm=0.32\n";
+    write_file_atomic(&path, again.as_bytes());
+    let mut t = Settings::default();
+    settings_load(&mut t);
+    check_near!(t.tools[TOOL_PENCIL.0 as usize].size_max_mm, 0.32f32, 1e-3);
 }
 
 fn pen_defaults_from_device() {
@@ -768,6 +802,53 @@ fn shape_corner_key() {
     check!(settings_load(&mut s) == 0 && s.shape_corner == 0);
 }
 
+// Classic's font (2.1): Terminess without the key; each family by its id; a font this version does not
+// have draws as Terminess and goes back as it was (kept) until the font is picked; the newest known key.
+fn font_key() {
+    let path = format!("{}/settings.ini", store_root());
+    let mut s = Settings::default();
+    check!(write_file_atomic(&path, b"invert=1\n") == 0);
+    check!(settings_load(&mut s) == 0 && s.font == 0);
+    check!(settings_save(&s) == 0 && has_pins_line(&path, "font=terminess"));
+    let text = read_file(&path).unwrap_or_default();
+    let at = |k: &str| text.windows(k.len()).position(|w| w == k.as_bytes());
+    check!(at("shape_corner=") < at("font="));
+    for (i, f) in FONT_FAMILIES.iter().enumerate() {
+        check!(write_file_atomic(&path, format!("font={}\n", f.id).as_bytes()) == 0);
+        check!(settings_load(&mut s) == 0 && s.font == i as i32 && settings_kept("font").is_none());
+        check!(settings_save(&s) == 0 && has_pins_line(&path, &format!("font={}", f.id)));
+    }
+    check!(write_file_atomic(&path, b"font=comic-sans\ntheme=classic\n") == 0);
+    check!(settings_load(&mut s) == 0 && s.font == 0 && settings_kept("font").as_deref() == Some(&b"comic-sans"[..]));
+    check!(settings_save(&s) == 0 && has_pins_line(&path, "font=comic-sans"));
+    s.mirror_pdf = !s.mirror_pdf;
+    check!(settings_save(&s) == 0 && has_pins_line(&path, "font=comic-sans"));
+    s.font = 3;
+    check!(settings_save(&s) == 0 && has_pins_line(&path, "font=literata") && !has_pins_line(&path, "font=comic-sans"));
+    // (picked back to Terminess it is written as set: the kept value is forgotten once changed)
+    s.font = 0;
+    check!(settings_save(&s) == 0 && has_pins_line(&path, "font=terminess"));
+    unlink(&path);
+}
+
+// What's new after every update (the owner's rule of 2026-11-05): due when a file a Grimoire saved
+// names another version's notes as seen, whatever whatsnew_hide says (the 2.0.0 betas' box, read and
+// written back as it was); not due for this version's, nor for a file without settings_version.
+fn whatsnew_due_after_every_update() {
+    let path = format!("{}/settings.ini", store_root());
+    let mut s = Settings::default();
+    check!(write_file_atomic(&path, b"settings_version=3\nwhatsnew_seen=1.2.0\nwhatsnew_hide=1\n") == 0);
+    check!(settings_load(&mut s) == 0 && s.whatsnew_due && s.whatsnew_hide && s.whatsnew_seen.as_str() == "1.2.0");
+    check!(settings_save(&s) == 0 && has_pins_line(&path, "whatsnew_hide=1"));
+    check!(write_file_atomic(&path, b"settings_version=3\nwhatsnew_seen=1.2.0\nwhatsnew_hide=0\n") == 0);
+    check!(settings_load(&mut s) == 0 && s.whatsnew_due && !s.whatsnew_hide);
+    let seen = format!("settings_version=3\nwhatsnew_seen={GRIMOIRE_VERSION}\nwhatsnew_hide=1\n");
+    check!(write_file_atomic(&path, seen.as_bytes()) == 0);
+    check!(settings_load(&mut s) == 0 && !s.whatsnew_due && s.whatsnew_hide);
+    check!(write_file_atomic(&path, b"whatsnew_seen=1.2.0\n") == 0);
+    check!(settings_load(&mut s) == 0 && !s.whatsnew_due && s.whatsnew_seen.as_str() == GRIMOIRE_VERSION);
+}
+
 fn status_corner_keys() {
     let path = format!("{}/settings.ini", store_root());
     let mut s = Settings::default();
@@ -907,6 +988,22 @@ fn gesture_keys() {
     check!(settings_load(&mut t) == 0 && t.status_corner == 0);
     check!(write_file_atomic(&path, b"invert=1\n") == 0);
     check!(settings_load(&mut t) == 0 && t.status_corner == 0);
+    // The clock's 12-hour time (clock_12h, 2.1.0-beta.2): off by default, written right after status_corner,
+    // read back; another value is on when it starts with a nonzero number and goes back as it was.
+    settings_default(&mut s);
+    check!(!s.clock_12h);
+    check!(settings_save(&s) == 0 && has_pins_line(&path, "clock_12h=0"));
+    let text = read_file(&path).unwrap_or_default();
+    let at = |k: &str| text.windows(k.len()).position(|w| w == k.as_bytes());
+    check!(at("status_corner=") < at("clock_12h=") && at("clock_12h=") < at("rotation_lock="));
+    s.clock_12h = true;
+    check!(settings_save(&s) == 0 && has_pins_line(&path, "clock_12h=1"));
+    check!(settings_load(&mut t) == 0 && t.clock_12h);
+    check!(write_file_atomic(&path, b"clock_12h=7\n") == 0);
+    check!(settings_load(&mut t) == 0 && t.clock_12h);
+    check!(settings_save(&t) == 0 && has_pins_line(&path, "clock_12h=7"));
+    check!(write_file_atomic(&path, b"invert=1\n") == 0);
+    check!(settings_load(&mut t) == 0 && !t.clock_12h);
     // upgraded: version 3 exactly, a file that exists, no gestures key
     check!(write_file_atomic(&path, b"settings_version=3\ninvert=1\n") == 0);
     check!(settings_load(&mut t) == 0 && t.upgraded);
@@ -1212,12 +1309,15 @@ fn test_store() {
     run!(settings_roundtrip);
     run!(settings_upgrade_keeps_tweaks);
     run!(settings_upgrade_ballpoint_smoothing);
+    run!(settings_upgrade_quick_size_pairs);
     run!(pen_defaults_from_device);
     run!(panel_tools);
     run!(before_eraser);
     run!(status_corner_keys);
     run!(shape_preferences_and_retired_bar_migration);
     run!(shape_corner_key);
+    run!(font_key);
+    run!(whatsnew_due_after_every_update);
     run!(gesture_keys);
     run!(rotation_lock_key);
     run!(safe_names);

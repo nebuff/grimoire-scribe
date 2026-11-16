@@ -36,11 +36,6 @@ Free software under the GPL-3.0. Not affiliated with or endorsed by Amazon.
 The pages above were drawn on a Kindle Scribe in Grimoire; the last picture is Live view, the
 Kindle's screen in a computer's browser as you write.
 
-> **Pre-release 2.0.0-beta.1.** The first public beta: Grimoire is in daily use on a Kindle
-> Scribe, and every build passes several hundred automated checks, but it is a beta: it autosaves every
-> stroke and keeps damaged files instead of overwriting them, and you should still copy your notebooks
-> off now and then (Library > Share makes that one click).
-
 ## Support Grimoire
 
 Grimoire is free, open source and made by one person, with a lot of care. If it has earned a place
@@ -59,8 +54,8 @@ no scriptlets, KOReader can open Grimoire instead (see the table).
 
 | Kindle | Status |
 |---|---|
-| Kindle Scribe (2024, 2nd gen), firmware 5.17 to 5.20.1 | **Works.** Tested daily on 5.20.1.0.2; a tester runs it on 5.20.1 (Vera). |
-| Kindle Scribe (2022, 1st gen), firmware 5.16.3 or newer | **Works.** A tester uses it daily on 5.20.1.0.2; another runs it on 5.20.1 (Vera). Same platform. If the screen is upside down, see Troubleshooting. |
+| Kindle Scribe (2024, 2nd gen), firmware 5.17 to 5.20.1 | **Works.** Used daily on 5.20.1.0.2 and runs on 5.20.1 (Vera) |
+| Kindle Scribe (2022, 1st gen), firmware 5.16.3 or newer | **Works.** Used daily on 5.20.1.0.2 and also runs on 5.20.1 (Vera). If the screen is upside down, see Troubleshooting. |
 | Kindle Scribe (2022) on firmware older than 5.16.3 | Should run, but there is no Library launcher for those older jailbreaks yet. With KOReader, it should open from KOReader's Tools > Grimoire, the plugin copied in by hand (see Does it work in KOReader?). |
 | Kindle Scribe 3 and Scribe Colorsoft (2025) | **Untested.** No public jailbreak yet. Grimoire already knows their bigger screen (1986x2648): notebooks keep their page size between these and the older Scribes (see Moving between versions). On the Colorsoft's color screen, Grimoire waits after each quick update until the screen's driver has read it, except for the pen's own ink (writing never waits), so buttons should not show striped. |
 | Paperwhite, Oasis, Basic and other Kindles without a pen | Not useful: you cannot write without the pen. |
@@ -94,23 +89,35 @@ your notebooks and settings from `quire/` to `grimoire/` and removes the old Qui
 
 ## Using it
 
-- **Library**: notebooks as covers with thumbnails, one level of folders. Tap the `...` on a
+- **Library**: notebooks as covers with thumbnails, in folders that nest (a folder moved or renamed onto one that is there asks: merge, keep both or cancel). Tap the `...` on a
   notebook to rename, move or delete it (deleted notebooks go to `grimoire/trash`, nothing is
   ever erased outright).
 - **Names** can have accents: the keyboard's **áé** key opens a page of accented letters (enough
   for Spanish, Portuguese, French, Italian, German, Dutch, Catalan, Danish, Norwegian, Swedish and
-  Finnish). Shift gives capitals and **abc** returns to the letters. With Grimoire in Spanish, the
-  letters page has **ñ** too, after l. In Japanese that key is **あ**, a phone's flick pad: a tap
-  types the row's first kana and a swipe left, up, right or down the rest, **゛小** cycles the
-  kana typed last (か to が, は to ば to ぱ, つ to づ to っ), **カ** switches to katakana and **、**
-  holds 、。？！ on its flicks.
+  Finnish). Shift gives the next letter its capital; tap it twice for caps on (a bar under the
+  key's label, every letter a capital until a third tap) and **abc** returns to the letters. With
+  Grimoire in Spanish, the letters page has **ñ** too, after l. In Japanese that key is **あ**, a
+  phone's flick pad: a tap types the row's first kana and a swipe left, up, right or down the
+  rest, **゛小** cycles the kana typed last (か to が, は to ば to ぱ, つ to づ to っ), **カ**
+  switches to katakana and **、** holds 、。？！ on its flicks.
+- **Delete held down** deletes one character after another, on every keyboard (names, Find, the page number
+  pads, the count pad): a tap deletes one, and a finger or the pen kept on the key deletes the next after about
+  0.4 s, then about 15 a second until it lifts or slides off.
+- **The caret**: every keyboard but the count pad has **◀** and **▶** at the right end of its text line, which
+  move the caret a letter (held, one after another, as delete does); a tap on the text puts the caret there
+  and a drag across it selects. Typing and delete act at the caret, and replace or take a selection. The key
+  beside them opens the edit page: **Select all**, **Cut**, **Copy**, **Paste**, and **Start** and **End** for
+  the caret. What you cut or copy stays until Grimoire closes and pastes into any keyboard; it is apart from
+  the lasso's ink. With a keyboard attached (and shortcuts enabled, below), the arrows, Home and End move the
+  caret (with Shift, they select) and Ctrl or Cmd with A, C, X and V select all, copy, cut and paste.
 - **Paper**: narrow, medium and wide rule (without or with a margin), Cornell, dot grid, graph,
   sheet music, guitar tab, blank, cross grid, isometric, hexagon, Seyes rule, and **Custom
   music**: stack treble, bass, alto, tenor, drum and plain staves, 4 to 8 line tabs and lyric
   lines (or start from grand staff or a 4 to 7 string bass tab), and choose how many systems fit
   on a page. Each page can have its own paper.
 - **Pens**: pencil, mechanical pencil, charcoal, ballpoint, fineliner, marker, fountain pen,
-  calligraphy pen, highlighter. Every pen's pressure and tilt response can be tuned
+  calligraphy pen, highlighter. Hold a pen on the toolbar for its sizes: a card of four widths
+  in millimetres (the eraser's also has Whole strokes / Precise). Every pen's pressure and tilt response can be tuned
   (Settings > Pen sensitivity). The eraser takes away whole strokes, or set to **Precise** only
   what it touches (see White ink, pinned pens and templates); the eraser end of the Premium Pen
   works too.
@@ -121,14 +128,48 @@ your notebooks and settings from `quire/` to `grimoire/` and removes the old Qui
     45 degree italic, thick going down to the right and hairline going up; lean toward the bottom
     left (a left hand) and the nib mirrors. Hold the pen upright and it keeps the 45 degree nib.
 - **The floating toolbar** holds tools, undo/redo, clear page, pages, paper and the Library. Drag
-  it anywhere; tap the corner arrows to fold it into a small box.
-- **Pen button**: hold the button while drawing to highlight (or erase; Settings). Hold it while
-  hovering to clear the page. Clear removes ink and outgoing links together; Undo restores both.
+  it anywhere; tap the corner arrows to fold it into a small box. On the last page its next-page arrow is a
+  **+**: tap it for a new page, which opens (as swiping past the last page does). Hold it (or, with a keyboard
+  attached, tap it with Shift, Ctrl, Alt or Cmd held) for the number pad Pages uses (at 1 at first): the pages are added
+  after the page you are on, on its paper, which stays open, and the Undo in Pages takes them back while they
+  are still blank. The `new-pages` shortcut opens the same pad on any page.
+- **Pen button**: hold the button while drawing to highlight (or erase; Settings). Its clicks and a
+  hold while hovering do nothing until you give them an action in Settings > Gestures (until 2.1.0-beta.1
+  the hold cleared the page, under a finger merely resting on the button). The toolbar's broom clears the
+  page: ink and outgoing links together (not a PDF's own links, its tabs); Undo restores both. Cleared by a
+  gesture or a shortcut, the page says so in a toast: "Page cleared. Undo brings it back."
 - **The Index**: swipe down with two fingers for Graph, or tap the page counter for Pages. **Graph**, **List** and
-  **Pages** share one navigation bar; Back returns to the notebook. Graph groups destinations by
-  notebook, with View at the bottom: All fits the whole linked map, Around the rings around a page,
-  and after a pan or pinch the button first fits the view again. List shows existing links. Pages has small
-  cached previews and controls for adding, copying, selecting and deleting pages.
+  **Pages** share one navigation bar; Back returns to the notebook. Graph always shows every linked page of
+  every notebook, each notebook's pages an island with its name over it (a library with too many linked pages
+  to draw at once shows this notebook alone, and says so), with the view button at the bottom: **View: All** fits
+  the whole linked map, **View: Adjacent** the pages around one (linked to it, and theirs); a tap switches to the
+  other view, fitted, after a pan or pinch too. With a keyboard the arrows pan the Graph, - and + zoom it, Ctrl+0
+  fits it, V switches its view, Ctrl+A selects every page drawn and Enter opens the selected page. List shows
+  existing links. Pages has small
+  cached previews and controls for adding, copying, selecting and deleting pages. Hold a page for its card
+  (Move to..., Copy to notebook..., Rename, Delete), or hold it a moment (300 ms, before the card would open) and
+  drag it off to a gap between two pages to move it (a black bar shows the gap it goes into; no card opens); right
+  after a move, the bottom row's Undo puts the pages back, and
+  then its Redo beside it moves them again. Tap **+** (New page) for one blank page at
+  once, after the open page (or the last one ticked), on that page's paper: Pages stays open and the new page's tile says
+  "(new)" (tap the tile to open it). Hold it (or, with a keyboard attached, tap it with
+  Shift, Ctrl, Alt or Cmd held) for a number pad that asks how many: it starts at 1, so **Add 1 page** at once
+  adds one; type the count (the first digit replaces the 1) or use - and + under the digits, and press
+  **Add N pages**. **Go to page...** opens the page-number-or-name sheet over Pages, which stays behind it:
+  Cancel gives Pages back as it was, a row picked opens that page. With a keyboard, Ctrl+A ticks every page and
+  Ctrl+N opens the number pad. The Undo button then takes that page or batch back while its pages are
+  still blank, and Redo adds the same pages again. While Pages is open, the `undo` and `redo` keys, controller
+  buttons and gestures are these Undo and Redo (one step each); on the page they stay the page's own, so a
+  page's writing is never undone from Pages, nor a page move from the page. A large batch takes a moment (taps
+  meanwhile are ignored); a big one, from about 50 pages, says **Adding N pages...** until they are added, and
+  so does its Redo.
+  **The Graph from the Library**: swipe down with two fingers over the Library (or press the key bound to
+  `index-map`) for the Graph of all notebooks with no notebook open: tap a page twice to open it, and Back from there, even from another notebook a link led to, or
+  the Links bar's **Back to Graph**, comes back to the Graph. Spread two fingers to zoom it. A library with too
+  many linked pages to draw at once opens the notebooks' browser instead, to pick one notebook's Graph.
+  A notebook's or a folder's menu (its **...** button)
+  has **Leave out of the Graph**: its pages are not drawn in the Graph of all notebooks (a folder's covers
+  everything in it); **Show in the Graph** brings them back.
   Swipe up with two fingers for the page-status panel: notebook name, page count, link areas and
   **Name page** and **Go to page** over the notebook. Page names stay attached when pages move and appear in the PDF table of contents.
   The toolbar's settings cog opens the main Settings menu; Done returns to the notebook.
@@ -139,10 +180,19 @@ your notebooks and settings from `quire/` to `grimoire/` and removes the old Qui
   picture**, Monitor mode, full screen, recording, **View settings** (transparent paper, colors,
   warmth and brightness, the pen dot, the toolbar and clock layers, latency) and **Keys**. Picture in picture floats the
   page over your other windows; keep the original tab open meanwhile, and close the small window
-  to bring the view back.
+  to bring the view back. Grimoire's toasts show in the browser too, where and as the Kindle shows
+  them, and go when they go there (always: the toolbar and clock switches leave them alone).
   A small icon in the top right corner says it is on; **Stop** on
   its card turns it off, and it turns itself off after 10 minutes with nobody watching. Plain HTTP:
   use it on a network you trust.
+- **Wi-Fi networks**: **Settings > Wi-Fi** turns Wi-Fi on or off, says which network the Kindle is
+  connected to, and lists the networks the Kindle has saved in their own order; the list scrolls. The
+  status line names the connected network. Tap one to switch to it: "Connecting to ..." until the Kindle
+  is connected to it, or "Could not connect to ..." when it refuses or has not connected in 45 seconds
+  (Grimoire changes nothing more: the Kindle's own Wi-Fi service decides what it joins next). Switching disconnects Share, Live view and SSH from
+  the network you leave. Add a network or change its password in the Kindle's settings or KOReader:
+  no Wi-Fi password reaches the app, its files or its log (its helper keeps only the networks' names), and no
+  network is added, changed or forgotten.
 - **Links**: tap the toolbar's link-plus button and draw around the area. Choose a page in this
   notebook, or **Somewhere Else** to browse folders, pick another notebook and choose its page.
   The selector starts in the current notebook's folder and shows cached page previews. Selection
@@ -173,6 +223,38 @@ your notebooks and settings from `quire/` to `grimoire/` and removes the old Qui
   passcode off for its whole session, and Grimoire opened from KOReader leaves it that way. Start
   Grimoire from the Library when you need the passcode.
 - **Language**: English, Spanish or Japanese, following the Kindle's own language (see Language).
+- **Fonts** (Classic): Settings' Display category has a **Font** row in the Classic style, naming the font in
+  use. It opens the Font sheet: **Terminess** (the default), **Atkinson Hyperlegible Next** (made for readers
+  with low vision: I, l and 1, O and 0 cannot be mistaken), **Noto Sans** and **Literata** (a serif made
+  for reading on screens), each named in itself, with a sample of the one in use at the top. A tap on a font
+  applies it to every screen at once and saves it; the sheet's back arrow returns to Settings and its X closes
+  Settings, both keeping the font you tapped (to go back, tap the font you had). Your pages, paper labels, the clock,
+  PDFs and pictures never change with the font, and neither do the icons; the share pages in your browser
+  use the same font (a page already open takes it when it loads again). Gothic keeps its own pixel type, so the Font row is not there. Greek, Cyrillic and other
+  letters a font lacks come from Terminess, and Japanese from DotGothic16, as in every style.
+- **Your own fonts** (Classic, since 2.1.0-beta.2): copy `.ttf` or `.otf` files into `grimoire/fonts` over USB
+  (a family unzipped into a folder of its own is fine, one folder deep; up to 200 files, 24 MB each), then open
+  Settings > Font. Under **Your fonts** each file shows its name drawn in itself once Grimoire has checked it
+  in the background ("Checking 3 fonts..." stays on the sheet meanwhile, and a file still being copied
+  waits until it is whole), or its row is greyed and says why not: "Unreadable font." (not a font, damaged, or
+  one whose letters draw nothing), "Too big (over 24 MB).", "No Latin letters." (a symbol font), "Use .ttf or
+  .otf." (a web font) or "Took too long to read.". Tap a font to use it: it applies at once and is saved.
+  Bold comes from the font's own weight axis if it has one, else from the Bold file of the same family beside
+  it, else Grimoire thickens the regular. A letter your font lacks comes from Terminess (its row says "Some
+  letters come from Terminess." when your language needs some), and kana and kanji from DotGothic16 unless your
+  font has them. Text in your font may be a little smaller or larger than in Terminess: Grimoire sizes it so
+  its capitals are about as tall and its words no wider, and a label that still does not fit ends in "...".
+  - **Whose fonts.** Your font draws Grimoire's own words only (menus, names, the keyboard). Pages, paper
+    labels, the clock, icons, PDFs and pictures never use it, and neither do the share pages (your browser gets
+    Terminess): Grimoire never copies your font into a page, a PDF or anywhere else, and never sends it
+    anywhere. It stays on this Kindle. Use fonts you have the right to use.
+  - **Back to Terminess.** Tap Terminess in the Font sheet (while a font of yours is in use the sheet's own words
+    are in Terminess, so it can always be read; a tap on Terminess also takes your font away after a start in
+    Terminess that a crash made, so the next start does not try it again), or delete the font's file over USB:
+    Grimoire is in Terminess from its next start (a running Grimoire keeps the copy it loaded), and the row says
+    "File missing." until you pick another font or put the file back, which brings the font back. If a font ever stops Grimoire before its first screen is drawn, the next start
+    is in Terminess by itself, the start after tries the font once more, and after a second failure Grimoire
+    leaves it alone until the file changes.
 
 ## White ink, pinned pens and templates
 
@@ -196,12 +278,35 @@ your notebooks and settings from `quire/` to `grimoire/` and removes the old Qui
   button shows a grid, it opens the picker directly.
 - **Templates**: copy PNG or JPG pictures into `grimoire/templates/` over USB while Grimoire is
   closed (upright, 3:4, 1860 x 2480 is best, light lines on white work best on e-ink). In a
-  notebook, Paper > **More layouts...** shows them; New notebook has the same button. Each notebook
-  keeps its own copy of a template it uses.
+  notebook, Paper > **More layouts...** shows them; New notebook has the same button. A template is
+  ready to pick once its tile shows its picture (Grimoire checks each new file in the background
+  first). Each notebook keeps its own copy of a template it uses.
 - **Pages you already have**: put a folder of page pictures (PNG or JPG, one per page, such as a
   PDF exported as pictures with `pdftoppm -gray -png -r 200 file.pdf page`) in
   `grimoire/import/<Name>/` and start Grimoire: it becomes the notebook <Name>, and the folder
   moves to `grimoire/import/done/`.
+- **PDFs**: copy a PDF (a planner, a book) into `grimoire/import/` over USB, or over SSH while Grimoire
+  runs, and open the Library: a notice at the bottom says how far it is ("Importing: page 37 of 412"), and
+  the notebook appears. Its pages are the PDF's pages, in colour where the PDF has colour (the Scribe shows
+  them in gray). A PDF put in a folder there goes into the Library folder of that name, and the PDF moves
+  to `import/done/`. Up to 2000 pages and 512 MB; a longer or bigger PDF, or one with a password, is refused
+  with a message, and the same PDF a second time says "PDF already imported.". A page that cannot be read
+  becomes a blank page and the end says so ("Some pages couldn't be read."); a PDF with no page that reads is
+  not imported. A PDF that fails waits until you replace it (three tries); one that found the storage full goes
+  once there is room. KOReader's Open this book still works for books and for the pages it draws.
+- **A file anywhere on the Kindle**: Library > New > **From a file...** opens Files, titled "Import a PDF or
+  pictures": Import (`grimoire/import`, with what each file is doing: Waiting, "Importing: page 40 of 365",
+  Imported, and a Look again row), Documents, Downloads and All storage (Grimoire's notebooks, PDFs and trash
+  are never listed). A tap on a folder opens it; a tap on a PDF opens its card ("14.2 MB, Oct 30" and Import as
+  notebook, or Open its notebook when a notebook already holds that book; "has notes" shows on its row), and
+  the second tap imports it. A notebook made from a PDF remembers its file, so the card of such a PDF offers
+  Import as notebook beside Open its notebook: the very same file says "PDF already imported.", and another
+  file that only looks like the book to KOReader's key (an edited copy, say) becomes a notebook of its own.
+  A folder of pictures is imported from its `...` (or a finger held on it) card.
+  The notebook takes the file's name unless you typed one in the New notebook sheet first, and goes in that
+  sheet's folder. The file stays exactly where it was: Grimoire only reads outside its own folders, and never
+  follows a link (a file picked in Import itself is filed in `import/done/` like one dropped there). A file
+  picked while an import from an earlier run is still going is imported once that one is done.
 - **Erased ink leaves the files**: when a notebook closes, ink erased entirely is taken out of its
   page files in the background. A stroke erased only in part stays whole in the file.
 
@@ -229,7 +334,7 @@ Translations are under Grimoire's license, GPL-3.0-or-later.
 
 Details in [docs/EXPORT.md](docs/EXPORT.md).
 
-1. **Wi-Fi**: turn on Wi-Fi and open **Library > Share**. Point your phone's camera at the QR code
+1. **Wi-Fi**: turn on Wi-Fi (**Settings > Wi-Fi** also picks the network) and open **Library > Share**. Point your phone's camera at the QR code
    it shows, or type the address under it into any browser on the same network. Download a
    notebook as PDF or zip, single pages as PNG, or everything at once. Notebook PDFs show page
    preparation and transfer progress, then arrive in your browser's Downloads. The browser reader shows
@@ -276,7 +381,16 @@ by updating Grimoire. The separate `KOReader-patches.zip` and the main zip carry
 from 1.1.0-beta.1: screenshot gestures and corners stay unchanged; Terminess now matches
 regular/bold fonts and separates the dropdown battery icon from its percentage. Battery status and
 reading footers keep KOReader’s native font fallback, avoiding conflicting Nerd Font icons. Fonts and manual
-instructions are included.
+instructions are included. Since 2.0.0-beta.2 the font is Terminus's text and Grimoire's own icons only (a
+much smaller file). In KOReader's menus the battery symbols now come from KOReader's own symbols font too, and
+the box drawing, heart, lightning and the like that Nerd Fonts had added come from KOReader's fallback fonts.
+Grimoire brings the copy in KOReader's `fonts/Grimoire` up to date when it next starts. The menus use that
+copy whenever it is there, even with other Terminess or Terminus files in the Kindle's `fonts` folder: a full
+Nerd Font has icons of its own where KOReader's battery symbols are (a "JS" badge in place of the battery), so
+without Grimoire's copy such a font is passed over while another will do, and `koreader/crash.log` names the
+font the menus use and why. A start of Grimoire also replaces an earlier Grimoire copy of the Terminess patch
+in KOReader's `patches`, one byte for byte as Grimoire wrote it, with the current one (`grimoire.log` says so);
+a copy you changed is kept.
 
 **Display > Sleep screen: KOReader wallpaper** uses a snapshot of KOReader's configured custom
 image, random image or book cover, exported whenever Tools > Grimoire hands over. It also works
@@ -320,7 +434,15 @@ then opens the page you are reading. In KOReader's file browser, long-press such
 **Open with... > Grimoire** to do the same without opening it. KOReader draws each page first, about
 a second or two a page on a Scribe, with a message that a tap stops; pages the notebook already has,
 with what you wrote on them, are kept as they are, so opening the same book again only adds what is
-missing. It is the same notebook Annotate this page uses.
+missing. It is the same notebook Annotate this page uses. A PDF's own links come along (a planner's tabs: a
+finger tap on "March" goes to March): see Document links.
+
+**Document links.** The tabs of a planner PDF are part of its pages. A tap follows one (a link you drew yourself
+comes first where they overlap); a finger held on one starts Select, as anywhere on the page. Clear page keeps
+them, a lasso around what you wrote in a day cell never takes the cell's link, and Copy page, Move to... and
+Copy to notebook... carry them (to pages that go too). The Links bar lists them as one row, "From the PDF
+(43)" (before any Linked from rows), which opens them grouped by the page they go to; Areas draws their boxes dotted. They are in a file of their own
+(`doclinks.ini`), so an older Grimoire shows the pages and your links without them.
 
 ## Moving between versions
 
@@ -328,9 +450,9 @@ Updating is one file, and so is going back. From 1.1.0-beta.1 on, Grimoire keeps
 version writes and does not understand (ink data, newer papers, extra page data, unknown lines
 in `settings.ini` and `notebook.ini`) and writes it back unchanged:
 
-- A page it cannot fully show opens **read-only**, with "This page was made by a newer Grimoire.
-  It is read-only here." Writing, erasing, clearing and changing its paper are refused on it;
-  deleting it still works. Update Grimoire to edit it.
+- A page it cannot fully show opens **read-only**, with "This page was made by a newer version,
+  and will be viewed as read-only." Writing, erasing, clearing and changing its paper are refused
+  on it; deleting it still works. Update Grimoire to edit it.
 - A paper from a newer version shows as blank paper named **Newer paper** and stays the page's
   paper. New pages added after such a page get it too.
 - A setting from a newer version that this one lacks works here as the nearest choice it has
@@ -388,7 +510,12 @@ precise eraser, and they drop pinned pens from `settings.ini`.
 - **Share has no password.** Anyone on the same network can open it while the Share screen is
   open, and nobody once you leave it. Do not open Share on a network you do not trust.
 - **grimoire.log**, which a bug report asks for, holds no serial number, account, Wi-Fi name or
-  network address, and Share notes downloads without notebook or folder names.
+  network address, and Share notes downloads without notebook or folder names. It never names a font of
+  yours either, by file or by family: only sizes, counts and timings.
+- **Files from outside are read in a sandbox.** A PDF, a picture or a font you copy onto the Kindle is first
+  read by a separate, locked-down copy of Grimoire that has no network, sees no files, runs as a user of its
+  own and may make only a short list of system calls; what it reports is checked before anything is written.
+  A font is drawn by Grimoire itself only after it passed that check for exactly its bytes.
 
 ## Known issues
 
@@ -403,11 +530,11 @@ precise eraser, and they drop pinned pens from `settings.ini`.
   comes back. If even that does nothing, hold it until the Kindle restarts (about 40 seconds); a
   restart keeps your notebooks. Never use the passcode reset code 111222777 to get out of
   anything: it erases the Kindle, notebooks included.
-- **"Your Kindle passcode was left off"**: the Kindle restarted while Grimoire was open. Turn the
-  passcode back on in the Kindle's Settings (Device Options > Device Passcode); Grimoire leaves
-  that to you.
-- **"This page was made by a newer Grimoire. It is read-only here."**: update Grimoire to change
-  that page. Nothing on it is lost (see Moving between versions).
+- **The Kindle's passcode is off after a restart**: the Kindle restarted while Grimoire was open
+  (grimoire.log says so). Turn the passcode back on in the Kindle's Settings (Device Options > Device
+  Passcode); Grimoire leaves that to you.
+- **"This page was made by a newer version, and will be viewed as read-only."**: update Grimoire to
+  change that page. Nothing on it is lost (see Moving between versions).
 - **KOReader**: open Grimoire from KOReader with Tools > Grimoire, never with *Execute shell
   script* (see Does it work in KOReader?). If "Grimoire did not start: KOReader is running." shows
   near the top of the screen after you tap Grimoire in the Library, a KOReader is still running in
@@ -439,12 +566,18 @@ Betas get betas and releases; a tap there switches to releases only. It needs KP
 
 ## Keyboard and controller shortcuts
 
-In **Library > Settings > Controller**, enable shortcuts: a keyboard or a controller then switches
+In **Library > Settings > Shortcuts**, enable shortcuts: a keyboard or a controller then switches
 tools, undoes and redoes, toggles white ink and turns pages in a notebook. **Buttons...** learns
-which controller button does what (tap a row, press the button). For a Bluetooth controller, unpack
-the kindle-hid-passthrough helper into `grimoire/bluetooth` (only its files, never its installer),
-turn on **Bluetooth controller** and **Pair a controller...**; Grimoire runs the helper only while
-it runs. `grimoire/shortcuts.ini` holds the keyboard's mappings. Shortcuts start disabled. See
+which controller button does what (tap a row, press the button), and **Own shortcuts for this device**
+gives a keyboard or controller shortcuts of its own, saved in `grimoire/shortcuts/` and used whenever it
+is connected (2.0.0-beta.2). For a Bluetooth controller, unpack the kindle-hid-passthrough helper into
+`grimoire/bluetooth` (only its files, never its installer), then in **Settings > Pair** turn on
+**Bluetooth controller** and **Pair a controller...**; Grimoire runs the helper only while it runs.
+`grimoire/shortcuts.ini` holds the default mappings. Shortcuts start disabled. A
+keyboard paired with the Kindle has one scheme (2.0.0-beta.2): in the Library Ctrl+N a notebook, Ctrl+F
+a folder, S Share, O Settings, Esc "Exit Grimoire?"; on a page 1 to 0 the tools, Ctrl+L a link, R the
+page's name, Space what two fingers up do, - and + zoom, Ctrl+S saves, Esc closes what is in front or
+goes back to the Library (an Apple keyboard's Cmd works as Ctrl). See
 [the setup, the mappings and the limits](docs/SHORTCUTS.md).
 
 ## Uninstall
@@ -455,15 +588,36 @@ keep your pages). With KOReader, delete `koreader/plugins/grimoire.koplugin` too
 
 ## Building from source
 
-Needs Zig 0.16.0 (the Kindle cross build), `clang`, Python 3.12+, and LuaJIT for patch checks.
-SDL3 is needed for the desktop simulator; gettext updates translations. The release workflow
-records the build/test setup.
+The app is Rust: one crate in `rust/` (`rust/Cargo.toml`; there is no `Cargo.toml` at the top), built
+and checked by the top-level Makefile. Run cargo from inside `rust/`, or use make; `rust/PORTING.md`
+has the cargo commands and the rules for the code.
+
+What it needs (the versions are the release workflow's pins, in `.github/workflows/release.yml`):
+
+- **Rust 1.97.1** through rustup, with the Kindle's target, and the Makefile pointed at it:
+  `rustup toolchain install 1.97.1 --profile minimal --target armv7-unknown-linux-musleabihf`, then
+  `export RUST_BIN="$(dirname "$(rustup which --toolchain 1.97.1 rustc)")"`. Without `RUST_BIN` the
+  Makefile puts rustup's `stable` toolchain for Apple Silicon first on the PATH (it moves with each
+  Rust release, and has no Kindle target unless you add one); on an Intel Mac or on Linux that folder
+  does not exist, so make runs whichever `cargo` is first on your PATH.
+- **Zig 0.16.0** (ziglang.org) and **cargo-zigbuild 0.23.0**
+  (`cargo install cargo-zigbuild --version 0.23.0 --locked`), for the Kindle build. A newer zig
+  passes the checks, but only the pinned one makes the release's bytes.
+- A C compiler (`clang`; gcc on Linux), make, curl and unzip: build.rs compiles the vendored C.
+- **Python 3.12+** (the standard library only), **Node.js 18+** and **LuaJIT**: the checks run them.
+- Optional, each skipped with a message when missing: shellcheck, luacheck, dash and busybox (the
+  launchers and the KOReader plugin), ImageMagick 7's `magick` (the Effects studio's picture check),
+  and GNU gettext's `msgfmt` (the languages' `.mo` comparison; `make l10n` needs it). `make sim`
+  needs SDL3 and pkg-config (on a Mac, `brew install sdl3 pkgconf`).
 
 ```
-make check     # unit tests, scripted UI scenarios with state checks, share server, exporter,
-               # ARM build, the zip with its launchers and KOReader plugin, and every language
-               # on every screen (make l10n-check)
-make sim       # desktop simulator window (docs/SIM.md)
+make check     # everything that can be checked without a Kindle: unit tests, scripted UI scenarios
+               # with state checks, every language on every screen (make l10n-check), the share
+               # server, Live view, Bluetooth, the exporter, the ARM build, the zip with its launchers
+               # and KOReader plugin, two clean builds compared byte for byte, and the KPM package;
+               # ends with CHECK PASSED
+make test      # the unit tests (rust/tests), on the host and in the headless build
+make scenarios # tests/scenarios/*.qs on the headless runner (SCENARIOS=... for some; docs/SIM.md)
 make kindle    # build/kindle/grimoire: static ARMv7 hard-float (musl) binary
 make dist      # complete installable bundle in dist/Grimoire-VERSION-COMMIT/
 make package   # build/dist/Grimoire.zip
@@ -471,7 +625,16 @@ make kpm-package # build/kpm/*.kpkg and preview/stable repository manifests
 make tools     # build/host/grimoire-export (used by tools/grimoire-pull)
 make tablet    # build/host/scribe-tablet: the pen as a Mac tablet for osu! (docs/TABLET.md)
 make l10n      # po/grimoire.pot from the sources, every po/<lang>.po updated and compiled
+make sim       # the C tree's simulator: an SDL3 window, the app before the Rust port (docs/SIM.md)
 ```
+
+On a 15-core Mac, `make -j15 check SCEN_JOBS=8` takes about 7 minutes once the build cache is warm; a
+first build, or a smaller or busier machine, takes longer (`make -j8 check SCEN_JOBS=4` took 13 minutes
+on a busy one). `build/` grows to a few GB, and more over time as cargo keeps older builds in
+`build/cargo`. Two checkouts can run it at the same time on different ports (`GRIMOIRE_TEST_PORT`,
+docs/TESTING.md). The whole of `make check` runs on macOS. On Linux the unit tests and the scenarios
+run (with two known failures, in docs/BACKLOG.md); the rest has not been tried there, and the share
+check needs macOS's `sips`.
 
 Use `make dist` for builds to keep or install. It collects the installer ZIP, optional KOReader
 patch ZIP, KPM package and manifests, checksums, and source revision in `dist/`. Version/commit
@@ -510,9 +673,20 @@ Grimoire is free software: GPL-3.0-or-later (see `LICENSE`), the same license as
 Much of what Grimoire knows about the Kindle comes from [KOReader](https://koreader.rocks) and
 [kindlemodding.org](https://kindlemodding.org).
 
-- Terminess Nerd Font, Jacquard 24, Jersey 10 and DotGothic16 (the Japanese fallback, subset to
-  the kana, the punctuation and the common kanji to keep the app small: see `assets/README.md`):
-  SIL Open Font License 1.1 (`assets/*-OFL-1.1.txt`)
+- Terminus by Dimitar Toshkov Zhekov (Terminus TTF by Tilman Blumenbach), as Nerd Fonts' Terminess
+  Nerd Font Mono, a subset (Terminus's text and the icons Grimoire uses, to keep the app small: see
+  `assets/README.md`): SIL Open Font License 1.1 (`assets/Terminess-OFL-1.1.txt`)
+- The icons, inside Terminess: Material Design Icons by Pictogrammers (some drawn by Google), Apache
+  License 2.0 (`assets/MaterialDesignIcons-LICENSE.txt`, `assets/MaterialDesignIcons-Apache-2.0.txt`)
+- Jacquard 24, Jersey 10 and DotGothic16 (the Japanese fallback, a subset: the kana, the punctuation
+  and the common kanji, to keep the app small; see `assets/README.md`): SIL Open Font License 1.1
+  (`assets/*-OFL-1.1.txt`)
+- The Classic fonts of Settings > Font: Atkinson Hyperlegible Next by the Braille Institute (with Applied
+  Design Works, Elliott Scott, Megan Eiswerth and Letters From Sweden), Noto Sans by Google (the Noto
+  Project Authors), and Literata by TypeTogether (the Literata Project Authors), each from Google Fonts'
+  release as a Regular and a Bold cut down to the Latin letters and punctuation Grimoire draws (see
+  `assets/README.md`): SIL Open Font License 1.1 (`assets/AtkinsonHyperlegibleNext-OFL-1.1.txt`,
+  `assets/NotoSans-OFL-1.1.txt`, `assets/Literata-OFL-1.1.txt`)
 - stb_truetype and stb_image_write by Sean Barrett: public domain / MIT
 - QR Code generator by Project Nayuki: MIT, vendored unmodified in `third_party/qrcodegen`
   (upstream commit 3c6d0b3)

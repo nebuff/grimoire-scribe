@@ -14,6 +14,10 @@ build/shots/l10n/es-gothic/ and es-classic/ show every screen in Spanish.
   (*Guardar*, *Renombrar*, *Empezar de nuevo*); notices are impersonal (*No se pudo guardar el
   PDF*, *Se borraron 3 páginas*).
 - Neutral words where the regions differ; the regional ones are listed as alternatives.
+- Toasts are terse, as the English is since 2.0.0-beta.2 (the owner's toast pass: *Couldn't save page
+  name.*): *No se pudo* for *Couldn't*, a second clause cut to its outcome (*No se pudieron guardar los
+  enlaces. Página sin cambios.*, *... no se deshizo.*), a useful hint kept (*¿Está lleno el
+  almacenamiento?*). Spanish keeps the articles the English drops where leaving them out would read wrong.
 
 ## The Scribe's pen and the drawing tools
 
@@ -86,7 +90,10 @@ build/shots/l10n/es-gothic/ and es-classic/ show every screen in Spanish.
 | picture (of a page) | **imagen** (*no se puede leer su imagen*) | As the import folder's README says *imágenes*; *foto* is a photograph. |
 | Done | **Listo** | *Hecho* (Spain), *Aceptar*. |
 | Cancel, Retry | **Cancelar, Reintentar** | |
-| Back (the Templates sheet's button back to the papers) | **Volver** | *Atrás*. |
+| Back (the Templates sheet's button back to the papers; What's new's, from a version's notes back to the list of versions) | **Volver** | *Atrás*. |
+| Dismiss (What's new's button, context `what's new`) | **Descartar** | *Cerrar*, which the share page's Dismiss keeps. What's new opens by itself after every update and from the bat; the button only puts it away until then (since 2.0.0 there is no *No volver a mostrar*). |
+| This version (What's new's list of versions: the mark on the row of the version running) | **Esta versión** | *Instalada* and *Actual* say less: the mark is on the version that is running now, beside its number. |
+| unreleased (What's new's list: a version not released yet, in place of its date) | **sin publicar** | *No publicada*, *inédita*. Lower case, as the English, in the column of dates. |
 | Delete | **Borrar** | *Eliminar*. A notebook or pages go (*Se borraron 3 páginas*). |
 | Clear (a page, the test pad) | **Limpiar** (*Se limpió la página*) | The strokes go, the page stays: not *borrar*, which deletes. *Vaciar* (*Página vaciada*). |
 | Rename | **Renombrar** | *Cambiar nombre*. |
@@ -122,11 +129,11 @@ build/shots/l10n/es-gothic/ and es-classic/ show every screen in Spanish.
 | Mirror PDFs to grimoire/PDFs | **Copiar los PDF a grimoire/PDFs** | Folder names on the Kindle stay English (grimoire/PDFs, grimoire/trash, grimoire.log). |
 | trash (the folder) | grimoire/trash | |
 | storage | **almacenamiento** | |
-| passcode | **contraseña** (*La contraseña del Kindle quedó desactivada*) | As the Kindle names it: Configuración > Opciones de dispositivo > *Contraseña del dispositivo*; Amazon's Spanish help says *contraseña de la pantalla de bloqueo*. Was *código de acceso*, which the Kindle does not use. |
+| passcode | **contraseña** (*La contraseña del Kindle quedó desactivada*, a notice 2.0.0-beta.2 dropped) | As the Kindle names it: Configuración > Opciones de dispositivo > *Contraseña del dispositivo*; Amazon's Spanish help says *contraseña de la pantalla de bloqueo*. Was *código de acceso*, which the Kindle does not use. |
 | paused (the passcode, while Grimoire is open) | **suspendida** (*La contraseña del Kindle queda suspendida mientras Grimoire está abierto*) | Suspended for a while, and back when Grimoire closes. *En pausa* is for playback, downloads or a subscription, not a password; *desactivada* is the left-off notice's word, which asks the reader to turn it back on. |
 | Kindle Settings | **la Configuración del Kindle** | The Kindle's own menus are *Configuración* and *Todas las configuraciones* (Amazon's Spanish help); capitalized as the menu's name, as the tip writes *ve a Ajustes*. Grimoire's own Settings stay *Ajustes*, which also keeps the two apart. Was *los ajustes del Kindle*. |
-| defaults (Reset to defaults) | **valores predeterminados** (*Se restablecieron los valores predeterminados*) | The usual interface word; was *valores iniciales*. |
-| a newer Grimoire | **una versión más reciente de Grimoire** (*Esta página se creó con una versión más reciente de Grimoire*) | *un Grimoire más nuevo* was a calque. The paper's short label stays *Papel más nuevo*. |
+| defaults (Reset to defaults) | **valores predeterminados** (*Se restablecieron los valores predeterminados*, a toast 2.0.0-beta.2 dropped) | The usual interface word; was *valores iniciales*. |
+| a newer Grimoire, a newer version | **una versión más reciente de Grimoire**, **una versión más reciente** (*Esta página se creó con una versión más reciente y se verá como de solo lectura*) | *un Grimoire más nuevo* was a calque. The paper's short label stays *Papel más nuevo*. |
 
 ## The share pages and the studio
 

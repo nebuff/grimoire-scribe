@@ -1,3 +1,4 @@
+# rust-only
 # settings: status_mode=1
 # settings: shortcuts_enabled=1
 # copy: tests/fixtures/controller-actions .
@@ -96,7 +97,8 @@ expect editor.panel is collapsed
 key 611 0 1
 wait 100
 expect editor.panel is expanded
-# Clear page, and undo brings the ink back
+# Clear page, and undo brings the ink back (a button clears with no broom in sight: a toast says so and
+# points at Undo, 2.1.0-beta.2)
 pen line 300 700 900 720 10 0.6 0.7
 pen line 300 900 900 920 10 0.6 0.7
 wait 100
@@ -104,7 +106,7 @@ expect editor.strokes is 2
 key 600 0 1
 wait 100
 expect editor.strokes is 0
-expect toast is Page cleared
+expect toast is Page cleared. Undo brings it back.
 key 304 0 1
 wait 100
 expect editor.strokes is 2
@@ -203,7 +205,7 @@ expect editor.link_mode is 1
 key 613 0 1
 wait 100
 expect editor.link_mode is 0
-expect toast is No link made.
+expect toast is
 expect editor.strokes is 2
 tap panel links
 wait 100
@@ -217,7 +219,8 @@ expect editor.strokes is 2
 key 613 0 1
 wait 200
 expect editor.modal is none
-expect toast is No link made.
+expect toast is
+expect editor.linkto is 0
 expect editor.strokes is 2
 # Pen feel opens, and its button or Close menu goes back
 key 610 0 1
@@ -243,7 +246,7 @@ key 612 0 1
 wait 300
 expect screen is editor
 expect editor.modal is none
-expect toast is Could not save this page. Is the storage full?
+expect toast is Couldn't save page. Is the storage full?
 storage ok
 # The Library
 key 612 0 1

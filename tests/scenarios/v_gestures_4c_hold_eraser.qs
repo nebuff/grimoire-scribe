@@ -5,16 +5,19 @@ wait 200
 expect pen.gesture is
 tap 1535 95
 wait 100
-expect library.ui_at.890.1930 is gestures
-tap 890 1930
+expect library.ui_at.329.830 is settings.cat.4
+tap 329 830
+wait 100
+expect library.ui_at.1233.639 is gestures
+tap 1233 639
 wait 100
 expect library.sheet is gestures
-expect library.ui_at.930.749 is gestures.group.editing
-tap 930 749
+expect library.ui_at.930.608 is gestures.group.editing
+tap 930 608
 wait 100
 expect library.gestures_group is editing
-expect library.ui_at.930.920 is gestures.row.4
-tap 930 920
+expect library.ui_at.930.758 is gestures.row.4
+tap 930 758
 wait 100
 expect library.gestures.learning is hold-eraser
 expect library.record is wait
@@ -23,29 +26,29 @@ side click 1
 wait 400
 expect library.record is wait
 expect library.record.line is Erase while held needs the button held: hold it or drag with it.
-expect library.ui_at.930.1650 is record.retry
-pentap 930 1650
+expect library.ui_at.763.1650 is record.retry
+pentap 763 1650
 wait 100
 side on
 wait 1300
 side off
 expect library.record is pattern pen.Button.hold
-# Hold is already the built-in Clear page slot; Use explicitly moves it.
-expect library.record.line is Now for Clear page. Use moves it here.
+# The hold has no built-in action (2.1.0-beta.2: it was Clear page): nothing to move.
+expect library.record.line is pen button hold
 expect library.ui_at.500.1650 is record.use
 pentap 500 1650
 wait 100
 expect library.record is 0
 expect gestures.hold-eraser is pen.Button.hold
 pen leave
-expect library.ui_at.930.2030 is done
-tap 930 2030
+expect library.ui_at.125.95 is done
+tap 125 95
 wait 100
-expect library.ui_at.930.2030 is done
-tap 930 2030
+expect library.ui_at.125.95 is settings.back
+tap 125 95
 wait 100
-expect library.ui_at.1550.1930 is done
-tap 1550 1930
+expect library.ui_at.1735.95 is done
+tap 1735 95
 wait 100
 expect library.sheet is none
 tap 965 95

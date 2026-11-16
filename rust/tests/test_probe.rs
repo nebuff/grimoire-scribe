@@ -55,7 +55,7 @@ fn tool_names_are_settings_ini_names() {
 
 // The gestures' settings keys (Index phase 1) are undotted (a dotted head is a calibration's or a
 // tool's), come after the keys the build before them wrote, in the order gestures, landscape_fit,
-// hints, link_areas (then the clock corner's place, status_corner), and leave every earlier line as that build wrote it: tests/fixtures/
+// hints, link_areas (then the clock corner's place, status_corner; 2.1's font last), and leave every earlier line as that build wrote it: tests/fixtures/
 // settings_default_head.ini is a default Settings saved before they existed, through status_size.
 fn gesture_keys_follow_the_older_ones() {
     let mut s = Settings::default();
@@ -64,8 +64,22 @@ fn gesture_keys_follow_the_older_ones() {
     let got = read_file(&format!("{}/settings.ini", store_root())).unwrap_or_default();
     // Keep the historic ordering fixture frozen; apply only the deliberate later default changes.
     let head = include_str!("fixtures/settings_default_head.ini").replace("status_on=0", "status_on=1").replace("status_size=0", "status_size=1")
-        .replace("highlighter.size_min_mm=3.0000", "highlighter.size_min_mm=5.0000")
-        .replace("highlighter.size_max_mm=3.0000", "highlighter.size_max_mm=5.0000")
+        .replace("highlighter.size_min_mm=3.0000", "highlighter.size_min_mm=5.6000")
+        .replace("highlighter.size_max_mm=3.0000", "highlighter.size_max_mm=5.6000")
+        // 2.1's quick sizes: settings_version 4, the pens' widths on the pen-width series
+        .replace("settings_version=3", "settings_version=4")
+        .replace("pencil.size_min_mm=0.1200", "pencil.size_min_mm=0.1300")
+        .replace("pencil.size_max_mm=0.3200", "pencil.size_max_mm=0.3500")
+        .replace("ballpoint.size_min_mm=0.3000", "ballpoint.size_min_mm=0.3100")
+        .replace("ballpoint.size_max_mm=0.4800", "ballpoint.size_max_mm=0.5000")
+        .replace("eraser.size_min_mm=2.5000", "eraser.size_min_mm=2.8600")
+        .replace("eraser.size_max_mm=7.0000", "eraser.size_max_mm=8.0000")
+        .replace("fineliner.size_min_mm=0.2800", "fineliner.size_min_mm=0.2500")
+        .replace("fineliner.size_max_mm=0.2800", "fineliner.size_max_mm=0.2500")
+        .replace("charcoal.size_min_mm=0.3000", "charcoal.size_min_mm=0.2700")
+        .replace("charcoal.size_max_mm=0.5500", "charcoal.size_max_mm=0.5000")
+        .replace("calligraphy.size_min_mm=1.7500", "calligraphy.size_min_mm=2.0000")
+        .replace("calligraphy.size_max_mm=1.7500", "calligraphy.size_max_mm=2.0000")
         .replace("highlighter.opacity_min=0.5000", "highlighter.opacity_min=0.2500")
         .replace("fountain.size_min_mm=0.2800", "fountain.size_min_mm=0.2500")
         .replace("fountain.size_max_mm=0.8000", "fountain.size_max_mm=1.0000")
@@ -73,7 +87,7 @@ fn gesture_keys_follow_the_older_ones() {
     let want = head.as_bytes();
     check!(got.len() > want.len() && &got[..want.len()] == want);
     let tail = String::from_utf8_lossy(&got[want.len().min(got.len())..]).to_string();
-    check!(tail == "gestures=1\nlandscape_fit=1\nhints=0\nlink_areas=0\nstatus_corner=0\nrotation_lock=0\ngesture_new_page=1\nstatus_mode=1\nshapes=1\nshape_hold_ms=550\nshape_quads=1\nshape_round=1\nshape_links=1\nshape_min_mm=10\nwhatsnew_seen=\nwhatsnew_hide=0\nshape_corner=0\n");
+    check!(tail == "gestures=1\nlandscape_fit=1\nhints=0\nlink_areas=0\nstatus_corner=0\nclock_12h=0\nrotation_lock=0\ngesture_new_page=1\nstatus_mode=1\nshapes=1\nshape_hold_ms=550\nshape_quads=1\nshape_round=1\nshape_links=1\nshape_min_mm=10\nwhatsnew_seen=\nwhatsnew_hide=0\nshape_corner=0\nfont=terminess\n");
     // (undotted: no key before its "=" has a dot)
     for line in tail.lines() {
         let key = line.split('=').next().unwrap_or("");

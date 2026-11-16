@@ -84,10 +84,18 @@ pub enum IconKind {
     Bubbles = 57,
 /// Recorded touch gestures in Settings (Rust only).
     Gestures = 58,
+    /// Select mode's lasso (Rust only)
+    Lasso = 59,
+    /// a page tile whose preview is being made (Rust only: ui_tile_loading)
+    Hourglass = 60,
+    /// Settings' Font chip, in Classic (2.1, Rust only)
+    Font = 61,
+    /// The record card's Disable (2.1, Rust only)
+    Ban = 62,
 }
 impl IconKind {
     /// ICON_COUNT
-    pub const COUNT: usize = 59;
+    pub const COUNT: usize = 63;
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -300,6 +308,10 @@ const K_ICON_CP: [u32; IconKind::COUNT] = {
     k[IconKind::Eye as usize] = 0xF0208; // md-eye
     k[IconKind::LinkPlus as usize] = 0xF0C94; // md-link_plus
     k[IconKind::Bubbles as usize] = 0xF05E3; // md-chart_bubble
+    k[IconKind::Lasso as usize] = 0xF0F03; // md-lasso
+    k[IconKind::Hourglass as usize] = 0xF051F; // md-timer_sand
+    k[IconKind::Font as usize] = 0xF06D6; // md-format_font
+    k[IconKind::Ban as usize] = 0xF073A; // md-cancel
     k
 };
 
@@ -332,6 +344,13 @@ pub fn ui_icon(c: &mut Canvas, k: IconKind, r: Rect, gray: u8) {
     let inset = (if r.w < r.h { r.w } else { r.h }) / 10;
     font_draw_icon(c, FontFace::Regular, K_ICON_CP[k as usize], rect_inflate(r, -inset), gray,
     );
+}
+/// A page tile whose preview is still being made (the Pages view's, a page picker's): an hourglass in
+/// the middle of the tile, black, a third of its smaller side, drawn once with the tile and left until
+/// the preview is drawn in its place. A page never shows one, so it never passes for a blank page.
+pub fn ui_tile_loading(c: &mut Canvas, r: Rect) {
+    let s = r.w.min(r.h) / 3;
+    ui_icon(c, IconKind::Hourglass, Rect { x: r.x + (r.w - s) / 2, y: r.y + (r.h - s) / 2, w: s, h: s }, 0);
 }
 /// The same icon hollow: its outline in edge, a few px wide, around its shape in inside (the
 /// surface under it, so the glyph reads as drawn in outline). A pen that draws white ink shows so.
@@ -513,6 +532,216 @@ pub fn ui_button_need_w(h: i32, icon: IconKind, label: &str, st: ButtonStyle) ->
     font_measure(FontFace::Caps, ts, label) + 2 * label_inset(carved(ui_px(90.0), h), st)
 }
 
+// ---- rows and lists: the one Settings row design ----
+
+/// The room a card keeps between its border and what it draws (a row's icon, a page's heading).
+pub fn ui_row_pad() -> i32 {
+    ui_px(30.0)
+}
+/// The room between a row's icon and its label.
+pub fn ui_row_gap() -> i32 {
+    ui_px(24.0)
+}
+/// The room between two rows of a list.
+pub fn ui_row_space() -> i32 {
+    ui_px(16.0)
+}
+
+/// A Settings card: the one shape a row, a choice or a control sits in, from the main page to About.
+/// The chosen one is filled; the rest are outlined (a disabled one in gray), all at one radius.
+pub fn ui_card(c: &mut Canvas, r: Rect, st: ButtonStyle) {
+    match st {
+        ButtonStyle::Selected => ui_frame(c, r, ui_px(16.0), 0, true, 0),
+        ButtonStyle::Disabled => ui_frame(c, r, ui_px(16.0), 170, false, ui_px(3.0)),
+        _ => ui_frame(c, r, ui_px(16.0), 0, false, ui_px(3.0)),
+    }
+}
+
+/// Settings' switch, at the right end of its card: a track with the knob at the side its state is on,
+/// as Updates' branch has it and every on/off row in Settings.
+pub fn ui_switch(c: &mut Canvas, r: Rect, on: bool) {
+    // (shorter rows, as the two-column sheets have, get a smaller switch: the same shape to scale)
+    let sw_h = ui_px(62.0).min(r.h - ui_px(12.0)).max(ui_px(24.0));
+    let sw_w = sw_h * 120 / 62;
+    let track = Rect::new(r.x + r.w - ui_px(30.0) - sw_w, r.y + (r.h - sw_h) / 2, sw_w, sw_h);
+    ui_frame(c, track, sw_h / 2, 0, on, ui_px(3.0));
+    let kw = sw_h * 46 / 62;
+    let inset = sw_h * 8 / 62;
+    let kx = if on { track.x + track.w - kw - inset } else { track.x + inset };
+    ui_frame(c, Rect::new(kx, track.y + (track.h - kw) / 2, kw, kw), kw / 2, if on { 255 } else { 0 }, true, 0);
+}
+/// One row of any list drawn in the app's design: Settings' page, its submenus, the Display sheet.
+/// An icon, a label, and an on/off switch at the right end when the row is a choice.
+///
+/// A list never draws a row itself: it lays out `ui_row_page`'s rects and calls `ui_row`, so a new
+/// item needs no drawing code at all and looks like every other row in the app.
+#[derive(Clone, Copy, Debug)]
+pub struct Row<'a> {
+    pub icon: IconKind,
+    pub label: &'a str,
+    /// Plain, Selected (filled), Disabled (gray) or Primary.
+    pub style: ButtonStyle,
+    /// Bold for a heading of a list (Settings' categories), Regular for a row's label.
+    pub font: FontFace,
+    /// Some(on): an on/off switch at the right end, and the label keeps clear of it.
+    pub switch: Option<bool>,
+    /// true: the label holds a name from the device (ui_text_name's rules).
+    pub name: bool,
+}
+
+impl<'a> Row<'a> {
+    /// A row that opens a page or a sheet.
+    pub const fn new(icon: IconKind, label: &'a str) -> Row<'a> {
+        Row { icon, label, style: ButtonStyle::Plain, font: FontFace::Regular, switch: None, name: false }
+    }
+    /// An on/off row, its switch at the right end.
+    pub const fn toggled(icon: IconKind, label: &'a str, on: bool) -> Row<'a> {
+        Row { icon, label, style: ButtonStyle::Plain, font: FontFace::Regular, switch: Some(on), name: false }
+    }
+    /// The row in use in a list of choices (a filled card, white on black).
+    pub const fn selected(icon: IconKind, label: &'a str) -> Row<'a> {
+        Row { icon, label, style: ButtonStyle::Selected, font: FontFace::Regular, switch: None, name: false }
+    }
+    pub const fn bold(mut self) -> Row<'a> {
+        self.font = FontFace::Bold;
+        self
+    }
+    pub const fn named(mut self) -> Row<'a> {
+        self.name = true;
+        self
+    }
+}
+
+/// The one row every list draws: the card, its icon, its label, and the switch of an on/off row.
+/// The label takes the room left between the icon and the switch and follows its rules (ui_text):
+/// one line at the text size, a smaller size, or two lines before a translation is ever cut short.
+pub fn ui_row(c: &mut Canvas, r: Rect, row: &Row) {
+    if r.w <= 0 || r.h <= 0 {
+        return;
+    }
+    ui_card(c, r, row.style);
+    let fg: u8 = if row.style == ButtonStyle::Selected {
+        255
+    } else if row.style == ButtonStyle::Disabled {
+        170
+    } else {
+        0
+    };
+    let isz = ui_px(60.0);
+    let mut lx = r.x + ui_row_pad();
+    if row.icon != IconKind::None {
+        ui_icon(c, row.icon, Rect::new(lx, r.y + (r.h - isz) / 2, isz, isz), fg);
+        lx += isz + ui_row_gap();
+    }
+    let mut lw = r.x + r.w - lx - ui_row_pad();
+    if let Some(on) = row.switch {
+        // (the switch keeps its own room at the card's right, as Settings' first page has it)
+        lw = (lw - ui_px(170.0)).max(0);
+        ui_switch(c, r, on);
+    }
+    let lr = Rect::new(lx, r.y, lw.max(0), r.h);
+    if row.name {
+        ui_text_name(c, row.font, ui_text_size(), ui_small_size(), lr, row.label, 2, fg);
+    } else {
+        ui_text(c, row.font, ui_text_size(), ui_small_size(), lr, row.label, 2, false, fg);
+    }
+}
+
+/// A page of rows laid out by `ui_row_page`: where each shows, which of the list it is, and the
+/// arrows when the list takes more than one page.
+#[derive(Clone, Debug, Default)]
+pub struct RowPage {
+    pub rows: Vec<Rect>,
+    /// The index in the list of the first row shown.
+    pub first: usize,
+    pub page: i32,
+    pub pages: i32,
+    pub prev: Rect,
+    pub next: Rect,
+}
+
+// How many rows fit h px at a comfortable height, and (when the list needs it) shorter rows and a
+// narrower gap down to a touch target, then the rows one page holds.
+fn row_fit(h: i32, n: usize, pref_h: i32, min_h: i32) -> (i32, i32, usize) {
+    if n == 0 {
+        return (pref_h.max(1), ui_row_space(), 1);
+    }
+    let n = n as i32;
+    let min_h = clampi(min_h, ui_px(72.0), pref_h.max(1));
+    let mut rh = pref_h.max(1);
+    let mut gap = ui_row_space();
+    if n * (rh + gap) > h {
+        rh = clampi(h / n - gap, min_h, rh);
+    }
+    if n * (rh + gap) > h {
+        gap = clampi(h / n - rh, ui_px(10.0), gap);
+    }
+    let per = (((h + gap) / (rh + gap)).max(1)) as usize;
+    (rh, gap, per)
+}
+
+fn row_pages(n: usize, per: usize) -> i32 {
+    if n == 0 {
+        1
+    } else {
+        (n.div_ceil(per.max(1))) as i32
+    }
+}
+
+/// The rows of a list in `area`, as many as fit, paged when they do not: the layout every Settings
+/// page and submenu shares. The caller keeps `page` (clamped here, and written back), draws each
+/// rect with `ui_row`, and adds the hits. Adding an item to a list never changes this or its page.
+pub fn ui_row_page(area: Rect, n: usize, page: i32, pref_h: i32, min_h: i32) -> RowPage {
+    let nav_h = ui_px(110.0);
+    let (mut rh, mut gap, mut per) = row_fit(area.h, n, pref_h, min_h);
+    let mut pages = row_pages(n, per);
+    let mut paged = pages > 1;
+    if paged {
+        // A paged list keeps a strip at the foot for its arrows, and fits the rows above it.
+        let (rh2, gap2, per2) = row_fit((area.h - nav_h).max(1), n, pref_h, min_h);
+        rh = rh2;
+        gap = gap2;
+        per = per2;
+        pages = row_pages(n, per);
+        paged = pages > 1;
+    }
+    let page = clampi(page, 0, pages - 1);
+    let first = page as usize * per;
+    let shown = n.saturating_sub(first).min(per);
+    let mut rows = Vec::with_capacity(shown);
+    for i in 0..shown {
+        rows.push(Rect::new(area.x, area.y + i as i32 * (rh + gap), area.w, rh));
+    }
+    let (prev, next) = if paged {
+        let bw = ui_px(130.0);
+        let bh = ui_px(90.0);
+        let y = area.y + area.h - bh;
+        (Rect::new(area.x, y, bw, bh), Rect::new(area.x + area.w - bw, y, bw, bh))
+    } else {
+        (RECT_EMPTY, RECT_EMPTY)
+    };
+    RowPage { rows, first, page, pages, prev, next }
+}
+
+/// The arrows and the page count under a paged list (ui_row_page's prev and next). A tap on them
+/// is the caller's hit; an arrow with no page that way is drawn disabled.
+pub fn ui_row_pager(c: &mut Canvas, p: &RowPage) {
+    if p.pages <= 1 {
+        return;
+    }
+    ui_button(c, p.prev, IconKind::Prev, "", if p.page > 0 { ButtonStyle::Plain } else { ButtonStyle::Disabled });
+    ui_button(c, p.next, IconKind::Next, "", if p.page + 1 < p.pages { ButtonStyle::Plain } else { ButtonStyle::Disabled });
+    let count = format!("{}/{}", p.page + 1, p.pages);
+    font_draw_centered(
+        c,
+        FontFace::Fixed,
+        ui_small_size(),
+        Rect::new(p.prev.x + p.prev.w, p.prev.y, (p.next.x - p.prev.x - p.prev.w).max(0), p.prev.h),
+        &count,
+        0,
+    );
+}
+
 /// Horizontal slider: label + value text on the left, track on the right.
 /// value_text may be NULL (then "%.2f unit" is shown).
 #[derive(Clone, Copy, Debug, Default)]
@@ -654,8 +883,18 @@ pub fn ui_slider_drag_to(s: &mut Slider, drag: &mut SliderDrag, x: f32, y: f32, 
 }
 
 
+/// The content rect ui_sheet returns for card, with a title or without, before anything is drawn:
+/// what a sheet's edges and title take, for a sheet sized to what it holds (about.rs).
+pub fn ui_sheet_inner(card: Rect, titled: bool) -> Rect {
+    let (th, inset, bare) = if gothic() { (ui_px(130.0), ui_px(40.0), ui_px(44.0)) } else { (ui_px(120.0), ui_px(36.0), ui_px(36.0)) };
+    if titled {
+        return rect_inflate(Rect { y: card.y + th, h: card.h - th, ..card }, -inset);
+    }
+    rect_inflate(card, -bare)
+}
+
 /// Modal sheet: dims nothing (e-ink), draws a white card with a thick border + title bar.
-/// Returns the content rect inside the card.
+/// Returns the content rect inside the card (ui_sheet_inner's).
 pub fn ui_sheet(c: &mut Canvas, card: Rect, title: &str) -> Rect {
     if gothic() {
         canvas_chamfer_rect(c, card, ui_px(34.0), 255, true, 0);
@@ -675,11 +914,9 @@ pub fn ui_sheet(c: &mut Canvas, card: Rect, title: &str) -> Rect {
             );
             ornament(c, card.x + ui_px(60.0), card.x + card.w - ui_px(60.0), card.y + th, 0,
             );
-            return rect_inflate(Rect { x: card.x, y: card.y + th, w: card.w, h: card.h - th ,
-                }, -ui_px(40.0),
-            );
+            return ui_sheet_inner(card, true);
         }
-        return rect_inflate(card, -ui_px(44.0));
+        return ui_sheet_inner(card, false);
     }
     canvas_round_rect(c, card, ui_px(24.0), 255, true, 0);
     canvas_round_rect(c, card, ui_px(24.0), 0, false, ui_px(6.0));
@@ -696,11 +933,9 @@ pub fn ui_sheet(c: &mut Canvas, card: Rect, title: &str) -> Rect {
         );
         canvas_hline(c, card.x + ui_px(6.0), card.x + card.w - ui_px(6.0), card.y + th, ui_px(3.0), 0,
         );
-        return rect_inflate(Rect { x: card.x, y: card.y + th, w: card.w, h: card.h - th ,
-            }, -ui_px(36.0),
-        );
+        return ui_sheet_inner(card, true);
     }
-    rect_inflate(card, -ui_px(36.0))
+    ui_sheet_inner(card, false)
 }
 // A toast is one line of text, or two at the same size when it needs them: the box grows by a
 // line, as wide as the longer line needs, and keeps the ends of a one-line box (Gothic's points,
@@ -737,6 +972,12 @@ pub fn ui_toast_rect(screen: Rect, msg: &str) -> Rect {
     }
     Rect { x: screen.x + (screen.w - w) / 2, y: screen.y + screen.h - h - ui_px(120.0), w, h ,
     }
+}
+/// The tallest ui_toast_rect makes, in either theme: two one-line boxes. Its second line adds a line's
+/// ascent and descent at the body size (44 px at 300 dpi), never as much as a one-line box (110 px). Live
+/// view's toast layer is no bigger than the screen's longer side times this (live.rs, live_start).
+pub fn ui_toast_max_h() -> i32 {
+    2 * toast_one_h()
 }
 pub fn ui_toast(c: &mut Canvas, screen: Rect, msg: &str) {
     ui_toast_at(c, ui_toast_rect(screen, msg), msg);
@@ -853,9 +1094,10 @@ pub fn ui_chip_w(f: FontFace, px: f32, text: &str, h: i32, min_w: i32, max_w: i3
     ui_text_box_w(f, px, text, if gothic() { h / 2 - ui_px(7.0) } else { ui_px(24.0) }, min_w, max_w,
     )
 }
-/// A notebook's or folder's name as the screens show it: name itself when the fonts draw all of it,
-/// else without what they cannot (font_drawable_copy), and Untitled when no letter is left ("Untitled
-/// 2" for a book's title of emoji and its " 2"). The name stays whole in the files. Returns name
+/// A notebook's or folder's name as the screens show it: name itself, a letter no font has as a box
+/// (2.1.0-beta.2), else without the characters that show nothing (font_drawable_copy: a control or
+/// format character, a combining mark no font has), and Untitled when no letter is left ("Untitled 2"
+/// for a name of zero-width characters and its " 2"). The name stays whole in the files. Returns name
 /// or buf (cap bytes).
 pub fn ui_name_label<'a>(name: &'a str, buf: &'a mut String, cap: usize) -> &'a str {
     if cap == 0 || font_drawable_copy(name, buf, cap) == 0 {
@@ -876,9 +1118,17 @@ pub fn ui_name_label<'a>(name: &'a str, buf: &'a mut String, cap: usize) -> &'a 
 /// corner): a fingertip pressed firmly on glass rolls a few millimetres.
 pub const TAP_SLOP_MM: f32 = 5.0;
 
+/// How long a finger (or the nib) is held still on a control before the hold offers that control's choices
+/// (DESIGN.md, One hold): a link's card, the finger lasso and a paste, the toolbar's and the Pages view's +
+/// (the count pad), a tile's card, a Links bar row's card, a Buttons or Gestures row. Every touch hold reads
+/// this one constant, so none can drift from the others (rust/tests/test_ui.rs checks the sites). Not a touch
+/// hold, so not this: the pen dwell for shapes (a setting), the pen button's 1200 ms, the power key's 4 s and
+/// the keyboard's repeat.
+pub const HOLD_MS: u32 = 600;
+
 /// Tap tracking shared by screens: a press that starts and ends in the same rect is a tap, however
-/// the fingertip rolled between (moved, past the slop, is for drags and holds). Long press = held >
-/// 600 ms without moving.
+/// the fingertip rolled between (moved, past the slop, is for drags and holds). Long press = held
+/// HOLD_MS without moving.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Press {
     pub down: bool,
@@ -1172,5 +1422,45 @@ mod tests {
         let mut buf = String::new();
         assert_eq!(ui_name_label("Notebook 3", &mut buf, 64), "Notebook 3");
         assert_eq!(ui_name_label("Notebook", &mut buf, 0), "Notebook");
+    }
+
+    // A list fits whole at a comfortable height, then shortens its rows, then pages: any number of
+    // items gets the same row design, and no row ever leaves the area.
+    #[test]
+    fn a_list_fits_shortens_then_pages() {
+        ui_init(300.0);
+        let area = Rect { x: 40, y: 100, w: 1000, h: 1200 };
+        let few = ui_row_page(area, 4, 0, 118, 90);
+        assert_eq!((few.pages, few.rows.len(), few.first, few.page), (1, 4, 0, 0));
+        assert_eq!(few.rows[0].h, 118);
+        assert!(rect_is_empty(few.prev) && rect_is_empty(few.next));
+
+        let many = ui_row_page(area, 60, 0, 118, 90);
+        let per = many.rows.len();
+        assert!(per > 0);
+        assert_eq!(many.pages, 60usize.div_ceil(per) as i32);
+        assert!(many.pages > 1 && !rect_is_empty(many.prev) && !rect_is_empty(many.next));
+        for r in &many.rows {
+            assert!(r.h >= 90 && r.y >= area.y && r.y + r.h <= area.y + area.h);
+        }
+        // every page shows its own slice: each item once, and the last page holds what is left
+        let mut seen = 0;
+        for p in 0..many.pages {
+            let page = ui_row_page(area, 60, p, 118, 90);
+            assert_eq!(page.page, p);
+            assert_eq!(page.first, seen);
+            seen += page.rows.len();
+            for r in &page.rows {
+                assert!(r.y + r.h <= area.y + area.h);
+            }
+        }
+        assert_eq!(seen, 60);
+        // a page past the last is the last, never a blank page
+        let last = ui_row_page(area, 60, many.pages + 3, 118, 90);
+        assert_eq!(last.page, many.pages - 1);
+        assert_eq!(last.first + last.rows.len(), 60);
+        // and no items at all is one empty page, not a division by zero
+        let none = ui_row_page(area, 0, 0, 118, 90);
+        assert_eq!((none.pages, none.rows.len()), (1, 0));
     }
 }

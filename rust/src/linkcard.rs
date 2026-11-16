@@ -11,8 +11,9 @@
 //! rows (732 x 118 each, 12 px apart), for N links the line 'To change one, hold it on the page.' (60 px, 12 px
 //! above it), 24 px padding: 666 px with four rows, 536 with three, 608 or 478 for N links, 218 read-only.
 //!
-//! Where it goes (linkcard_place) is a pure function, tested: beside the border, never over it when any place
-//! avoids it, never over the clock's corner, and off the panel when it can be.
+//! Where it goes is the shared popout's place (popout.rs, popout_place, with the panel and the clock's corner to
+//! avoid): beside the border, never over it when any place avoids it, never over the clock's corner, and off the
+//! panel when it can be.
 
 use crate::prelude::*;
 
@@ -57,6 +58,10 @@ pub struct LinkCard {
     /// nav_link_page: a page index, NAV_TO_INDEX, or -1 (a page gone, another version's target)
     pub page: i32,
     pub readonly: bool,
+    /// the card of a document link's chip (a planner's tabs): read only, so it offers Rename the page and
+    /// nothing that edits a link (`doc_target`: the page they go to)
+    pub doc: bool,
+    pub doc_target: u32,
     pub from_bar: bool,
     pub rows: [CardRow; 4],
     pub nrows: usize,
@@ -121,7 +126,13 @@ pub fn linkcard_set(c: &mut LinkCard, pid: u32, seeds: &[u32], nb: &NotebookInfo
         c.page = -1;
     }
     let name = if c.page >= 0 && (c.page as usize) < nb.page_ids.len() { nav_name(nav, nb.page_ids[c.page as usize]) } else { "" };
-    c.title = if let Some(label)=nav_target_label(c.target.as_str()){label} else if c.page == NAV_TO_INDEX {
+    c.title = if let Some(t)=nav_target_state(c.target.as_str()){
+        // (a broken link's title says what is gone first: the card's title row cuts a long one at its end)
+        match t {
+            NavTarget::PageGone(name) => format!("{} · {}", tr("Page gone"), name),
+            t => nav_target_state_label(&t),
+        }
+    } else if c.page == NAV_TO_INDEX {
         tr("The Index").to_string()
     } else if c.page < 0 {
         tr("Page not here").to_string()
@@ -182,62 +193,35 @@ pub fn linkcard_set(c: &mut LinkCard, pid: u32, seeds: &[u32], nb: &NotebookInfo
     add(c, CardRow::Delete, true, delete);
 }
 
-/// The card's place on screen `screen` beside `anchor` (the border's outer rect), PHASE2 8.4: right of it, then
-/// left, below, above; each clamped into the screen 20 px in on its free axis, and slid sideways off the panel
-/// when it meets it. The first that is on the screen, does not cover the anchor, the panel or `corner` (the
-/// clock's corner zone) wins; then the first that covers neither the anchor nor the corner (it draws over the
-/// panel); else the right one clamped to the screen, moved below the corner when it meets it.
-pub fn linkcard_place(w: i32, h: i32, anchor: Rect, screen: Rect, panel: Rect, corner: Rect) -> Rect {
-    let m = u(20.0);
-    let gap = u(24.0);
-    let x_lo = screen.x + m;
-    let x_hi = screen.x + screen.w - m - w;
-    let y_lo = screen.y + m;
-    let y_hi = screen.y + screen.h - m - h;
-    let on_screen = |r: Rect| r.x >= x_lo && r.x <= x_hi && r.y >= y_lo && r.y <= y_hi;
-    let cy = clampi(anchor.y, y_lo, y_hi);
-    let cx = clampi(anchor.x, x_lo, x_hi);
-    let cands = [
-        Rect { x: anchor.x + anchor.w + gap, y: cy, w, h },
-        Rect { x: anchor.x - gap - w, y: cy, w, h },
-        Rect { x: cx, y: anchor.y + anchor.h + gap, w, h },
-        Rect { x: cx, y: anchor.y - gap - h, w, h },
-    ];
-    // Off the panel: to the nearer side of it that stays on the screen.
-    let slide = |r: Rect| -> Rect {
-        if !rect_overlaps(r, panel) {
-            return r;
-        }
-        let left = Rect { x: panel.x - m - w, ..r };
-        let right = Rect { x: panel.x + panel.w + m, ..r };
-        let (near, far) = if (r.x - left.x).abs() <= (right.x - r.x).abs() { (left, right) } else { (right, left) };
-        if on_screen(near) {
-            near
-        } else if on_screen(far) {
-            far
-        } else {
-            r
-        }
+/// The card of a document-link chip (D7a: read only in 2.1): the target page's name and one row, Rename the page
+/// (D3: the name is the page's, everywhere), which the page's name being savable enables. No Change where it
+/// goes, Redraw or Delete: a document link is the document's. `target` is the page id the links go to.
+pub fn linkcard_set_doc(c: &mut LinkCard, pid: u32, target: u32, nb: &NotebookInfo, nav: &Nav, from_bar: bool) {
+    let kb = std::mem::take(&mut c.kb);
+    let boxes = std::mem::take(&mut c.boxes);
+    *c = LinkCard { open: true, pid, doc: true, doc_target: target, from_bar, kb, boxes, ..Default::default() };
+    c.page = nb.page_ids.iter().position(|&p| p == target).map_or(-1, |i| i as i32);
+    c.target = FixedStr::from_str(&format!("p{target}"));
+    let name = if c.page >= 0 { nav_name(nav, target) } else { "" };
+    c.title = if c.page < 0 {
+        tr("Page not here").to_string()
+    } else if name.is_empty() {
+        cformat!(tr("Page %d"), c.page + 1)
+    } else {
+        name.to_string()
     };
-    let clear = |r: Rect| on_screen(r) && !rect_overlaps(r, anchor) && !rect_overlaps(r, corner);
-    for &c in &cands {
-        let r = slide(c);
-        if clear(r) && !rect_overlaps(r, panel) {
-            return r;
-        }
+    if c.page < 0 {
+        return;
     }
-    for &c in &cands {
-        for r in [slide(c), c] {
-            if clear(r) {
-                return r;
-            }
-        }
-    }
-    let mut r = Rect { x: clampi(cands[0].x, x_lo, x_hi), y: clampi(cands[0].y, y_lo, y_hi), w, h };
-    if rect_overlaps(r, corner) {
-        r.y = corner.y + corner.h + u(8.0);
-    }
-    r
+    let label = if name.is_empty() {
+        cformat!(tr("Name page %d..."), c.page + 1)
+    } else {
+        tr("Rename the page").to_string()
+    };
+    c.rows[0] = CardRow::Rename;
+    c.enabled[0] = nav.writable;
+    c.labels[0] = label;
+    c.nrows = 1;
 }
 
 /// The card from a Links bar row (PHASE2 8.10): above the bar, 16 px over it, in the held chip's column,
@@ -441,6 +425,11 @@ pub fn linkcard_hit_name(c: &LinkCard, x: i32, y: i32) -> String {
 /// closed), "links" (how many it acts on) and "border" (how many boxes carry the heavy border now). false for
 /// another key.
 pub fn linkcard_probe(c: &LinkCard, key: &str, out: &mut String, cap: usize) -> bool {
+    if key == "doc" {
+        // 1 for the card of a document-link chip (read only: Rename the page alone), 0 otherwise.
+        csnprintf!(out, cap, "%d", (c.open && c.doc) as i32);
+        return true;
+    }
     if key == "rows" {
         let mut v = String::new();
         if c.open && c.readonly {

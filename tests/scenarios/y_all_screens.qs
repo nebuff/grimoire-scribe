@@ -15,6 +15,8 @@ shot 01-library-empty
 # Phase 3: every Gestures group, with the record card in both orientations.
 tap 1535 95
 wait 50
+tap library settings.cat.4
+wait 50
 tap library gestures
 wait 50
 expect library.sheet is gestures
@@ -136,7 +138,7 @@ rotate 0
 wait 100
 tap library done
 wait 50
-tap library done
+tap library settings.back
 wait 50
 expect library.sheet is settings
 tap library done
@@ -148,11 +150,13 @@ tap 1535 95
 wait 50
 expect library.sheet is settings
 shot 02-settings
-tap library controller
+tap library settings.cat.4
+wait 50
+tap library shortcuts
 wait 50
 expect library.sheet is shortcuts
 shot 02-shortcuts-disabled
-tap 930 575
+tap library shortcuts.enable
 wait 50
 expect settings.shortcuts_enabled is 1
 key 305 0 1
@@ -161,12 +165,38 @@ shot 02-shortcuts-input
 hid attach held Mapper Pad
 wait 50
 shot 02-shortcuts-held
+# Two devices: the device row names one and offers the next; its own shortcuts on (a copy of the default)
+# title the Buttons sheet with its name; gone, it is listed as not connected; its own shortcuts off again.
+hid attach pad:2dc8:6006 Pro 2
+wait 50
+tap library shortcuts.device
+wait 50
+expect library.shortcuts.device is pro-2-2dc8-6006
+shot 02-shortcuts-devices
+tap library shortcuts.own
+wait 50
+expect library.shortcuts.own is on
+shot 02-shortcuts-own
+tap library buttons
+wait 50
+expect library.sheet is buttons
+shot 02-buttons-own
+tap library settings.back
+wait 50
+expect library.sheet is shortcuts
+hid detach Pro 2
+wait 50
+expect library.shortcuts.device is pro-2-2dc8-6006
+shot 02-shortcuts-saved
+tap library shortcuts.own
+wait 50
+expect library.shortcuts.own is off
 hid detach Mapper Pad
-tap 930 1215
+tap library buttons
 wait 50
 expect library.sheet is buttons
 shot 02-buttons
-tap 930 469
+tap library buttons.group.editing
 wait 50
 expect library.buttons_group is editing
 shot 02-buttons-editing
@@ -178,48 +208,48 @@ tap library buttons.row.4
 wait 50
 tap library done
 wait 50
-tap 930 629
+tap library buttons.group.tools
 wait 50
 expect library.buttons_group is tools
 shot 02-buttons-tools
-tap 930 1475
+tap library buttons.row.8
 wait 50
 expect library.learning is tool:calligraphy
 shot 02-buttons-learning
-tap 930 1475
+tap library buttons.row.8
 wait 50
 expect library.learning is
-tap 930 1955
+tap library buttons.row.11
 wait 50
 expect library.learning is picker-previous
 shot 02-buttons-learning-picker
-tap 930 1955
+tap library buttons.row.11
 wait 50
 expect library.learning is
-tap 930 2115
+tap library done
 wait 50
 expect library.buttons_group is
-tap 930 789
+tap library buttons.group.pages
 wait 50
 expect library.buttons_group is pages
 shot 02-buttons-pages
-tap 930 416
+tap library buttons.row.1
 wait 50
 expect library.learning is previous-page
 shot 02-buttons-learning-pages
-tap 930 416
+tap library buttons.row.1
 wait 50
-# The added final row and its learning text, with Done below it.
+# The added final row and its learning text (the group's Done is the page's Back since #115).
 tap library buttons.row.9
 wait 50
 expect library.learning is gesture-new-page
 shot 02-buttons-learning-gesture-new-page
 tap library buttons.row.9
 wait 50
-tap 930 1856
+tap library done
 wait 50
 expect library.buttons_group is
-tap 930 949
+tap library buttons.group.index
 wait 50
 expect library.buttons_group is index
 shot 02-buttons-index
@@ -268,113 +298,190 @@ rotate 0
 wait 100
 tap library done
 wait 50
-tap library done
+tap library settings.back
 wait 50
 expect library.sheet is shortcuts
-tap 930 1375
+tap library shortcuts.reload
 wait 50
-tap 930 575
+# The Pair sheet: a controller another app holds, nothing connected, then shortcuts off (its rows greyed, the
+# line saying where to turn them on).
+hid attach held Mapper Pad
 wait 50
-expect settings.shortcuts_enabled is 0
-tap 930 1695
+tap library settings.close
 wait 50
 expect library.sheet is none
 tap 1535 95
+wait 50
+tap library settings.cat.4
+wait 50
+tap library pair-menu
+wait 50
+expect library.sheet is pair-menu
+shot 02-pair-held
+hid detach Mapper Pad
+wait 50
+shot 02-pair
+tap library settings.close
+wait 50
+tap 1535 95
+wait 50
+tap library settings.cat.4
+wait 50
+tap library shortcuts
+wait 50
+tap library shortcuts.enable
+wait 50
+expect settings.shortcuts_enabled is 0
+tap library settings.close
+wait 50
+tap 1535 95
+wait 50
+tap library settings.cat.4
+wait 50
+tap library pair-menu
+wait 50
+expect library.sheet is pair-menu
+shot 02-pair-shortcuts-off
+tap library settings.close
+wait 50
+expect library.sheet is none
+tap 1535 95
+wait 50
+tap library settings.cat.0
 wait 50
 tap library updates
 wait 50
 expect library.sheet is updates
 shot 02-updates-no-kpm
-tap 930 1375
+tap library settings.close
 wait 50
 expect library.sheet is none
 tap 1535 95
 wait 50
 expect library.sheet is settings
+tap library settings.cat.5
+wait 50
 tap library ko
 wait 50
 expect library.sheet is koreader
 shot 02-koreader-controls
-tap 930 1450
+tap library settings.close
 wait 50
 expect library.sheet is none
 tap 1535 95
 wait 50
 expect library.sheet is settings
-tap 930 930
+tap library settings.cat.1
+wait 50
+tap library theme
 wait 100
 shot 03-settings-other-style
-tap 930 930
+tap library theme
 wait 100
-tap 930 1060
+tap library settings.cat.5
 wait 50
-tap 930 1060
+tap library mirror
 wait 50
-tap 930 1190
+tap library mirror
+wait 50
+tap library settings.cat.3
+wait 50
+tap library pen-button
+wait 50
+shot 04-settings-pen-button-list
+tap library pen-button.3
 wait 50
 shot 04-settings-pen-button-3
-tap 930 1190
+tap library pen-button
+wait 50
+tap library pen-button.0
 wait 50
 shot 04-settings-pen-button-0
-tap 930 1190
+tap library pen-button
+wait 50
+tap library pen-button.1
 wait 50
 shot 05-settings-pen-button-1
-tap 930 1190
+tap library pen-button
 wait 50
-tap 930 1320
+tap library pen-button.2
 wait 50
-tap 930 1320
+tap library settings.cat.1
 wait 50
-tap 930 1450
+tap library rotate
 wait 50
-tap 930 1450
+tap library rotate
+wait 50
+tap library pinch
+wait 50
+tap library pinch
 wait 50
 expect library.sheet is settings
 expect settings.side_button is 2
 expect settings.mirror_pdf is 1
 expect settings.follow_rotation is 1
 expect settings.pinch_zoom is 1
-# Language: the list, Automatic (which changes nothing here), the list again, Cancel. The list is
+# Language: the list, Automatic (which changes nothing here), the list again, Back. The list is
 # shorter than Settings: the empty Library's lines are not drawn under it, where it would cut them.
-tap 930 1580
+tap library settings.cat.0
+wait 50
+tap library language
 wait 50
 expect library.sheet is language
 expect library.hint is 0
 shot 06-language
-tap 930 785
+tap library language.auto
 wait 100
 expect library.sheet is settings
 expect settings.language is auto
-tap 930 1580
+tap library language
 wait 50
 expect library.sheet is language
-tap 930 1425
+tap library language.back
 wait 50
 expect library.sheet is settings
-# Display, with its sleep rows: each of the four sleep screens.
-tap 930 780
+# Display; then Sleep settings, the sleep rows' page since #115: each of the four sleep screens; then Clock settings.
+tap library settings.cat.1
+wait 50
+tap library display
 wait 50
 expect library.sheet is display
 shot 07-display
-tap 930 1448
+tap library display.back
+wait 50
+tap library settings.cat.2
+wait 50
+tap library sleep-clock
+wait 50
+expect library.sheet is display
+tap library display.sleep
 wait 50
 shot 08-display-sleep-1
-tap 930 1448
+tap library display.sleep
 wait 50
 shot 09-display-sleep-2
-tap 930 1448
+tap library display.sleep
 wait 50
 expect settings.sleep_mode is 3
 shot display-koreader-wallpaper
-tap 930 1448
+tap library display.sleep
 wait 50
 expect settings.sleep_mode is 0
-tap 1462 1766
+tap library display.back
+wait 50
+expect library.sheet is settings
+tap library clock-settings
+wait 50
+expect library.sheet is display
+shot 09-clock-settings
+tap library display.back
 wait 50
 expect library.sheet is settings
 # Pen feel: every tab (the pad drawn on in the pencil's and the calligraphy pen's: the live readout),
 # Reset tool.
-tap 930 460
+tap library settings.cat.3
+wait 50
+tap library pen-feel
 wait 100
 expect screen is penset
 shot 10-penfeel
@@ -421,7 +528,7 @@ shot 11-penfeel-tab-9-precise
 tap 1039 1440
 wait 50
 expect settings.eraser_mode is 0
-tap 1630 95
+tap 150 2390
 wait 50
 shot 12-penfeel-reset
 expect screen is penset
@@ -432,7 +539,7 @@ expect screen is library
 # off, then right; touch skipped with the pen; the check, then Cancel (keep the old calibration).
 tap 1535 95
 wait 50
-tap 930 620
+tap library calibrate
 wait 100
 expect screen is calib
 shot 13-calib-pen
@@ -466,16 +573,20 @@ tap 930 1985
 wait 100
 expect screen is library
 expect settings.pen.valid is 0
+# (since #115 Settings opens again behind a calibration it started)
+expect library.sheet is settings
+tap library done
+wait 50
 # Share (a made-up address under make l10n-check), then its Live view card and Stop.
 tap 1345 95
 wait 300
 expect screen is share
 shot 18-share
-tap 318 2100
+tap share live
 wait 300
 expect live.pairing is 1
 shot 18-live-card
-tap 318 2100
+tap share stop
 wait 100
 expect screen is library
 expect live.on is 0
@@ -501,6 +612,27 @@ shot 20-templates-empty-new
 tap 300 2123
 wait 50
 expect library.sheet is new
+# From a file...: the picker's root (upright and sideways), its Import place, Back to the sheet, Cancel at its root.
+tap library new.file
+wait 150
+expect files.open is 1
+shot 20-files-root
+rotate 1
+wait 100
+shot 20-files-root-sideways
+rotate 0
+wait 100
+tap library files.row.1
+wait 300
+expect files.place has /import
+expect files.rows is 1
+shot 20-files-import
+tap library files.back
+wait 100
+tap library files.back
+wait 100
+expect files.open is 0
+expect library.sheet is new
 tap library new.rename
 wait 50
 expect library.sheet is keyboard
@@ -525,6 +657,157 @@ expect screen is editor
 pen curve 300 600 40 70 0.7 4
 wait 100
 shot 23-editor
+# The quick sizes card (a pen button held 600 ms): the eraser's with its Whole strokes / Precise row, then every
+# pen's through the tool button (the pencil last, as the rest of the scenario has it): five chips each, no Pen feel chip;
+# every card must fit the screen upright and sideways, in English, Spanish and Japanese.
+touch down 1768 466
+wait 700
+touch up 1768 466
+wait 100
+expect editor.quicksize is eraser
+shot 23-quick-sizes-eraser
+pentap 400 1200
+wait 150
+pen leave
+expect editor.quicksize is 0
+pentap panel tool-picker
+wait 100
+expect editor.tool is pencil
+pentap panel tool-picker
+wait 50
+tap panel picker.tool:mech
+wait 100
+expect editor.modal is none
+touch down 1768 358
+wait 700
+touch up 1768 358
+wait 100
+expect editor.quicksize is mech
+shot 23-quick-sizes-mech
+pentap 400 1200
+wait 150
+pen leave
+expect editor.quicksize is 0
+pentap panel tool-picker
+wait 50
+tap panel picker.tool:charcoal
+wait 100
+expect editor.modal is none
+touch down 1768 358
+wait 700
+touch up 1768 358
+wait 100
+expect editor.quicksize is charcoal
+shot 23-quick-sizes-charcoal
+pentap 400 1200
+wait 150
+pen leave
+expect editor.quicksize is 0
+pentap panel tool-picker
+wait 50
+tap panel picker.tool:ballpoint
+wait 100
+expect editor.modal is none
+touch down 1768 358
+wait 700
+touch up 1768 358
+wait 100
+expect editor.quicksize is ballpoint
+shot 23-quick-sizes-ballpoint
+pentap 400 1200
+wait 150
+pen leave
+expect editor.quicksize is 0
+pentap panel tool-picker
+wait 50
+tap panel picker.tool:fineliner
+wait 100
+expect editor.modal is none
+touch down 1768 358
+wait 700
+touch up 1768 358
+wait 100
+expect editor.quicksize is fineliner
+shot 23-quick-sizes-fineliner
+pentap 400 1200
+wait 150
+pen leave
+expect editor.quicksize is 0
+pentap panel tool-picker
+wait 50
+tap panel picker.tool:marker
+wait 100
+expect editor.modal is none
+touch down 1768 358
+wait 700
+touch up 1768 358
+wait 100
+expect editor.quicksize is marker
+shot 23-quick-sizes-marker
+pentap 400 1200
+wait 150
+pen leave
+expect editor.quicksize is 0
+pentap panel tool-picker
+wait 50
+tap panel picker.tool:fountain
+wait 100
+expect editor.modal is none
+touch down 1768 358
+wait 700
+touch up 1768 358
+wait 100
+expect editor.quicksize is fountain
+shot 23-quick-sizes-fountain
+pentap 400 1200
+wait 150
+pen leave
+expect editor.quicksize is 0
+pentap panel tool-picker
+wait 50
+tap panel picker.tool:calligraphy
+wait 100
+expect editor.modal is none
+touch down 1768 358
+wait 700
+touch up 1768 358
+wait 100
+expect editor.quicksize is calligraphy
+shot 23-quick-sizes-calligraphy
+pentap 400 1200
+wait 150
+pen leave
+expect editor.quicksize is 0
+pentap panel tool-picker
+wait 50
+tap panel picker.tool:highlighter
+wait 100
+expect editor.modal is none
+touch down 1768 358
+wait 700
+touch up 1768 358
+wait 100
+expect editor.quicksize is highlighter
+shot 23-quick-sizes-highlighter
+pentap 400 1200
+wait 150
+pen leave
+expect editor.quicksize is 0
+pentap panel tool-picker
+wait 50
+tap panel picker.tool:pencil
+wait 100
+expect editor.modal is none
+touch down 1768 358
+wait 700
+touch up 1768 358
+wait 100
+expect editor.quicksize is pencil
+shot 23-quick-sizes-pencil
+pentap 400 1200
+wait 150
+pen leave
+expect editor.quicksize is 0
 pentap panel tool-picker
 wait 50
 expect editor.modal is tools
@@ -605,20 +888,32 @@ pentap panel display
 wait 100
 expect editor.modal is display
 shot 26-display-editor
-tap 500 1539
+tap panel display.done
+wait 100
+expect editor.modal is none
+pentap panel settings
+wait 100
+expect editor.modal is settings
+tap library settings.cat.2
+wait 50
+tap library sleep-clock
+wait 100
+expect editor.settings.sheet is display
+shot 26-sleep-editor
+tap library display.pin
 wait 100
 shot 27-display-pinned
 expect settings.sleep_mode is 1
-tap 930 1399
+tap library display.sleep
 wait 50
-tap 930 1399
+tap library display.sleep
 wait 50
 expect settings.sleep_mode is 3
 shot display-koreader-wallpaper
-tap 930 1399
+tap library display.sleep
 wait 50
 expect settings.sleep_mode is 0
-tap 1462 1860
+tap library display.done
 wait 100
 expect editor.modal is none
 pentap panel next
@@ -742,6 +1037,20 @@ tap panel pages.delete
 wait 150
 shot 30-pages-deleted
 expect editor.pages is 1
+# New page, its Undo, then the bottom row's Redo beside the Undo's place (2.0.0-beta.2), and Undo again
+tap panel pages.new
+wait 200
+expect editor.pages is 2
+tap panel pages.undo-add
+wait 200
+expect editor.pages.redo is 1
+shot 30b-pages-redo
+tap panel pages.redo
+wait 200
+expect editor.pages is 2
+tap panel pages.undo-add
+wait 200
+expect editor.pages is 1
 tap panel pages.back
 expect editor.modal is none
 pen curve 300 600 40 70 0.7 4
@@ -749,16 +1058,16 @@ pinch 900 900 300 700 6
 wait 100
 expect editor.zoom not 1.00
 shot 31-zoom
-# two fingers dragging the zoomed page move it, and say once that Pages and Links are on the panel now
+# two fingers dragging the zoomed page move it (silently: the pan hint went in 2.0.0-beta.2)
 pen leave
 wait 1100
 swipe 2 930 1200 0 400
 wait 300
-# (64, the pan hint; 2, the first link made above showed the first-link tip; 8, the Links bar showed its
-# second header line three times)
-expect settings.hints is 90
+# (2, the first link made above showed the first-link tip; 24, the Links bar showed its second header line
+# three times; 512, the first quick sizes card, bit 9)
+expect settings.hints is 538
 expect editor.zoom not 1.00
-shot 31-zoom-pan-hint
+shot 31-zoom-pan
 tap 930 74
 expect editor.zoom not 1.00
 pinch 900 900 700 200 6
@@ -785,13 +1094,13 @@ tap 548 1052
 wait 50
 expect library.sheet is more
 shot 34-more
-tap 930 1155
+tap library more.pdf
 wait 50
 expect library.sheet is none
 shot 35-saving-pdf
 tap 548 1052
 wait 50
-tap 930 1315
+tap library more.delete
 wait 50
 expect library.sheet is delete
 shot 37-delete
@@ -811,7 +1120,7 @@ expect library.items is 2
 tap 1151 1052
 wait 50
 expect library.sheet is more
-tap 930 995
+tap library more.move
 wait 50
 expect library.sheet is move
 shot 38-move
@@ -853,7 +1162,7 @@ tap 1151 1052
 wait 50
 expect library.sheet is folder-more
 shot 42-folder-more-empty
-tap 930 835
+tap library fmore.rename
 wait 50
 expect library.sheet is keyboard
 shot 43-rename-folder
@@ -877,68 +1186,80 @@ tap 2155 95
 wait 100
 expect library.sheet is settings
 shot 45-settings-landscape
-tap library controller
+tap library settings.cat.4
+wait 50
+tap library shortcuts
 wait 50
 expect library.sheet is shortcuts
-tap 1240 368
+tap library shortcuts.enable
 wait 50
 expect settings.shortcuts_enabled is 1
-shot 45-controller-landscape
-tap 1240 1008
+shot 45-shortcuts-landscape
+tap library buttons
 wait 50
 expect library.sheet is buttons
 shot 45-buttons-landscape
-tap 1240 422
+tap library buttons.group.tools
 wait 50
 expect library.buttons_group is tools
 shot 45-buttons-tools-landscape
-tap 1240 1699
+tap library done
 wait 50
 expect library.buttons_group is
-tap 1240 582
+tap library buttons.group.pages
 wait 50
 expect library.buttons_group is pages
 shot 45-buttons-pages-landscape
-tap 1240 1556
+tap library buttons.row.9
 wait 50
 expect library.learning is gesture-new-page
 shot 45-buttons-learning-gesture-new-page-landscape
-tap 1240 1556
+tap library buttons.row.9
 wait 50
-tap 1240 1700
+tap library done
 wait 50
 expect library.buttons_group is
-tap 1240 742
+tap library buttons.group.index
 wait 50
 expect library.buttons_group is index
 shot 45-buttons-index-landscape
 tap library done
 wait 50
 expect library.buttons_group is
-tap library done
+tap library settings.back
 wait 50
 expect library.sheet is shortcuts
-tap 1240 368
+tap library shortcuts.enable
 wait 50
 expect settings.shortcuts_enabled is 0
-tap 1240 1488
+tap library settings.close
 wait 50
 expect library.sheet is none
 tap 2155 95
 wait 100
 expect library.sheet is settings
-tap 1240 1003
+tap library settings.cat.3
+wait 50
+tap library pen-button
+wait 50
+tap library pen-button.3
 wait 50
 expect settings.side_button is 3
 shot 45-settings-pen-button-3-landscape
-tap 1240 1003
+tap library pen-button
 wait 50
-tap 1240 1003
+tap library pen-button.0
 wait 50
-tap 1240 1003
+tap library pen-button
+wait 50
+tap library pen-button.1
+wait 50
+tap library pen-button
+wait 50
+tap library pen-button.2
 wait 50
 expect settings.side_button is 2
-tap 1908 1695
+tap library done
 wait 100
 expect library.sheet is none
 tap 1585 95
@@ -963,6 +1284,28 @@ tap 267 530
 wait 200
 expect screen is editor
 shot 48-editor-landscape
+touch down 2026 264
+wait 700
+touch up 2026 264
+wait 100
+expect editor.quicksize is ballpoint
+shot 48-quick-sizes-landscape
+tap 600 700
+wait 150
+expect editor.quicksize is 0
+touch down 2026 372
+wait 700
+touch up 2026 372
+wait 100
+expect editor.quicksize is eraser
+shot 48-quick-sizes-eraser-landscape
+tap 600 700
+wait 150
+expect editor.quicksize is 0
+# (the eraser is the pen in use now: the tool button's tap brings its pen back)
+tap panel tool-picker
+wait 100
+expect editor.tool is ballpoint
 pentap panel tool-picker
 wait 50
 expect editor.modal is tools
@@ -1076,7 +1419,7 @@ tap 431 896
 wait 50
 expect library.sheet is more
 shot 50-more-landscape
-tap 1240 1110
+tap library more.delete
 wait 50
 expect library.sheet is delete
 shot 51-delete-landscape
@@ -1086,7 +1429,7 @@ expect library.sheet is none
 expect library.items is 1
 tap 431 896
 wait 50
-tap 1240 790
+tap library more.move
 wait 50
 expect library.sheet is move
 shot 52-move-landscape
@@ -1100,40 +1443,61 @@ tap 431 896
 wait 50
 expect library.sheet is folder-more
 shot 53-folder-more-landscape
-expect library.ui_at.1240.790 is fmore.move
-expect library.ui_at.1240.1110 is done
+expect library.ui_at.1240.690 is fmore.move
+expect library.ui_at.1240.850 is fmore.graph
+expect library.ui_at.1240.1170 is done
 tap library done
 wait 50
 expect library.sheet is none
 tap 2155 95
 wait 100
 expect library.sheet is settings
-tap 1240 590
+tap library settings.cat.1
+wait 50
+tap library display
 wait 50
 expect library.sheet is display
-tap 1240 1239
+tap library display.back
 wait 50
-tap 1240 1239
+tap library settings.cat.2
+wait 50
+tap library sleep-clock
+wait 50
+expect library.sheet is display
+tap library display.sleep
+wait 50
+tap library display.sleep
 wait 50
 shot 54-display-landscape
-tap 1240 1239
+tap library display.sleep
 wait 50
 expect settings.sleep_mode is 3
 shot display-koreader-wallpaper
-tap 1240 1239
+tap library display.sleep
 wait 50
 expect settings.sleep_mode is 0
-tap 1770 1559
+tap library display.back
 wait 50
 expect library.sheet is settings
-tap 1240 1385
+tap library clock-settings
+wait 50
+expect library.sheet is display
+shot 54-clock-settings-landscape
+tap library display.back
+wait 50
+expect library.sheet is settings
+tap library settings.cat.0
+wait 50
+tap library language
 wait 50
 expect library.sheet is language
 shot 55-language-landscape
-tap 1240 1169
+tap library language.back
 wait 50
 expect library.sheet is settings
-tap 1240 260
+tap library settings.cat.3
+wait 50
+tap library pen-feel
 wait 100
 expect screen is penset
 tap 1834 289
@@ -1149,7 +1513,7 @@ wait 100
 expect screen is library
 tap 2155 95
 wait 50
-tap 1240 425
+tap library calibrate
 wait 100
 expect screen is calib
 shot 57-calib-pen-landscape
@@ -1182,15 +1546,18 @@ tap 1240 1675
 wait 100
 expect screen is library
 expect settings.pen.valid is 0
+expect library.sheet is settings
+tap library done
+wait 50
 tap 1965 95
 wait 300
 expect screen is share
 shot 62-share-landscape
-tap 318 1485
+tap share live
 wait 300
 expect live.pairing is 1
 shot 62-live-card-landscape
-tap 318 1485
+tap share stop
 wait 100
 expect screen is library
 expect live.on is 0
@@ -1243,10 +1610,10 @@ expect editor.links is 1 1
 pentap panel display
 wait 300
 expect editor.modal is display
-tap 500 1126
+tap panel display.newpage
 wait 300
 expect settings.gesture_new_page is 0
-tap 1462 1860
+tap panel display.done
 wait 300
 expect editor.modal is none
 wait 1100
@@ -1376,6 +1743,11 @@ shot 68-find-landscape
 tap 279 1745
 wait 300
 expect editor.find is 0
+# (opened from the Pages view: the view again, as it was; its Back closes it)
+expect editor.modal is pages
+tap panel pages.back
+wait 300
+expect editor.modal is none
 # the bar sideways (three chips across), its peek, and on a page with no links
 pen leave
 wait 1100
@@ -1412,15 +1784,15 @@ pentap panel display
 wait 150
 expect editor.modal is display
 shot 69-display-fit-landscape
-tap 1240 779
+tap panel display.fit
 wait 300
 expect settings.landscape_fit is 0
 shot 69-display-fit-off-landscape
-tap 1240 779
+tap panel display.fit
 wait 300
 expect settings.landscape_fit is 1
 shot 69-display-fit-on-landscape
-tap 1768 1653
+tap panel display.done
 wait 300
 expect editor.modal is none
 # upright, the same row says where it applies
@@ -1430,14 +1802,14 @@ pentap panel display
 wait 150
 expect editor.modal is display
 shot 69-display-fit
-tap 930 986
+tap panel display.fit
 wait 300
 expect settings.landscape_fit is 0
-shot 69-display-fit-toast
-tap 930 986
+shot 69-display-fit-off-upright
+tap panel display.fit
 wait 300
 expect settings.landscape_fit is 1
-tap 1462 1860
+tap panel display.done
 wait 300
 expect editor.modal is none
 expect settings.link_areas is 0
@@ -1466,6 +1838,9 @@ expect editor.map is graph
 wait 100
 expect editor.map.mode is all
 shot 72-index-map
+expect editor.map.scope is all
+# No Notebook chip (the owner's ruling of 2026-11-03, "remove it"): the Graph is every notebook's.
+expect editor.map.ui_at.400.215 is
 tap editor map.current
 shot 73-map-card
 rotate 1
@@ -1487,8 +1862,46 @@ expect editor.map is 0
 pentap panel library
 wait 300
 expect screen is library
-# What's new: the card and Read all's whole notes, upright and sideways (from the top level: a
-# folder's bar has its name where the bat is).
+# The Merge dialog (2.1): a folder renamed onto the name of one that is there, upright and sideways, then Cancel.
+tap library back
+wait 100
+expect library.folder is
+expect library.folders is A
+tap 1155 95
+wait 100
+tap 221 2045
+expect library.text is a
+tap 1643 2365
+wait 100
+expect library.folders is A, a
+tap library folder-menu.a
+wait 100
+tap library fmore.rename
+wait 100
+expect library.sheet is keyboard
+tap 1679 2205
+tap 175 2205
+tap 221 2045
+expect library.text is A
+tap 1643 2365
+wait 100
+expect library.sheet is merge
+shot 77-merge
+rotate 1
+wait 100
+expect library.sheet is merge
+shot 77-merge-sideways
+rotate 0
+wait 100
+tap library done
+wait 100
+expect library.sheet is none
+expect library.folders is A, a
+tap library folder.A
+wait 100
+# What's new: the card, Read all's list of every version's notes (this version marked, the newest
+# unreleased) and a version's notes with Back and the page arrows, upright and sideways (from the top
+# level: a folder's bar has its name where the bat is).
 tap library back
 wait 100
 tap library about
@@ -1500,11 +1913,22 @@ wait 100
 shot 79-whatsnew-card-sideways
 tap library about.more
 wait 100
-expect library.about.full is 1
-shot 80-whatsnew-all-sideways
+expect library.about.view is list
+shot 80-whatsnew-list-sideways
 rotate 0
 wait 100
-shot 81-whatsnew-all
+shot 81-whatsnew-list
+tap library about.row.2.0.0
+wait 100
+expect library.about.view is note
+expect library.about.pages is 1
+shot 82-whatsnew-notes
+rotate 1
+wait 100
+expect library.about.pages is 1
+shot 83-whatsnew-notes-sideways
+rotate 0
+wait 100
 tap library about.close
 wait 100
 expect library.sheet is none

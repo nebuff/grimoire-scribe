@@ -26,23 +26,23 @@ expect editor.page is 3
 pentap panel display
 wait 300
 expect editor.modal is display
-tap 500 1076
+tap panel display.newpage
 wait 300
 expect settings.gesture_new_page is 0
 shot 01-display-row-off
-tap 500 1076
+tap panel display.newpage
 wait 300
 expect settings.gesture_new_page is 1
-tap 500 1076
+tap panel display.newpage
 wait 300
 expect settings.gesture_new_page is 0
-pentap panel display
+pentap panel display.done
 wait 300
 expect editor.modal is none
-# off: nothing is added, and the toast says where it stopped
+# off: nothing is added, and nothing is said (the page stays)
 wait 1100
 swipe 2 1300 1200 -400 0
-expect toast is This is the last page.
+expect toast is
 expect editor.pages is 3
 expect editor.page is 3
 # a key's next page still adds one

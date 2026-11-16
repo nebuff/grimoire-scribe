@@ -2,8 +2,9 @@
 # Checks the zip people install (make package): its four files and the optional KOReader plugin
 # folder; documents/Grimoire.sh, the self-unpacking scriptlet (SH_Integration's keys, BUILD_ID,
 # the icon, the Capabilities line, the archive); the app inside it (the binary, the launcher,
-# CAPABILITIES, KOReader's Grimoire plugin, and a license for every embedded font and every
-# third-party part of the binary: the vendored code, musl and zig's compiler-rt, the parts of
+# CAPABILITIES, KOReader's Grimoire plugin, the KOReader patches and Grimoire's earlier Terminess
+# patches, and a license for every embedded font, for Terminess's Material Design icons and for
+# every third-party part of the binary: the vendored code, musl and zig's compiler-rt, the parts of
 # FBInk's tree with notices of their own, the Rust standard library and the libc crate); and that
 # the launchers' test hooks fall back to the device's own paths and timings. The plugin the app
 # carries also goes through tests/koplugin_check.sh.
@@ -54,7 +55,9 @@ for f in kindle/koreader/patches/*.lua; do
         check "optional patch $n parses" sh -c 'luajit -bl "$1" >/dev/null' sh "$B/zip/$PATCHZ/$n"
     fi
 done
-for f in assets/TerminessNerdFontMono-*.ttf assets/Terminess-OFL-1.1.txt; do
+# The fonts with their notices: Terminus's OFL, and the Material Design icons' notice and Apache-2.0 text.
+ICON_LICENSES="assets/MaterialDesignIcons-LICENSE.txt assets/MaterialDesignIcons-Apache-2.0.txt"
+for f in assets/TerminessNerdFontMono-*.ttf assets/Terminess-OFL-1.1.txt $ICON_LICENSES; do
     n=${f##*/}
     printf '%s\n' "$PATCHZ/fonts/Grimoire/$n" >>"$B/allowed.list"
     check "manual patches carry $n" cmp -s "$f" "$B/zip/$PATCHZ/fonts/Grimoire/$n"
@@ -104,7 +107,7 @@ first=$(grep -an '^# Capabilities:' "$S" | head -n 1 | cut -d: -f1)
 check "the header's Capabilities line is the first in the file (line $first)" is "$first" 6
 ID=$(sed -n 's/^BUILD_ID=//p' "$B/script.sh")
 check "BUILD_ID is 12 hex digits ($ID)" sh -c 'printf "%s\n" "$1" | grep -qxE "[0-9a-f]{12}"' sh "$ID"
-check "BUILD_ID is the archive's checksum" is "$(shasum "$B/app.tar" | cut -c1-12)" "$ID"
+check "BUILD_ID is the archive's checksum" is "$( (shasum "$B/app.tar" 2>/dev/null || sha1sum "$B/app.tar") | cut -c1-12)" "$ID"
 
 # The app inside.
 tar -tf "$B/app.tar" >"$B/app.list" 2>/dev/null && tar -xf "$B/app.tar" -C "$B/app" 2>/dev/null
@@ -118,16 +121,23 @@ check "payload's wifi.sh is kindle's" cmp -s "$B/app/wifi.sh" kindle/app/wifi.sh
 check "payload's update.sh is kindle's" cmp -s "$B/app/update.sh" kindle/app/update.sh
 check "payload's CAPABILITIES match the header" is "$(cat "$B/app/CAPABILITIES" 2>/dev/null)" "$CAPS"
 # app/grimoire.sh names what it supports itself: the guard, --hosted, --annotate (a page KOReader
-# sends) and --book (a whole book), and no unpacking (that is Grimoire.sh's).
+# sends), --book (a whole book) and links (the book's links, import/.book/links.txt), and no unpacking
+# (that is Grimoire.sh's).
 APP_CAPS=$(head -n 10 "$B/app/grimoire.sh" 2>/dev/null | sed -n 's/^# Capabilities: //p')
 check "payload's grimoire.sh has its own Capabilities line ($APP_CAPS)" [ -n "$APP_CAPS" ]
-for c in guard hosted annotate book; do
+for c in guard hosted annotate book links; do
     check "payload's grimoire.sh Capabilities include $c" sh -c 'case " $1 " in *" $2 "*) exit 0 ;; esac; exit 1' sh "$APP_CAPS" "$c"
 done
 check "payload's grimoire.sh Capabilities leave out unpack-only" sh -c 'case " $1 " in *" unpack-only "*) exit 1 ;; esac' sh "$APP_CAPS"
 # KOReader's Grimoire plugin, which Grimoire.sh installs into KOReader from app/koreader.
 for f in "$KOPLUGIN"/*; do
     check "payload has koreader/grimoire.koplugin/${f##*/}, kindle's" cmp -s "$f" "$B/app/koreader/grimoire.koplugin/${f##*/}"
+done
+# The patches Settings > KOReader applies, and Grimoire's earlier Terminess patches: a copy in KOReader
+# that is byte for byte one of those is replaced with app/koreader/patches' at a start (koreader.rs).
+for f in kindle/koreader/patches/*.lua kindle/koreader/legacy/*.lua; do
+    d=${f%/*}
+    check "payload has koreader/${d##*/}/${f##*/}, kindle's" cmp -s "$f" "$B/app/koreader/${d##*/}/${f##*/}"
 done
 if tests/koplugin_check.sh "$B/app/koreader/grimoire.koplugin" "$B/koplugin-check" >"$B/koplugin.log" 2>&1; then
     echo "ok   the plugin the app carries passes tests/koplugin_check.sh"
@@ -141,14 +151,17 @@ check "payload has no Mac metadata" sh -c '! grep -qE "(^|/)(\._|\.DS_Store)" "$
 if command -v file >/dev/null 2>&1; then
     check "grimoire is a static ARM binary" sh -c 'file "$1" | grep -q "ARM.*statically linked"' sh "$B/app/grimoire"
 fi
-for f in assets/*-OFL-1.1.txt; do
+for f in assets/*-OFL-1.1.txt $ICON_LICENSES; do
     check "payload has licenses/${f##*/}" cmp -s "$f" "$B/app/licenses/${f##*/}"
 done
-# Each font the binary embeds (FONTS in the Makefile) needs its OFL text: a
+check "the icons' notice names Material Design Icons and the Apache License" sh -c \
+    'grep -qF "Pictogrammers Free License" "$1" && grep -qF "Apache License, Version 2.0" "$1"' sh assets/MaterialDesignIcons-LICENSE.txt
+check "the Apache-2.0 text is the license's" grep -qF "TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION" assets/MaterialDesignIcons-Apache-2.0.txt
+# Each font the binary embeds (FONTS and FONTS_CLASSIC in the Makefile) needs its OFL text: a
 # licenses/<family>-OFL-1.1.txt whose family begins the font's file name (Terminess-OFL-1.1.txt
-# covers TerminessNerdFontMono-Regular.ttf).
-FONTS=$(awk '/^FONTS[ \t]*:=/ { on = 1; sub(/^FONTS[ \t]*:=/, "") }
-    on { l = $0; sub(/\\$/, "", l); print l; if ($0 !~ /\\$/) exit }' Makefile)
+# covers TerminessNerdFontMono-Regular.ttf, NotoSans-OFL-1.1.txt NotoSans-Bold.ttf).
+FONTS=$(awk '/^FONTS(_CLASSIC)?[ \t]*:=/ { on = 1; sub(/^FONTS(_CLASSIC)?[ \t]*:=/, "") }
+    on { l = $0; sub(/\\$/, "", l); print l; if ($0 !~ /\\$/) on = 0 }' Makefile)
 nfonts=0
 for font in $FONTS; do
     nfonts=$((nfonts + 1))
@@ -160,7 +173,13 @@ for font in $FONTS; do
     done
     check "payload has the OFL text for $font" is "$found" yes
 done
-check "the Makefile's FONTS names the embedded fonts ($nfonts)" [ "$nfonts" -gt 0 ]
+check "the Makefile's FONTS and FONTS_CLASSIC name the embedded fonts ($nfonts)" [ "$nfonts" -ge 11 ]
+# The Classic fonts the binary embeds are the ones rust/src/assets.rs includes, and no other.
+for font in $FONTS; do
+    check "rust/src/assets.rs embeds $font" grep -qF "assets/$font\")" rust/src/assets.rs
+done
+check "rust/src/assets.rs embeds only the Makefile's fonts" is \
+    "$(grep -c 'include_bytes!("../../assets/[^"]*\.ttf")' rust/src/assets.rs)" "$nfonts"
 # Every vendored component needs its license in the package: a third_party/<dir> brings a
 # LICENSE or COPYING file, a single-file library at the top of third_party/ must be named in a
 # notice. The binary is linked static, so musl's notice goes too.
@@ -197,6 +216,17 @@ check "payload has licenses/rust-std-LICENSE.txt, the Rust standard library's no
 check "payload has licenses/rust-libc-LICENSE.txt, the libc crate's MIT and Apache-2.0 licenses" sh -c \
     'grep -qF "From the libc crate" "$1" && grep -qF "The Rust Project Developers" "$1" &&
      grep -qF "Permission is hereby granted" "$1" && grep -qF "Apache License" "$1"' sh "$L/rust-libc-LICENSE.txt"
+# The PDF engine's crates (2.1.0-beta.2, D22): app/licenses/rust-crates.txt is generated at package time from
+# the crates Cargo.lock holds (tools/crate_licenses.py), and every one of them is in it with its version, besides
+# the notices of the data hayro carries: Foxit's standard fonts, Adobe's CMaps and the ICC profiles.
+check "payload has licenses/rust-crates.txt" [ -s "$L/rust-crates.txt" ]
+LOCKED=$(awk '/^name = / { gsub(/"/, "", $3); n = $3 } /^version = / { gsub(/"/, "", $3); if (n != "" && n != "grimoire") print n " " $3; n = "" }' rust/Cargo.lock)
+check "Cargo.lock lists crates (the PDF engine's)" [ -n "$LOCKED" ]
+MISSING=$(printf '%s\n' "$LOCKED" | while read -r n v; do grep -qF -- "$n $v  (licensed" "$L/rust-crates.txt" || echo "$n-$v"; done)
+check "rust-crates.txt names every crate of Cargo.lock with its version (missing: ${MISSING:-none})" [ -z "$MISSING" ]
+check "rust-crates.txt has hayro and Foxit's notice" sh -c 'grep -qF "hayro 0.8.0" "$1" && grep -qF "Foxit" "$1"' sh "$L/rust-crates.txt"
+check "rust-crates.txt has Adobe's CMaps notice" sh -c 'grep -qF "Adobe" "$1"' sh "$L/rust-crates.txt"
+check "rust-crates.txt has the ICC profiles' notice" sh -c 'grep -qF "the ICC profiles" "$1" && grep -qF "CC0 1.0 Universal" "$1"' sh "$L/rust-crates.txt"
 # FBInk compiles two parts of its tree with notices of their own into the binary: cutef8
 # (cutef8/utf8.c) and Bjoern Hoehrmann's UTF-8 decoder (cutef8/dfa.c). Each ships the notice at the
 # head of its source and its entry in FBInk's CREDITS, the only text the tree has for them. A new
@@ -255,6 +285,13 @@ for w in "lipc-wait-event -s 0 $EVENTS" "lipc-wait-event -m -s 0 $EVENTS"; do
     check "the binary runs '$w'" sh -c 'tr "\000" "\n" <"$1" | grep -qF -- "$2"' sh "$B/app/grimoire" "$w"
     check "restore()'s pkill pattern matches '$w'" sh -c 'printf "%s\n" "$2" | grep -qE -- "$1"' sh "$PAT" "$w"
 done
+
+# The size guard (2.1, the owner's decision D23, raised by him for 2.1.0-beta.2): the Kindle binary stays under
+# 11 MB and the zip under 6 MB (the binary is on the Kindle twice: in documents/Grimoire.sh's archive and as app/grimoire).
+BIN_SIZE=$(wc -c <"$B/app/grimoire" | tr -d ' ')
+ZIP_SIZE=$(wc -c <"$ZIP" | tr -d ' ')
+check "the Kindle binary is under 11 MB ($BIN_SIZE bytes)" [ "$BIN_SIZE" -lt 11000000 ]
+check "the zip is under 6 MB ($ZIP_SIZE bytes)" [ "$ZIP_SIZE" -lt 6000000 ]
 
 if [ $fail = 0 ]; then
     rm -rf "$B"

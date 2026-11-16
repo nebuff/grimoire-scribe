@@ -29,16 +29,23 @@ fn kept_drawings_are_exact_and_only_current() {
     let mut drawn = Canvas::default();
     check!(canvas_init(&mut drawn, w, h) == 0);
     page_render(&mut drawn, &p, Rect { x: 0, y: 0, w, h }, 300.0);
-    check!(!store_page_render_kept(&nb, pid, w, h));
-    check!(store_save_page_render(&nb, pid, &drawn));
-    check!(store_page_render_kept(&nb, pid, w, h));
+    check!(!store_page_render_kept(&nb, pid, w, h, false));
+    check!(store_save_page_render(&nb, pid, &drawn, false));
+    check!(store_page_render_kept(&nb, pid, w, h, false));
     // Read back byte for byte, into a canvas of the page's size only.
     let mut back = Canvas::default();
     check!(canvas_init(&mut back, w, h) == 0);
-    check!(store_load_page_render(&nb, pid, w, h, &mut back) && back.px == drawn.px);
+    check!(store_load_page_render(&nb, pid, w, h, &mut back, false) && back.px == drawn.px);
     let mut other = Canvas::default();
     check!(canvas_init(&mut other, w, h + 1) == 0);
-    check!(!store_load_page_render(&nb, pid, w, h + 1, &mut other));
+    check!(!store_load_page_render(&nb, pid, w, h + 1, &mut other, false));
+    // A drawing kept with an unlayered tag (as 2.0.0-beta.1 keeps every page's) is not trusted for a
+    // layered page, and a layered one ("|L") not for an unlayered page.
+    check!(!store_page_render_kept(&nb, pid, w, h, true));
+    check!(!store_load_page_render(&nb, pid, w, h, &mut other, true));
+    check!(store_save_page_render(&nb, pid, &drawn, true));
+    check!(store_page_render_kept(&nb, pid, w, h, true) && !store_page_render_kept(&nb, pid, w, h, false));
+    check!(store_save_page_render(&nb, pid, &drawn, false));
     // The page file written again (new ink): the kept drawing no longer counts.
     let mut p2 = page_with_ink(w, h);
     let mut prm = ToolParams::default();
@@ -48,12 +55,72 @@ fn kept_drawings_are_exact_and_only_current() {
     page_add(&mut p2, s);
     std::thread::sleep(std::time::Duration::from_millis(20));
     check!(store_save_page(&nb, 0, &p2) == 0);
-    check!(!store_page_render_kept(&nb, pid, w, h));
+    check!(!store_page_render_kept(&nb, pid, w, h, false));
     let mut stale = Canvas::default();
     check!(canvas_init(&mut stale, w, h) == 0);
-    check!(!store_load_page_render(&nb, pid, w, h, &mut stale));
+    check!(!store_load_page_render(&nb, pid, w, h, &mut stale, false));
     // The fingerprint is stable within a process.
     check!(page_render_fingerprint() == page_render_fingerprint() && page_render_fingerprint() != 0);
+}
+
+fn dir_of(nb: &NotebookInfo) -> String {
+    let mut dir = String::new();
+    check!(store_notebook_dir(nb.id.as_str(), &mut dir, 600) == 0);
+    dir
+}
+
+// A drawing 2.0.0 or 2.0.1 kept: its tag is this build's without the version ("|k2") after the fingerprint.
+fn kept_by_2_0_1(nb: &NotebookInfo, pid: u32) {
+    let stamp = format!("{}/.page-previews/p{pid}.full.stamp", dir_of(nb));
+    let tag = std::fs::read_to_string(&stamp).unwrap();
+    check!(tag.contains("|k2"));
+    std::fs::write(&stamp, tag.replace("|k2", "")).unwrap();
+}
+
+fn drawings_kept_by_2_0_1_are_never_read_and_retired_once() {
+    // 2.0.0 and 2.0.1 could keep the old picture of a page just cleared or given a new paper under the new file's
+    // stamp (editor.rs page_is_its_file): such a tag cannot be told from a true one, so none is read.
+    let mut nb = NotebookInfo::default();
+    check!(store_create("Before", "", PAPER_NARROW, &mut nb) == 0);
+    let (w, h) = (600, 800);
+    let p = page_with_ink(w, h);
+    check!(store_save_page(&nb, 0, &p) == 0);
+    let pid = nb.page_ids[0];
+    let mut drawn = Canvas::default();
+    check!(canvas_init(&mut drawn, w, h) == 0);
+    page_render(&mut drawn, &p, Rect { x: 0, y: 0, w, h }, 300.0);
+    for layered in [false, true] {
+        check!(store_save_page_render(&nb, pid, &drawn, layered));
+        kept_by_2_0_1(&nb, pid);
+        let mut back = Canvas::default();
+        check!(canvas_init(&mut back, w, h) == 0);
+        check!(!store_page_render_kept(&nb, pid, w, h, layered));
+        check!(!store_load_page_render(&nb, pid, w, h, &mut back, layered));
+        // It goes, once (stamp and drawing)
+        check!(store_retire_page_render(&nb, pid));
+        check!(!store_retire_page_render(&nb, pid));
+        check!(!std::path::Path::new(&format!("{}/.page-previews/p{pid}.full", dir_of(&nb))).exists());
+    }
+    // One of the page file as it was before (the file written again since, by an idle save inside the previews'
+    // 30 s or a notebook closed before its idle save) goes too: the preview and the card made beside it may show
+    // a Clear's old ink all the same.
+    check!(store_save_page_render(&nb, pid, &drawn, true));
+    kept_by_2_0_1(&nb, pid);
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    check!(store_save_page(&nb, 0, &p) == 0);
+    check!(store_retire_page_render(&nb, pid) && !store_retire_page_render(&nb, pid));
+    // This build's drawing is never taken for one, current or not, nor one of a later version
+    check!(store_save_page_render(&nb, pid, &drawn, false));
+    check!(!store_retire_page_render(&nb, pid));
+    check!(store_page_render_kept(&nb, pid, w, h, false));
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    check!(store_save_page(&nb, 0, &p) == 0);
+    check!(!store_retire_page_render(&nb, pid));
+    let stamp = format!("{}/.page-previews/p{pid}.full.stamp", dir_of(&nb));
+    let tag = std::fs::read_to_string(&stamp).unwrap();
+    std::fs::write(&stamp, tag.replace("|k2", "|k3")).unwrap();
+    check!(!store_retire_page_render(&nb, pid));
+    check!(std::path::Path::new(&format!("{}/.page-previews/p{pid}.full", dir_of(&nb))).exists());
 }
 
 #[test]
@@ -62,5 +129,7 @@ fn test_render_keep() {
     let _ = std::fs::remove_dir_all(&root);
     check!(store_init(&root) == 0);
     run!(kept_drawings_are_exact_and_only_current);
+    run!(drawings_kept_by_2_0_1_are_never_read_and_retired_once);
     let _ = std::fs::remove_dir_all(&root);
+    done(); // (a failed check fails the test: it did not, without this)
 }

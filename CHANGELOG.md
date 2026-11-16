@@ -1,7 +1,375 @@
 # Changelog
 
-## Unreleased
+## 2.1.1 (unreleased)
 
+- Hardening: Grimoire reads the files in its own folders only when they are plain files, with size limits
+  on the small text files, and makes its temporary files afresh each time. A `settings.ini` it cannot
+  read is kept as `settings.ini.unread` rather than written over. A picture or folder in `templates/`,
+  `photos/` or `import/` that is a link is no longer taken: copy the file in.
+- Housekeeping: the separate process that reads PDFs, pictures and fonts is held to a narrower set of
+  system calls and is started only with all of its descriptors in place. No change in the app.
+- Housekeeping: the documents of the safe loader and of your own fonts say what the code does (the limit
+  on a worker's record lines, what a build off the Kindle takes of the sandbox, the font check's second
+  try), `licenses/rust-crates.txt` says it lists every crate `Cargo.lock` names, and the crate check
+  refuses by name the one crate that would bring a second font parser into the build. No change in the app.
+- **"PDF already imported." now means that very file.** A notebook made from a PDF keeps the SHA-256 and
+  size of its file (one line in its `source.ini`), and a PDF with the same book key is compared with it. The
+  same file says "PDF already imported." as before; a different file with that key (an edited copy, say)
+  becomes a notebook of its own, and KOReader's Open this book in Grimoire keeps opening the first.
+  Notebooks made before this version, or from KOReader, go by the key as before. In Files, a PDF that a
+  notebook already holds offers Import as notebook beside Open its notebook. A big PDF is read once more at
+  the end of its import (the notice stays on its last page meanwhile).
+- The import handles odd names and places more strictly: a file's path is kept exactly as it is while it is
+  imported (a name with unusual characters goes on correctly after an interruption), a path with a line
+  break in a name is left where it is, a file picked from a folder that is only spelled like
+  `grimoire/import` stays where it is, and the import's lock file and its first look at a dropped PDF are
+  opened without following links.
+
+## 2.1.0 (2026-11-13)
+
+- The first stable release of 2.1: 2.1.0-beta.2 with the changes below, now on the stable channel too (KPM
+  2.1.9999; a preview subscriber is offered it as well). A 2.0.0 install gets everything in the 2.1.0-beta.1 and
+  2.1.0-beta.2 sections with it. Fixes come as 2.1.1, 2.1.2 and so on, new features as 2.2.
+- Page turns at the fitted view no longer flash, and turning back a page or two is instant (nebuff, #49). A page
+  turn at the fitted view is a grayscale refresh without a flash (a turn at another view, the Library and back, and
+  every 30th refresh still flash, which also cleans what fast refreshes left). The whole drawings of the last three
+  pages you left are kept in memory (4.6 MB each), so turning back to one shows it at once rather than drawing
+  every stroke again; a page written since is drawn again. A jump to the oldest of the three is shown from memory
+  too (issue #60, nebuff, #67): it had been put aside before it was read.
+- The lasso's bar answers every tap, and a drag leaves fewer traces (nebuff, #52, issues #50 and #51). A bar button
+  shows a pressed look as the pen or finger comes down and acts at the lift, so Copy, which changes nothing on the
+  screen, still shows it was tapped; a contact that slides off a button does nothing. The first fast refresh after
+  a flashing one now waits for it to end (the two on the panel at once tore the drag's first strips), and the
+  outline a drag leaves counts toward the cleaning of fast refreshes' traces.
+- The first pen, touch or key press in the Kindle's first minute after a restart counts as activity for its sleep
+  timer, as every later one does (issue #74). It was not passed on to the power service until a minute had gone.
+- Grimoire's core can be built for another device, with that device's parts in a crate of their own (#61, #62,
+  #70, #71). On a Kindle nothing changes.
+- `make dev` and `tools/kindle-dev` work on more Macs and on Linux (nebuff, #76).
+
+## 2.1.0-beta.2 (2026-11-11)
+
+- **Closing a big notebook no longer redraws every page.** The PDF of a notebook (the mirror in `PDFs/`) kept
+  every page drawn at every close of a changed notebook: minutes on a 400-page planner, with the one background
+  queue held. Each page's image is now kept in `grimoire/.cache/pdf/` (256 MB in all, disposable: deleting it
+  loses nothing) and only the pages you changed are drawn again. The PDF is written to its file as it is made
+  rather than built whole in memory, so a 2,000-page notebook's PDF no longer takes hundreds of MB; the share
+  page's PDF and zip downloads are streamed the same way. A page with a coloured picture (an imported colour page,
+  a colour template) is kept in colour in the PDF, decoded once (its PDF fits the background process's memory at
+  the Scribe's page size); every other page stays gray. A page drawn before its picture was made (a template just
+  picked) is drawn again with it at the next close, never kept white; Grimoire started again while a PDF is being
+  made (a KOReader round trip) waits for it rather than writing the same file; a download or zip that would pass
+  4 GiB fails instead of arriving broken. Every background process now runs at a lower priority for the memory
+  killer (an out-of-memory kill takes it before Grimoire) and with a ceiling on its memory.
+- **A PDF's own links work in a notebook: a planner's tabs.** Opening a book from KOReader (Open this book in
+  Grimoire) now also sends the links of its pages: a finger tap on "March" goes to March. They are part of the
+  page, kept in a file of their own (`doclinks.ini`, up to 16,000 links) apart from the links you draw: your links
+  come first where they overlap a tab; Clear page keeps the tabs; a lasso around the writing in a day cell never
+  picks the cell's link up; Copy page and Copy to notebook carry them (to pages that travel too). The Links bar
+  lists them as one row, "From the PDF (43)" (before any Linked from rows), which opens them grouped by page; the eye draws their boxes
+  dotted. A finger held on one arms Select, as on paper. The Graph never draws them. The notebook's PDF has them
+  as links. A tab under the clock corner is followed (the clock's tap works where no tab lies). A 2.0 build shows
+  the pages and your own links, without the tabs. Needs the KOReader plugin of this
+  version (Grimoire installs it) and a book opened once more: the links of the pages Grimoire already holds are
+  sent the first time (and again whenever pages are added); a book whose links do not all fit says "Some links
+  were left out.".
+- A PDF dropped in `grimoire/import/` (or in a folder there, to file it in that Library folder) becomes a
+  notebook of its pages, with no KOReader: a notice at the bottom of the Library says "Importing: page 37 of
+  412", the PDF moves to `import/done/`, and a PDF already imported says so. Pages with colour are kept in
+  colour (the Scribe shows gray); a page that cannot be read ends blank and the notebook says "Some pages
+  couldn't be read." (a PDF with no readable page is not imported). More than 2000 pages, over 512 MB or a password are refused with a message.
+  A PDF that is refused, or fails three times, waits until the file changes; a full storage counts nothing
+  against it, and it goes once there is room. An import cut off (Grimoire closed, the Kindle off) goes on where
+  it stopped, and makes again any page whose files were lost. As for a folder of pictures, no toast says
+  "Imported notebook" when the Library shows the new card.
+- **Library > New > From a file... picks a PDF or a folder of pictures anywhere on the Kindle.** It opens Files:
+  Import (with a status on every row: Waiting, "Importing: page 40 of 365", Imported, and a Look again row),
+  Documents, Downloads and All storage. A tap on a PDF opens its card (size and date, Import as notebook, or Open
+  its notebook when a notebook already holds the book: "has notes" shows on its row); the second tap imports it.
+  A folder of pictures imports from its card (a hold or its `...`). The notebook is named as typed in the sheet,
+  else as the file, and goes in the sheet's folder. The file is only read: it stays where it is, no link is ever
+  followed, and Grimoire's own notebooks, PDFs and trash are never listed. (A file picked in Import itself is
+  filed in `import/done/` like a dropped one.) A file picked while an import from an earlier run is still going
+  is imported once that one is done: "Another import is still going. This one starts after it."
+- A PDF dropped in `grimoire/import/` brings its links and page names too: a planner's tabs work in the notebook
+  it becomes (the PDF's internal links, including those by name, the next, previous, first and last page links,
+  and links drawn as several boxes; web links are left out), and its outline names the pages. A planner with more
+  links than a notebook holds (14,400) keeps the most on every page and trims the busiest pages, and the end
+  says "Imported notebook (%d pages). Some links were left out.". A notebook Grimoire exported as a PDF and
+  imported again gives back its links and page names.
+- Pictures you put in `grimoire/templates`, `grimoire/photos` or an import folder are now read by that same
+  separate process, in slices, instead of by the part of Grimoire that writes files: a damaged or hostile picture
+  (cut short, enormous, a decompression bomb) is refused as before; one that crashes the reader is read again by a
+  fresh one, and crashing that too marks it as not usable (templates and photos), or counts one of its folder's
+  three tries. A template or photo copied in a moment ago is picked once its tile shows its preview ("Not ready
+  yet. Try again in a moment." before that). On the Kindle a picture is never read outside that process: should it
+  ever be unavailable (grimoire.log says why, once), a template or photo waits for its preview and is never marked
+  as not usable, and a picture folder stays in `import/` and is tried again at every look without using up its
+  tries.
+- PDFs are read by a separate process that cannot reach the files, the network or other programs (a sandboxed
+  worker); a Scribe that refuses a step reads no PDF and says so in grimoire.log. A picture folder in `import/`
+  now also gets a notebook name no other notebook has.
+- package-check's size guard is now 11 MB for the Kindle binary and 6 MB for the zip (was 10.5 MB and 5.5 MB):
+  the PDF engine, its safe worker and the file picker brought the binary to 10.45 MB before your own fonts.
+- **Your own fonts in Classic.** Copy `.ttf` or `.otf` files into `grimoire/fonts` over USB (a family in a
+  folder of its own is fine) and open Settings > Font: under "Your fonts" each file shows its name drawn in
+  itself once Grimoire has checked it in the background ("Checking 3 fonts..." stays above the buttons
+  meanwhile), or its row says why it cannot be used: "Unreadable font.", "Too big (over 24 MB).", "No Latin
+  letters.", "Use .ttf or .otf." or "Took too long to read.". Tap one to see the sample in it, Done to use it.
+  Bold comes from the font's weight axis, else from the Bold file of the same family beside it, else from a
+  thicker print of the regular; a letter the font lacks comes from Terminess. Your font draws Grimoire's own
+  words only: pages, paper labels, the clock, icons, PDFs and the share pages never change with it, and the
+  file stays on the Kindle. A font is first read in the sandbox that reads PDFs and pictures, glyph by glyph,
+  and Grimoire draws it only while the file is byte for byte the one that passed. Should a font ever stop
+  Grimoire before its first screen, the next start is in Terminess by itself, and Terminess then Done in the Font
+  sheet takes the font away for good; deleting the font's file brings Terminess back too ("File missing.", from
+  the next start), and while a font of yours is in use the Font sheet's own words stay in Terminess. A font that
+  cannot be checked now (a file dated ahead of the clock, a full storage) is asked again after 3 s, 15 s and
+  60 s, then not until Grimoire starts again; the fonts are checked one at a time, behind an export or a PDF
+  slice; a font whose check ran out of time gets a second try; a Done that cannot load the font says so. New in `settings.ini`: `font=file:<path>` and `font_bold=`, which 2.1.0-beta.1 and older keep as
+  lines they do not know (they draw Terminess). The Kindle binary is 10.6 MB and the zip 5.5 MB with it.
+- **Settings > Wi-Fi switches between the Kindle's saved networks** (issue #40). A Wi-Fi button in Settings'
+  bottom row, beside Pair, opens a sheet that turns Wi-Fi on or off, says which network the Kindle is connected
+  to, and lists the networks the Kindle has saved in their own order; the status line names the connected network and
+  the list scrolls. Tap one to switch: "Connecting to ...", then "Connected to ...", or "Could not connect to ..." when
+  the Kindle refuses it or has not connected in 45 seconds (Grimoire then changes nothing more). Switching drops
+  Share, Live view and SSH from the network you leave. Adding a network or a password stays in the Kindle's
+  settings and KOReader. No Wi-Fi password reaches the app, its files or its log (its helper keeps only the
+  networks' names from what the Kindle answers); no network is added, changed or forgotten; no network name is
+  logged.
+- **The keyboard has a caret, and copy and paste for typed text** (issue #36). Every keyboard (names, renames,
+  Find, link and page names, Go to page, the kana pad) has ◀ and ▶ at the right end of its text line: they move
+  the caret a letter, and held they go on as delete does. A tap on the text puts the caret there; a drag across
+  it selects. Typing and delete act at the caret, replacing or taking a selection, and ゛小 changes the kana
+  before the caret. The key beside the arrows opens the edit page: Select all, Cut, Copy, Paste, and Start and
+  End for the caret; abc (or あ, or 123) goes back. What you cut or copy is kept until Grimoire closes and
+  pastes into any keyboard; it is apart from the lasso's ink clipboard. With a keyboard attached (and shortcuts
+  enabled), the arrows, Home and End move the caret (Shift selects) and Ctrl or Cmd with A, C, X and V select
+  all, copy, cut and paste. The count pad stays as it is.
+- The text cache now holds at most 4 MB of letters (it was only limited by their number), which matters for
+  large letters of your own fonts.
+- A character no font in Grimoire can draw shows as a box instead of disappearing, so a name no longer looks cut
+  short: a notebook named 会议记录 showed only 会 in the Library (会 is in the Japanese font; 议, 记 and 录 are
+  simplified Chinese, which none of Grimoire's fonts has) and now shows 会 and three boxes; an emoji or a
+  Vietnamese letter Terminess lacks is a box too. What is meant to be unseen (zero-width characters, the joiners
+  and variation selectors inside an emoji, a flag's tags, an accent no font has) still shows nothing. To read
+  Chinese text, use a font of your own that has its letters (Settings > Font, in Classic).
+- Japanese: nearly every string is translated now (922 of 987), and several that said the wrong thing are fixed
+  ("Save now" and "Select (lasso)" among them), by nebuff. The 65 still in English are 2.1's newest: most of
+  this beta's new screens, What's new, the Font sheet and the folder merge.
+- The Graph's list of links sorts faster on notebooks with many links (each row's target is read once, not at
+  every comparison), by nebuff.
+- Hardening: Grimoire no longer follows links planted in its own folders when it saves, cleans up or prunes its
+  caches, and a late sandbox reply from the separate process that reads PDFs and pictures now counts as a failure.
+- **The pen button's hold no longer clears the page by itself.** Holding the pen's button with the pen near the
+  screen cleared the page after a second, so a finger resting on the button wiped it (issues #36, #39). The pen
+  button now has no gesture until you give it one in Settings > Gestures, and a hold you recorded yourself for
+  Clear page stays. When Clear page runs from a gesture, a key or a controller button, a toast says "Page
+  cleared. Undo brings it back."; Undo does, in one step. The toolbar's broom clears as before, without a toast.
+  A `gestures.ini` that still holds the old built-in (written by 2.0.0-rc.1, or carried since) loses it.
+- **Resize a lasso selection.** The selection's box has a handle at each corner: drag one to make the ink larger
+  or smaller, the opposite corner staying where it is; the links you drew travel and scale with it, a PDF's tabs
+  stay, and Undo takes it back in one step. A drag of a selection that holds a lot of ink starts sooner (its ink
+  is drawn again once, not once for each edge of the outline) (issue #37), by nebuff.
+- **A 12-hour clock.** Settings > Display, "Display time as 12 hour": the clock in the corner of a page says
+  `Nov 14, 10:13 PM` (in Spanish `14 nov, 10:13 p. m.`); every other screen keeps the 24-hour clock. New in
+  `settings.ini`: `clock_12h`, which 2.1.0-beta.1 and older keep as a line they do not know. By nebuff.
+- **Delete pages from the Pages view's bottom row.** With pages ticked, the bottom row has a trash button that
+  deletes them, and a tap on a page already ticked unticks it (no Multi-select needed). A held page's card now
+  lists its actions as the other menus do, an icon beside each (issue #18), by nebuff.
+- **No gesture for an action.** Settings > Gestures' record card has Disable: the action keeps no gesture, a
+  built-in one included (both directions on a paired row), and its row says "no gesture" (issue #44), by nebuff.
+
+## 2.1.0-beta.1 (2026-11-08)
+
+- A cleared page, or a page given a new paper, template or photo, no longer shows its old picture (2.0.0 and
+  2.0.1). A page that keeps its drawing so that it opens at once (a dense page, or one that took a second or more
+  to draw) was drawn from that drawing again after the change, though it was made before it: a cleared page still
+  showed all its old ink (with Undo and Clear greyed out, as it had none), a new paper showed the old one, and the
+  save 2 seconds later kept that picture, so it came back at every open, in the Pages view's preview, and on the
+  Library's card when it was page 1. The page itself was always saved right (a cleared page with no strokes), and
+  PDF exports drew it right. A kept drawing now stands for a page only while nothing on it has changed since it
+  was saved; a changed page is drawn from its strokes.
+- Each page that kept its drawing is drawn once more the first time it opens after the update (on a dense page,
+  seconds, with "Loading page..."), then opens at once again: a drawing kept by 2.0.0 or 2.0.1 may hold a cleared
+  page's old picture, and nothing tells it from a true one, so none of them is used. As such a page is drawn
+  (opened, or stayed on from the Links bar), its Pages view preview is made again from it, and so is the
+  notebook's Library card when it is page 1 (once the page is left), so an old picture they kept goes too, even on
+  a page written on again since. A page not opened since keeps its old preview, and a notebook whose page 1 is not
+  opened keeps its old card, until then.
+- A dense page (512 KB or more) written from blank keeps its whole drawing, so its first revisit reads it back
+  (11 s and 25 s on the owner's stress pages before; a tenth of a second after, host time) instead of drawing
+  every stroke again: it is made when the page is left or the notebook closed, and at an idle save once the page
+  has been quiet for 30 s. Ctrl+S, the Pages view, Settings and the power press write the page and nothing more,
+  so they no longer write that 3.4 MB drawing at each press. The Pages preview is made at an idle save at most
+  every 30 s (across page turns and reopens too). Closing a notebook from another page no longer draws page 1
+  again for the Library card: the card is kept when it was drawn from page 1 as it is, and else made from page
+  1's kept drawing (a card of before 2.1.0 is drawn from its strokes, once).
+- The Links bar learning scenario waits for its incoming rows with the headless runner's new `waitfor`,
+  instead of guessing that every runner will check 120 notebooks within 9 seconds. Normal application
+  behavior is unchanged. `waitfor KEY OP VALUE` takes the keys and checks of `expect` and lets timers run as
+  `wait` does until its check holds, then reads on at once: the main loop goes round every 30 ms, as in a
+  `wait` or on the Kindle at rest, and with `GRIMOIRE_SIM_CLOCK=script` app time moves on by what it idled,
+  so it can wait on what a timer does (a toast going). It fails after 60 s of real time, and at once for an
+  unknown key, a malformed check or a key whose check starts its count again (`display.presents`,
+  `main.longest_unpumped_ms`, `pump.calls`, `keyboard.draws`, `fshape.fired`), which it leaves unread for an
+  `expect`. A `touch` contact held across it is stamped by the clock again after it, as across a `waitbg`.
+- The slow runner the scenario failed on is pinned: `GRIMOIRE_SIM_BACKLINKS_STEP_MS` (headless runner only)
+  makes each tick of the backlinks check that much longer, and the scenario runs with 60 ms, so its check
+  takes over 11 s however fast the machine is (the old 9 s wait fails every run, the `waitfor` passes). Its
+  run with every wait 400 ms late (`make scenarios-late`) does not slow the check: it covers the waits around
+  it, not the slow runner.
+- Folders that meet (the owner, 2026-11-04: it "should open a MERGE dialog, not an error"). Moving or renaming
+  a folder onto the name of one that is there no longer says "Couldn't move folder": a sheet asks "A folder
+  named "School" is already there." with Merge into it, Keep both (as "School 2") and Cancel. Merge puts
+  everything the folder holds, subfolders included, into the other in one step; a notebook whose name is
+  taken there (in any case of its letters) becomes "Name 2", then "Name 3", so its mirror PDF follows
+  without replacing another; no notebook is lost, and a write that fails leaves every file as it was. A
+  folder cannot be merged into its own child. The README and FORMAT.md no longer say "one level of folders".
+- Quick sizes (the owner, 2026-11: "quick size menu via longpressing a tool"). Hold a pen on the toolbar (a pinned
+  pen, the eraser, or the tool button while it shows a pen) for 0.6 s, with a finger or the nib: that pen becomes
+  the pen in use and a card opens beside the toolbar with its name, its width now and five sizes in
+  millimetres (the pens follow the ISO pen-width series, each step about 1.4 times the last; the mechanical
+  pencil has lead sizes), each with a stroke of the pen's own brush at the size (drawn at the view's zoom). A
+  pick keeps the pen's own thin-to-thick ratio: the size is the pen's widest, and its thinnest scales with it,
+  so a pressure range tuned in Pen feel is not lost. Tap a size, or slide the same touch onto one and lift, and the pen has it; a tap anywhere else closes
+  the card and does nothing more. The eraser's card has rings of 1, 2, 4, 8 and 12 mm and a Whole strokes / Precise
+  row. A size is a setting, not a page change: no undo step, old strokes keep their width, nothing but
+  settings.ini is written (the tool's own `size_min_mm` and `size_max_mm`, which every version reads). The
+  first time Pen feel opens from the toolbar a toast says "Hold a pen on the toolbar for its sizes." (hints
+  bit 9). Holding is never also a tap: the lift after a hold does nothing.
+- The pens' factory widths moved onto that series: pencil 0.13 to 0.35 mm, charcoal 0.27 to 0.50, ballpoint 0.31
+  to 0.50, fineliner 0.25, calligraphy pen 2.0, highlighter 5.6, eraser 2.86 to 8 mm. Only a pen still on its
+  factory widths moves, when the update first runs: a pen whose minimum or maximum width you changed keeps both
+  as they are. The mechanical pencil, marker and fountain pen are unchanged.
+- More fonts in Classic (the owner, 2026-11-04: "Custom font support/More fonts in the classic theme"). In
+  Classic the Style row in Settings has a Font chip at its right end ("Font: Terminess"); the rest of the
+  row still changes the style, and Gothic, whose look is its pixel type, has no chip. It opens the Font
+  sheet: Terminess (still the default), Atkinson Hyperlegible Next, Noto Sans and Literata, each named in
+  itself, the one in use with a check, and on top a sample of the one highlighted (its name, a sentence in
+  the language in use, digits and accents). A tap highlights a font and refreshes only the sample and the
+  two rows; Done applies it with a full refresh, as a style change does; Cancel, Back and Esc leave the
+  font as it was. Every screen's text follows, and so do the share pages in the browser from the next page
+  they load, with Live view on too (a style change made while Live view is on now reaches them the same
+  way); pages, paper labels, the clock, PDFs, pictures and the icons never do. Each font is drawn a little
+  bigger than the size asked so that its letters come out about Terminess's size (Atkinson 1.10, Noto Sans
+  1.065, Literata 1.15), and every screen fits in each in English and Spanish, upright and sideways.
+  Letters a font lacks (Greek, Cyrillic, a few of Latin Extended-A in Atkinson) come from Terminess, and
+  Japanese from DotGothic16, as before. Saved as `font=` in settings.ini (`terminess`, `atkinson`,
+  `noto-sans`, `literata`); a value this version does not have draws as Terminess and stays in the file
+  until a font is picked. The three families are Google Fonts' releases (Atkinson Hyperlegible Next 2.001,
+  Noto Sans 2.015, Literata 3.103 at its 12 pt optical size), each a static Regular and Bold cut down to
+  Latin, Latin-1, Latin Extended-A and the general punctuation: 238 KB for the six, with their OFL texts
+  in `app/licenses` and `make fonts-subset` making them again (`tools/fonts_classic.py`,
+  assets/README.md). The Kindle binary grows by about 0.26 MB (5,840,984 to 6,102,208 bytes) and the zip
+  by about 0.13 MB; package-check now fails a binary of 10.5 MB or more and a zip of 5.5 MB or more
+  (decision D23).
+- What's new's Read all lists every version's notes, newest first (the owner, 2026-11-06: "wire read all button
+  to a list of each UNIQUE release note, and allow users to easily browse the changes by version - some of them
+  are important"). A row for each: the version (the one running marked This version), its date and the notes'
+  first line. A tap on a row shows that version's notes whole (on one screen, below), with Back to the list;
+  Dismiss closes What's new from the list and from a version's notes, as from the card. Notes that are word for word
+  the same are one row naming every version that has them. On a keyboard Enter opens (the card's Read all, then
+  the notes of the version running), Esc goes back a step (a version's notes to the list, the list to the card,
+  and the card closes), and Left and Right turn the pages. Each step on the sheet refreshes the sheet's place
+  alone. The card is as before, this version's notes. The notes are a file for each version now,
+  `docs/whatsnew/VERSION.md` (2.0.0's and 2.0.0-beta.1's as they shipped; `docs/WHATSNEW.md` is gone;
+  2.0.0-beta.2 showed beta.1's notes and has no file), built in with the dates of this changelog's headings.
+  The release checks want this version's file, with notes in it, and not the release before's notes again
+  (docs/RELEASING.md, The bump commit).
+- Read all shows each version's notes whole on one screen (the owner, 2026-11-07: "The read all doesn't need
+  text that big -- either smaller text for all past messages, or fit all (which i lean toward)", and "The note
+  reading itself isn't polished enough"). Notes too long for the sheet are first set closer at the size they
+  had (44 px): the line spacing down to 1.15 and the gaps between items to 60%. Only if that is not enough does
+  the text get smaller, in half pixels, to the largest size that fits at the closest spacing, and the room that
+  leaves goes back to the spacing, up to the usual look, so the notes fill their sheet evenly. The title, the
+  version line and the buttons keep their sizes, and there are no page arrows. 2.0.0's notes, which took two
+  pages in Gothic and sideways in Classic, fit on one: at 44 px in Gothic upright and in Classic's Atkinson,
+  Noto Sans and Literata sideways, at 41.5 px in Terminess sideways, and sideways in Gothic, which has no room
+  for its large type, in its next size down. The text gets no smaller than 34 px, the size the card sets the
+  same notes in: notes too long even for that would take pages at it (none do). Bullets keep the card's
+  proportion to the text, so they are a little larger beside 44 px text than before. A word too long for a
+  line (a link) is broken across lines rather than cut short, and Japanese or Chinese breaks between
+  characters. Read all's sheets, the list's too, never end across the Library's page buttons (they reach
+  down to the screen's margin instead, so Page 1 of 1 is never cut through) nor start across its top bar's
+  buttons (such a sheet starts at the margin above them instead, as the tallest does). The What's new card
+  ends above the page buttons too: sideways it had covered the left one and the P of Page 1 of 1, and now
+  shows 2.0.0's nine bullets there, its two paragraphs left to Read all.
+- A long book from KOReader no longer flashes the whole screen while its pages are added. "Adding book pages: N
+  of M" was a toast put up again every 0.6 s, and every redraw of it counted toward the full refresh that comes
+  after 30 small ones: about one flash every 18 s. It is now a notice that stays in the same place until the book
+  is open, redrawn on its own, without a flash and without counting, when its number changes, at most once every
+  2 s. A toast that comes meanwhile shows in its place for its time, then the notice is back.
+- The Library reads each notebook once when it opens, changes folder or closes a sheet (it read every
+  notebook.ini twice: once for the cards, once for the folders). It lists exactly what it did.
+- Under the hood, the pieces 2.1's planner links, file picker, fonts and quick sizes will share, with nothing
+  else changed on the Scribe: one hold time for every touch hold (600 ms, as each was), one placement for cards
+  that open beside what was held (the long-press card places exactly as before), one order for names ("Álgebra
+  2" before "Álgebra 10", accents folded), and a read-only layer for the Kindle's storage that never follows a
+  link, stays on its own device and never reaches Grimoire's notebooks by another name.
+
+## 2.0.0 (2026-11-05)
+
+- The first stable release of Grimoire 2.0: 2.0.0-beta.2 with the fixes below, now on the stable channel too
+  (KPM 2.0.9999; a preview subscriber is offered it as well). Fixes come as 2.0.1, 2.0.2 and so on, new features
+  as 2.1 and up. Since beta.2 the release workflow publishes on its own again (its publish job had no status
+  function in its condition, so a skipped job upstream skipped it), and README's Building from source describes
+  the Rust build.
+- What's new after every update, and no Don't show this again (the owner's rule of 2026-11-05: "no don't show
+  this again, just a "Dismiss" and every update with changes by default has at least a basic what's new"). The
+  first start after an update opens the notes once, even where the box of the 2.0.0 betas was ticked; the card
+  and Read all close with Dismiss (or Back, or Esc), and the bat in the Library's top bar opens them again.
+  `whatsnew_hide` stays in settings.ini as it was, for an older Grimoire that reads the file, and this version
+  no longer looks at it. Every release now comes with its What's new: the release checks fail when
+  docs/WHATSNEW.md has not changed since the release before (docs/RELEASING.md, The bump commit).
+- The What's new card ends at the last note that fits whole above the signature, and leaves the rest to Read
+  all (the card had cut the last paragraph of 2.0.0's notes mid-sentence: "please consider donating to"). A
+  first note too long for the card on its own is cut at the end of a line.
+- Dragging a selection follows the pen however much it holds (the owner's report of 2026-11-05: "the copy paste
+  lasso function is horrifically slow on drag with anything containing colored in or multiple strokes"). The
+  drag drew its whole band again at every pen sample, the bar and the selection's dotted halo included, so a
+  selection of shading or of many strokes took about 22 ms a sample on the Scribe, while the pen reports one
+  every 2 to 3 ms, and the outline fell behind the pen. Now a pen sample only notes where the pen is, and the
+  outline is drawn at the newest place once the panel has finished the last fast refresh (about five times a
+  second at room temperature), or at once when the pen stops: it steps along with the pen and never trails
+  behind it. The bar goes as the box starts to move (one fast refresh of its place, which shows the page in
+  black-and-white dots until you lift) and comes back under the box when you lift; after that only the outline's
+  strips are refreshed, never the box's inside, and nothing of the ink is drawn while it moves, so a selection of
+  colored-in hexagons drags as lightly as three words. The box moves once the pen has gone 1 mm (a finger a
+  little more), so a tap inside the selection that wobbles a pixel no longer moves it with an undo step, and a
+  sleep in the middle of a drag cancels it. The lift is as before: the strokes move to where the pen lifted, one
+  undo step, with pencil, mechanical pencil and charcoal grain drawn afresh on the moved part, and links move
+  with them. Live view shows the drag as the Kindle does.
+- Live view keeps the toolbar in the browser while a menu is up on the Kindle (issue #16, reported by nebuff).
+  The toolbar's layer was taken away whenever the Display sheet, the Paper sheet or another of the notebook's
+  menus opened, so the browser showed the page where the Kindle still showed the toolbar beside the menu, until
+  the menu closed. Now the layer holds what the Kindle shows where the toolbar is: the toolbar beside a menu,
+  and a menu's part over it where the menu covers it, whether a setting changes in the menu or not. Settings
+  and its Display sheet were already shown as the Kindle shows them, and still are.
+
+## 2.0.0-beta.2 (2026-11-05)
+
+- A smaller download: the zip is 2.9 MB (beta.1's was 7.1 MB) and the app 5.8 MB (8.8 MB). Terminess keeps
+  Terminus's own text and only the Material Design icons Grimoire uses: Grimoire's own text looks as before,
+  and the box drawing, block elements, heart, lightning, menu sign, power symbols and heavy angle brackets
+  that Nerd Fonts had added are gone. The icons' Apache-2.0 notice ships beside the OFL text, and the share
+  pages serve the fonts' licenses at `/font/licenses.txt` (`assets/README.md`). Grimoire updates its copy in
+  KOReader's `fonts/Grimoire` at its next start.
+- KOReader's battery symbol is back in its dropdown and reading footer with the Terminess menus (the owner's
+  Scribe showed a "JS" badge in its place, 2026-11-04). The menus use Grimoire's own copy of Terminess in
+  `koreader/fonts/Grimoire` whenever it is there, before any other Terminess or Terminus in the Kindle's fonts
+  folders; a full Nerd Font, whose icons sit where KOReader's battery symbols are (U+E781 is a JavaScript
+  badge), is used only when no other font will do. `koreader/crash.log` names the font the menus use and why
+  each other was passed over. A start of Grimoire replaces an earlier Grimoire copy of the Terminess patch in
+  KOReader's `patches` (1.1.0-beta.2's, 1.2.0's or 2.0.0-beta.1's, byte for byte) with this one, and
+  grimoire.log says so; a copy someone changed is kept, and a patch that is not applied stays off.
+- Quieter toasts (the owner's review of every one): confirmations of what the screen already shows are gone,
+  and the rest are terse ("Couldn't save page name.", "Couldn't save links. Page unchanged."). A finger shape
+  names its action only when the action did something: none for Next page on the last page, Previous page on
+  page 1, Clear page on an empty page, or Undo and Redo with nothing to undo or redo. Zoom in at the most zoom,
+  Zoom out at the least and a scroll past the first or last page no longer draw the screen again.
+- The lasso's clipboard lasts one session: every start of Grimoire clears it, and a paste no longer logs a
+  false "read-only page" line.
 - Add Japanese: every screen, the share pages and the Effects studio, with a DotGothic16 pixel fallback for kana and kanji (subset to the kana and the common kanji, `assets/README.md`). `po/ja.po`, `po/ja.mo` and `po/ja-glossary.md`; the KOReader plugin's own words follow KOReader's Japanese setting.
 - A Japanese keyboard, as a phone has it: with Grimoire in Japanese the keyboard's accents key is
   あ, and it opens a flick kana pad, twelve keys in three columns (あ か さ / た な は / ま や ら /
@@ -11,6 +379,187 @@
   so dakuten, handakuten and the small kana are one key. カ types the pad in katakana (ノート,
   メモ) and あ back in hiragana; 、 holds 、。？！・ on its flicks. Every keyboard has it, so
   notebook, folder, page and link names all take kana. Every other language keeps áé there.
+- Caps on: the keyboard's shift key has three states, a tap each (the owner's "next toggle shift in typing
+  toggles off shift for next char then shift on which makes longer caps strings possible"). One tap gives the
+  next letter its capital, as before; a second tap is caps on, every letter a capital through digits, spaces,
+  delete and the symbols and accents pages, for names such as NASA or a run of initials; a third tap turns it
+  off. Shift for one letter shows the pressed shift key, as before; caps on shows the same key with a bar under
+  its label. Every keyboard opens with shift off, so caps on ends when the keyboard closes. Every keyboard has
+  it: names, Find, link names and the rest.
+- Delete held down deletes one character after another (the owner's "hold del long enough in keyboards to
+  quick delete"), on every keyboard: names (notebooks, folders, pages, links), Find, the page number pads and the
+  count pad for new pages. A tap still deletes one, at the touch-down; kept on the key, it deletes the next after
+  0.4 s ("low ish delay but not too low"), then one every 65 ms, about 15 a second ("repeat rate high so it feels
+  snappy", "not too high"), the same rate all the way, until the finger or the pen lifts or slides off the key.
+  It never runs ahead of the screen: while the panel is still showing the last delete, the next waits and then
+  takes the ones that came due together (three at most), so nothing is deleted after the lift that was not
+  already on its way to the screen. It stops with the text gone, and on the count pad the touch-down clears the
+  opening 1 as before, with nothing to repeat. The link card's Rename keyboard now also gets the gray clean-up
+  refresh the other keyboards get once typing pauses. A hardware keyboard's held Backspace still deletes one digit
+  on a count pad.
+- One keyboard scheme for a keyboard paired with the Kindle (the owner's scheme; docs/SHORTCUTS.md). A key
+  may do one thing in each place (the Library, a notebook page, the Pages view, the Graph, Pen feel): in the
+  Library Ctrl+N a new notebook, Ctrl+F a new folder, S Share, O Settings, Left and Right its screens; on a page
+  0 and E the eraser, Ctrl+L Add a link, R the page's name, Space what two fingers up do (the Links bar), - and
+  = (+) zoom, Ctrl+S saves now everywhere. Esc is one action, `back`, eating one layer a press (a field's
+  Cancel, a dialog, a selection, a menu one level at a time, a link being placed, then back to the Library, up
+  from a folder), and at the Library's top it asks "Exit Grimoire?" (Enter the highlighted answer, Yes at
+  first; Left and Right move it; Esc No). Up and Down do nothing but in the Graph; the count pad no longer
+  takes them. PageUp and PageDown turn pages (they stepped tools; [ and ] do that), and an Apple keyboard's
+  Cmd works as Ctrl. A shortcuts.ini (or live-keys.ini) that is byte for byte a starter map an earlier
+  version wrote gets the new keys at the next start (grimoire.log says so); one someone edited is kept and means
+  what it meant. Older versions refuse the new action names one line each.
+- Settings > Shortcuts and Settings > Pair, in place of the Controller sheet (the owner's "\"Shortcuts\" is
+  better now ... a button occupying the previous spot called \"Pair\""). Settings' top rows are Display, Pen
+  sensitivity, Shortcuts and Calibrate pen and touch, in that order, and the bottom row's Pair (where
+  Controller was) holds Bluetooth controller, Pair a controller... and what is connected. Shortcuts holds
+  Enable shortcuts, Buttons... and Reload shortcuts.ini, and each keyboard's or controller's own shortcuts:
+  its Device row goes through those connected and those saved, and **Own shortcuts for this device** gives
+  the one shown a profile, `grimoire/shortcuts/<device>.ini` (a copy of shortcuts.ini to start from), used
+  whenever it is connected; Buttons... then learns its buttons beside it, and takes a press only from a
+  controller that uses the buttons it shows (a toast names another; a keyboard's profile leaves it on the
+  default's, controller.ini). Turned off, the device uses the
+  default again and the profile is kept for when it is turned on. A device is its name and vendor:product
+  numbers (two of the same model share a profile). A device with none, and anyone who never makes one, uses
+  shortcuts.ini and controller.ini as before, and they are never rewritten by this; gestures, the pen's
+  button and finger shapes are not per device (docs/SHORTCUTS.md, Device profiles). The starter
+  shortcuts.ini names Settings > Shortcuts; an unedited one from an earlier beta.2 build becomes it at the
+  next start, as earlier starters do.
+- Pen feel on a keyboard: 1 to 9, 0 and E pick that pen's tab.
+- The Pages view on a keyboard: Ctrl+A ticks every page (the new `select-all` action), Ctrl+N opens the number
+  pad for new pages, Esc closes a held page's card alone (Pages staying open, also with a shortcuts file that
+  keeps Esc as `close-menu`), and Esc stops a drag with nothing moved.
+- The number pad for new pages (New page held in Pages, the toolbar's + held, Ctrl+N) starts at 1: Add 1 page
+  (or Enter) at once adds one page, the first digit typed replaces the 1, and - and + count from it. A keyboard's
+  Up and Down keys no longer change the count (- and + do).
+- From the owner's Scribe test of the beta.2 builds: a drag in Pages starts after a shorter hold, 300 ms, half
+  the 600 ms a held page's card takes, so the page is picked up and moved with no card drawn and taken down
+  first (two refreshes fewer). The page is picked up as the finger leaves it: a slow tap that rolls a little on
+  the page is still a tap (it ticks the page, and never moves ticked pages), a page held still opens its card as
+  before, and a quick swipe from a page still turns the screen. A drag lifted back in its own place takes its
+  black bar off with one small refresh instead of drawing Pages again. The number pad for new pages shows its opening 1 as plain black text at the size of its
+  title, with no caret after it (it was a large white 1 in a black box, which read as a 0 on the Scribe).
+- Go to page... in Pages (and the `go-to-page` key there) opens the page number or name sheet over Pages,
+  which stays behind it, instead of closing Pages first: Cancel, a tap outside it or the key again give Pages
+  back as it was, on the same screen with the same pages ticked (with the page previews made while it was open,
+  on every page shown), and a row picked opens that page.
+- The Graph's view button reads **View: All** or **View: Adjacent** (it said "Around", and "Fit: ..." after a
+  pan), on the Kindle too: a tap always switches to the other view, fitted, and the selected page's card says
+  **Adjacent** where it said "Around it" (the owner's "View: All and View: Adjacent ... so the wording isn't
+  jumbled"). graph.ini still writes `mode=around`.
+- The Graph's keys, on a keyboard paired with the Kindle: the arrows pan it (a sixth of the view a press; the
+  only place Up and Down do anything), - and + (and Ctrl with them) zoom by 1.25 about its centre, Ctrl+0 fits
+  the view again, V switches View: All and View: Adjacent, Ctrl+A selects every page drawn (each drawn
+  selected), Enter opens the selected page, and Esc clears the selection, then closes it. New actions
+  `graph-view`, `pan-left`, `pan-right`, `pan-up`, `pan-down` (docs/SHORTCUTS.md); a shortcuts.ini that binds
+  none of them gets the arrows and V for the Graph in memory, its own lines unchanged.
+
+- Live view shows Grimoire's toasts (the owner, testing on the Scribe with a browser watching: "Enable
+  toasts on the live view display. they don't show up now."). Each one comes as the Kindle shows it, in
+  the same place with the same look, over the page, the toolbar and the clock corner; it moves when it
+  moves on the Kindle (a sheet or the keyboard opening under it, the Kindle turned) and goes when it goes
+  there (its time up, a dismiss, another toast in its place, the Kindle asleep). It always shows, with no
+  setting, and the toolbar and clock switches leave it alone: it comes with transparency, so with the
+  toolbar or the clock switched off its round ends show the page there, never bits of what is hidden.
+  Nothing is sent while the pairing card is up or the Kindle sleeps, as before, and a toast from then
+  never shows afterwards unless the Kindle still shows it. The toast is a third layer of the stream, kept
+  on the Kindle in a buffer of about 1.1 MB at most (`live.rs`); a browser page from before it shows no
+  toast and works as before.
+- Live view's picture in picture no longer costs more the larger its window. In a large PiP window the
+  pen showed 15 to 23 ms later than on the page (the Latency readout's pen age at paint): every frame
+  redrew the whole picture, up to the Kindle's 4.6 million pixels, the capture copied them all, and with
+  the tab shown it did so about 120 times a second against the page's 60. Now a frame draws only what
+  changed, into a picture kept in memory (no copy back from the GPU), and animation frames pace it as
+  they pace the page (the background timer stands in only when they stop). The picture is the same,
+  pixel for pixel; in headless Firefox Nightly PiP's pen age is within 2 ms of the page's at every size.
+- Live view's picture in picture keeps up in Firefox Nightly. With the Live view tab hidden behind
+  the floating picture (or behind another tab), Nightly 161 runs a hidden tab's timers once a second,
+  so the floating video changed once a second and the ink came up to a second late. Its frames are
+  now drawn as the Kindle's data arrives: in headless Nightly a batch of ink is handed to the video 1 ms
+  after it arrives at the median and 2 ms at p90 (it was 0.45 s and 0.9 s), and the video changes 59
+  times a second while you write instead of once. Visible tabs, other browsers and the pop-out work
+  as before (Chrome's hidden PiP gets the same quicker frames).
+- New page in the Pages view adds pages in a batch: tap + for one page at once; hold it (or, with a
+  keyboard attached, tap it with Shift held) for a number pad that asks how many, with - and + under the
+  digits and an "Add N pages" button. The pages are added in one go where New page puts one, and the bottom
+  row's Undo takes the batch back while those pages are still blank. Taps made while a large batch is written
+  are ignored. A big batch (from 51 pages, about 2 seconds or more on a Kindle) says "Adding N pages..." until
+  its pages are added, and so does its Redo; a smaller one adds them with nothing said. A tap on + no longer opens
+  the new page: Pages stays open, the page's tile says "(new)", and Undo takes it back as a batch of one. New
+  pages take the paper of the page they go after: the last page ticked, else the open page.
+- The toolbar's + (its next-page arrow on the last page) held, or tapped with a keyboard's modifier key held, opens the
+  same number pad over the page: the pages go after the page you are on, on its paper, which stays open, and the
+  Undo in Pages takes them back. A tap on it still adds one
+  page and opens it, as swiping past the last page does. The new `new-pages` action opens the pad from a key
+  or a controller button.
+- Seyes rule paper is true to size: it is drawn at the panel's own density (302.9 dpi on the Scribe 2,
+  from the display driver's size) instead of the round 300, so a line pitch measures 2 mm and a square
+  8 mm, as in a French school notebook. Pages already on Seyes get the corrected lines too (up to about
+  2 mm lower at the bottom of the page). Its lines are darker and heavier, so they read sharp on the Scribe's
+  screen: the faint lines and the 8 mm verticals 2 px (the ruled papers' weight), the strong lines and the
+  margin 3 px, each in one of the panel's 16 grays so none shows as its neighbour.
+- Lasso select, copy, cut, paste and move. Select (in the tool picker, or the `select` action on a key,
+  controller button, gesture or pen button) turns the pen into a dashed lasso; what it goes around is
+  selected, with the erasing that belongs to it and its links. A bar under it has Copy, Cut, Delete, Paste
+  and Done; drag inside its box to move it (only the outline moves until you lift, then it is one undo
+  step). The clipboard is a file: page turns and other notebooks keep it, and each start of Grimoire clears it.
+  While Select is on, the toolbar's tool button shows the lasso. Hold the pen still on empty page to paste
+  there. There is no Select button on the panel: hold a finger still on the page (off a link) until a small
+  dashed ring shows, about 0.6 s, then draw around ink without lifting to select it, with the same bar; or
+  lift it without moving to paste the clipboard there. A finger held on a link still opens its card, and
+  swipes, taps and links work as before. A palm, or a thumb resting on the page while the pen is in range,
+  never selects or pastes: the pen coming drops the lasso. Bound to a pen button's hold or drag, `select` works while the button is held:
+  draw the lasso with the button down; let go with nothing selected and the pen writes again, or keep the
+  selection for the bar until you tap outside it. A paste on the page it came from lands 3 mm off only
+  while the originals are still there, so Cut and Paste puts it back where it was.
+- The lasso shows what it selects while you draw it, not only when you lift: ink the lasso would take if
+  you lifted now gets a dotted halo, which comes and goes as the lasso goes round (pen or finger
+  alike), and what you lift with is exactly what the halo showed. The halo stays on the selection after
+  the lift. It refreshes a few small areas at most about eight times a second, and the lift redraws them
+  all in grays once; on the 1,090-stroke stress page it costs well under a millisecond a step on a Mac.
+- Exact-area lasso ("pixel lassoing"): the bar has a mode button, **Whole strokes** (the default) or
+  **Exact area**. In exact area the lasso cuts the strokes it crosses along its line and takes only the
+  ink inside it: the halo covers just the inside part while you draw, with a short tick where each cut
+  will be, and the selection is the inside parts. A short mark (an i-dot, an accent, under 1.5 mm) is
+  never cut: it is taken whole when its middle is inside, as its halo shows. Nothing changes on the page until you move, cut or
+  delete; then the parts left behind stay exactly as they were drawn (the cut ends are the pen's own
+  round ends), and one undo puts the strokes back whole. Copy leaves the page untouched. Tapping the
+  mode button with a selection up judges the same lasso again in the other mode. With a keyboard paired
+  with the Kindle: hold Shift (or Alt) as you start a lasso to use the other mode for it, or bind
+  `select-exact` to a key. The mode lasts until Grimoire restarts. Pencil, mechanical pencil and charcoal grain is drawn
+  afresh on the moved part (it differs slightly in single pixels); a calligraphy stroke whose tilt
+  widens or lightens it, and ink carrying a link of 2.0.0-beta.5, are taken whole as before. The pieces
+  are ordinary strokes every older version reads.
+- Erasing travels with the ink it erased: a word partly erased with the precise eraser or white ink moves
+  and pastes with the same gaps, and never lightens the ink it lands on (scoped erase strokes; the eraser
+  itself works exactly as before). White ink lassoed alone selects nothing: it moves with the ink it covers.
+- A linked item copies with its link: the same target, area and outline, a new link where it is pasted;
+  in another notebook its target points back to the first notebook's page. A move takes the link along.
+- Links between notebooks, polished. A page's Links bar lists **Linked from**: the pages of this notebook and of other notebooks whose links come to it (tap one to look at it, or to follow it into its notebook). A held page's card in Pages says how many pages link to it. What other notebooks link to is kept in a small cache, `backlinks.ini`, rebuilt a little at a time while nothing is touched, never holding up the page; deleting it loses nothing.
+- When the Graph shows one notebook alone (a library with too many linked pages to draw at once), other notebooks' pages that it links to, or that link here, are boxes at its edge, grouped by notebook, with an arrow for each way the links go; a tap opens that page. No dot moves for them.
+- The Graph opens on **All notebooks**: every linked page of every notebook, links within and across notebooks its lines, each notebook's pages gathered in an island with the notebook's name over it, as Obsidian's global graph and org-roam-ui draw a library. A tap on another notebook's page shows its notebook in the card; Open goes there, and Back comes back. There is no notebook picker: the Graph is always every notebook's (the owner's ruling; View: All / Around is as before). What every notebook says is kept in a small cache, `graph-index.ini`, filled a little at a time while nothing is touched (the panel says "Reading notebooks" the first time), and the library's layout in `graph-all.ini`; a new notebook joins beside the others without moving them. Deleting either loses nothing. Pages with no link are never drawn there (the owner's ruling); the panel counts them.
+- The Graph is a place of its own: two fingers down over the Library (or the key bound to `index-map`, for a keyboard) open the Graph of all notebooks with no notebook open. It has no List or Pages tab; tapping a page twice opens its notebook there, Back (or the Library button) from that notebook comes back to the Graph as it was left, and Back from the Graph returns to the Library. A notebook's or a folder's menu in the Library has **Leave out of the Graph** (and **Show in the Graph**): a notebook left out has no page in the Graph of all notebooks, links to it are not drawn, and a folder's setting covers everything inside it, folders and notebooks moved in later included. Kept in `notebook.ini` (`graph=0`) and `graph-omit.ini`; older versions keep the first and ignore the second.
+- The Graph from the Library, the reviewer's fixes (2.0.0-beta.2 graph lane): two fingers spreading over it zoom it as over the editor's Graph (a spread that was not a clean swipe did nothing); a notebook that does not open says so instead of the Graph coming back silently; a library with too many linked pages for every notebook opens the notebooks' browser to pick one instead of nothing; Leave out of the Graph (or a move, or the trash) right after Grimoire starts shows in the first Graph opened; a left-out folder that vanished with its last notebook does not leave the next folder of that name out; and the Links bar's chip reads "Volver al grafo" in Spanish.
+- A link to a page or notebook that was deleted shows as such: a dashed chip that says Page gone or Notebook gone, a dashed mark on its page in the Graph (which counts them), and a tap on it (on the page, the bar or the Graph's List) opens the link's card to change where it goes or delete it, instead of a toast and nothing.
+- Back out of another notebook returns to the page the link was followed from at the zoom and place it had, and that notebook's own Back goes on where it left off.
+- Pages: move pages. Hold a page (or tick pages and use the bottom row) and pick Move to...: type the page they go before, or one past the last page for the end. Ticked pages stay together in their order, the open page stays open, and links, names and book pages follow their pages.
+- Pages: a move can be undone. Right after Move to... (or a drag), with nothing ticked, the bottom row's Undo (in Move to...'s place) puts the pages back in the order they had. It stays until the notebook's pages change again (a page added, deleted, copied or moved; a rename keeps it) or the notebook closes. The Undo on the page still undoes only that page's writing.
+- Pages: Redo, and the undo and redo keys. Right after the bottom row's Undo of a move or a batch of new pages, Redo (beside it, in Copy to notebook...'s place, nothing ticked) does it again: the pages in the exact order the move left, or the same blank pages back at the same places. One step each, until the notebook's pages change otherwise. While Pages is open, the `undo` and `redo` actions (keys, controller buttons, gestures) are Pages' Undo and Redo; on the page they stay the page's own. The two histories never mix.
+- Pages: drag to reorder. Hold a page a moment (300 ms, before its card would open), then move off it without lifting: a black bar shows the gap the page (or the ticked pages, when it is one of them) goes into, and nothing else moves on the screen; lift to drop it there. Hold it over the top bar or the bottom row to turn to the previous or next screen. Lifting it back in its own place, or over the bars, moves nothing. Held still (600 ms), it opens its card, and a move from there drags it too.
+- Pages: Copy to notebook... copies a page, or the ticked pages, into another notebook: pick it among your folders, then a page there (the copies go before it) or At the end. The copies keep their ink byte for byte, their picture paper (templates, photos, book pages), their names and their links: a link between two pages copied together joins the two copies, a link to a page left behind leads back into the first notebook, and links to the Index are left out. Pages from a Scribe of the other size are scaled as they open there.
+- Pages: each preview shows as soon as it is ready, the light pages first and a dense page last, with an hourglass on the pages still to come (also in Copy to notebook... and Link to...); a screen turned to while previews are made asks for its own at once (made beside the others when the Kindle has the cores for a second background process, else right after them). Previews and dense pages reuse a kept drawing instead of drawing the page again (making previews keeps one only of a dense page, a page file of 512 KB or more, so ordinary pages save nothing extra), and opening a page of 256 KB or more that must be drawn says Loading page... until it shows.
+- Bluetooth controllers: the helper in `grimoire/bluetooth` is stopped as Grimoire leaves even when it was started again outside Grimoire or Grimoire lost its record of it (before, such a helper kept running, holding the radio, while the Kindle's own Bluetooth started again beside it). Its mouse cursor overlay goes with it when the helper has to be killed, and turning Bluetooth controller on takes such a helper back instead of calling it someone else's. A helper someone else started elsewhere is still never stopped, and one unpacked in another folder is now recognised while it starts, so Grimoire does not start a second one.
+- Fewer leftovers on the screen after moving the toolbar or erasing (issue #11, reported by nebuff). Moving the toolbar ends with one quick flash of just the strip it passed through, which wipes the faint copies of it that the fast refresh used while dragging leaves behind (and a drag that went round no longer leaves the page between its ends speckled). Erasing (either eraser) and moving a selection keep count of how much they wiped with the fast refresh; small erases never flash, but once more than a quarter of the screen has been wiped, the screen flashes once where the erasing was, after the pen leaves, instead of waiting for a page turn or a trip to the Library. A selection dragged round and back also no longer leaves the page it crossed speckled.
+- The release checks no longer fail on GitHub's macOS runner: two scenarios timed a press and a finger shape by the real time between their lines, which a loaded machine stretches. The test runner now stamps a scripted touch by the script's own clock, and `make check` runs those scenarios again with every wait 400 ms late.
+- Tests and CI only: the scenarios run several at once (tests/scenario_runner.py; `SCEN_JOBS`, longest first by
+  tests/scenario-times.txt), and so do the language runs: the scripted checks take about two minutes on the
+  maintainer's Mac instead of half an hour. The handwriting replay is four scenarios that run side by side, the
+  English Gothic run of the all-screens tour is made once instead of twice, and 23 scenarios that count
+  refreshes hold the clock corner still (a minute turning over mid-count failed them). Pull requests' CI is
+  split into jobs that run at once (a build, the unit tests' two halves, six scenario shards, the languages, the
+  host checks, the package) behind one `gate` check, skips the two clean release builds, and runs only a short
+  check for a documentation-only change.
+- Fix Live view's picture in picture in Firefox 159 and later (and Nightly): Firefox now has the video picture-in-picture API, so Live view took the path for Chromium and Safari, whose frame requests Firefox does not have (it asks the capture stream, not its track). The floated picture stayed on its first frame and a refusal did nothing. Frames are now asked of whichever has them, and if Firefox will not float the video, it goes in the page for Firefox's own Picture-in-Picture button as before.
 
 ## 2.0.0-beta.1 (2026-11-01)
 

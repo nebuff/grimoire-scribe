@@ -60,7 +60,9 @@ expect screen is library
 tap 1535 95
 wait 200
 expect library.sheet is settings
-tap 930 446
+tap library settings.cat.3
+wait 100
+tap library pen-feel
 wait 400
 expect screen is penset
 pen down 700 600 0.6
@@ -86,7 +88,9 @@ expect screen is library
 # Calibration: the check box's stroke is live ink, without the pen mode (plain DU, as before)
 tap 1535 95
 wait 200
-tap 930 610
+tap library settings.cat.3
+wait 100
+tap library calibrate
 wait 300
 expect screen is calib
 pentap 223 298
@@ -101,13 +105,13 @@ tap 1637 2182
 tap 223 2182
 tap 930 1240
 wait 200
-pen down 300 1300 0.6
-pen move 600 1320 0.6
-pen move 900 1340 0.6
+pen down 300 1000 0.6
+pen move 600 1020 0.6
+pen move 900 1040 0.6
 expect display.ink is 1
 expect display.pen_mode is 0
 expect display.last_fast is ink
-pen up 900 1340
+pen up 900 1040
 wait 100
 expect display.ink is 0
 expect screen is calib

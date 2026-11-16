@@ -8,8 +8,11 @@
 wait 200
 tap 1535 95
 wait 100
-expect library.ui_at.890.1930 is gestures
-pentap 890 1930
+expect library.ui_at.329.830 is settings.cat.4
+pentap 329 830
+wait 100
+expect library.ui_at.1233.639 is gestures
+pentap 1233 639
 wait 100
 shot p6-gestures
 rotate 1
@@ -17,8 +20,8 @@ wait 100
 shot p6-gestures-sideways
 rotate 0
 wait 100
-expect library.ui_at.930.749 is gestures.group.editing
-pentap 930 749
+expect library.ui_at.930.608 is gestures.group.editing
+pentap 930 608
 wait 100
 shot p6-editing
 rotate 1
@@ -26,8 +29,8 @@ wait 100
 shot p6-editing-sideways
 rotate 0
 wait 100
-expect library.ui_at.930.920 is gestures.row.4
-tap 930 920
+expect library.ui_at.930.758 is gestures.row.4
+tap 930 758
 wait 100
 expect library.gestures.learning is hold-eraser
 expect library.record is wait
@@ -51,8 +54,8 @@ wait 100
 expect library.ui_at.1360.1650 is record.cancel
 pentap 1360 1650
 wait 100
-expect library.ui_at.930.440 is gestures.row.1
-tap 930 440
+expect library.ui_at.930.296 is gestures.row.1
+tap 930 296
 wait 100
 expect library.gestures.learning is undo
 expect library.record is wait
@@ -69,11 +72,11 @@ wait 100
 expect library.ui_at.1360.1650 is record.cancel
 pentap 1360 1650
 wait 100
-expect library.ui_at.930.2030 is done
-pentap 930 2030
+expect library.ui_at.125.95 is done
+pentap 125 95
 wait 100
-expect library.ui_at.930.1229 is gestures.group.index
-pentap 930 1229
+expect library.ui_at.930.1076 is gestures.group.index
+pentap 930 1076
 wait 100
 shot p6-index
 rotate 1
@@ -81,8 +84,8 @@ wait 100
 shot p6-index-sideways
 rotate 0
 wait 100
-expect library.ui_at.930.520 is gestures.row.1
-tap 930 520
+expect library.ui_at.930.296 is gestures.row.1
+tap 930 296
 wait 100
 expect library.gestures.learning is links
 expect library.record is wait
@@ -99,11 +102,11 @@ wait 100
 expect library.ui_at.1360.1650 is record.cancel
 pentap 1360 1650
 wait 100
-expect library.ui_at.930.1690 is done
-pentap 930 1690
+expect library.ui_at.125.95 is done
+pentap 125 95
 wait 100
-expect library.ui_at.930.1069 is gestures.group.pages
-pentap 930 1069
+expect library.ui_at.930.920 is gestures.group.pages
+pentap 930 920
 wait 100
 shot p6-pages
 rotate 1
@@ -111,8 +114,8 @@ wait 100
 shot p6-pages-sideways
 rotate 0
 wait 100
-expect library.ui_at.930.1800 is gestures.row.10
-tap 930 1800
+expect library.ui_at.930.1682 is gestures.row.10
+tap 930 1682
 wait 100
 expect library.gestures.learning is pan
 expect library.record is wait
@@ -126,8 +129,8 @@ wait 100
 shot p6-pan-click-refusal-sideways
 rotate 0
 wait 100
-expect library.ui_at.930.1650 is record.retry
-pentap 930 1650
+expect library.ui_at.763.1650 is record.retry
+pentap 763 1650
 wait 100
 side on
 wait 1300
@@ -140,8 +143,8 @@ wait 100
 shot p6-pan-hold-refusal-sideways
 rotate 0
 wait 100
-expect library.ui_at.930.1650 is record.retry
-pentap 930 1650
+expect library.ui_at.763.1650 is record.retry
+pentap 763 1650
 wait 100
 side on
 pen down 800 1100 0.6
@@ -160,8 +163,8 @@ wait 100
 expect library.ui_at.1360.1650 is record.cancel
 pentap 1360 1650
 wait 100
-expect library.ui_at.930.1960 is gestures.row.11
-tap 930 1960
+expect library.ui_at.930.1836 is gestures.row.11
+tap 930 1836
 wait 100
 expect library.gestures.learning is zoom
 expect library.record is wait
@@ -175,8 +178,8 @@ wait 100
 shot p6-zoom-click-refusal-sideways
 rotate 0
 wait 100
-expect library.ui_at.930.1650 is record.retry
-pentap 930 1650
+expect library.ui_at.763.1650 is record.retry
+pentap 763 1650
 wait 100
 side on
 wait 1300
@@ -189,8 +192,8 @@ wait 100
 shot p6-zoom-hold-refusal-sideways
 rotate 0
 wait 100
-expect library.ui_at.930.1650 is record.retry
-pentap 930 1650
+expect library.ui_at.763.1650 is record.retry
+pentap 763 1650
 wait 100
 side on
 pen down 800 1100 0.6

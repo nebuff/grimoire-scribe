@@ -1,6 +1,7 @@
 //! httpd.h: tiny single-threaded HTTP/1.0 share server, polled from the main loop.
 //! Serves a phone/desktop-friendly HTML index of folders + notebooks with thumbnails and
-//! download links, in the Kindle's style (Gothic or Classic fonts). Routes (ids are notebook
+//! download links, in the Kindle's style (Gothic's fonts, or Classic's font: Terminess or the one picked
+//! in Settings > Font). Routes (ids are notebook
 //! ids, n is 1-based):
 //!   GET /                         HTML index (folders, notebooks, page links)
 //!   GET /nb/<id>                  HTML notebook page with per-page PNG links
@@ -10,7 +11,9 @@
 //!   GET /nb/<id>/<n>.png          one page PNG (?layer=ink or ?layer=paper: that layer alone;
 //!                                 ?f=2..8: shrunk; headers X-Page-Size, X-Paper, X-Ink-Box)
 //!   GET /nb/<id>/thumb.png        thumbnail
-//!   GET /font/<name>.ttf          the page fonts (the binary's own copies)
+//!   GET /font/<name>.ttf          the page fonts (the binary's own copies: Gothic's, Terminess and the
+//!                                 Classic fonts, font.rs's FONT_FAMILIES)
+//!   GET /font/licenses.txt        the fonts' licenses (assets.rs's FONT_LICENSES)
 //!   GET /folder/<name>.zip        every notebook in a folder
 //!   GET /all.zip                  everything
 //!   GET /api/list.json            machine-readable listing (used by tools/grimoire-pull)
@@ -224,6 +227,8 @@ struct State {
     listen: i32,
     dpi: f32,
     gothic: bool,
+    /// Classic's font when the server started (FONT_FAMILIES), as gothic is the style then
+    font: usize,
     served: i32,
     /// HTTPD_SHARE, HTTPD_LIVE: who keeps the server up
     owners: u32,
@@ -250,6 +255,7 @@ impl Default for State {
             listen: -1,
             dpi: 300.0,
             gothic: true,
+            font: 0,
             served: 0,
             owners: 0,
             live_pairings: 0,
@@ -276,6 +282,9 @@ fn dpi() -> f32 {
 }
 fn gothic() -> bool {
     with(|s| s.gothic)
+}
+fn family() -> &'static FontFamily {
+    &FONT_FAMILIES[with(|s| s.font).min(FONT_FAMILIES.len() - 1)]
 }
 fn owners() -> u32 {
     with(|s| s.owners)
@@ -324,6 +333,7 @@ fn httpd_start(port: i32, dpi: f32, gothic: bool) -> i32 {
     with(|s| {
         s.dpi = dpi;
         s.gothic = gothic;
+        s.font = font_family();
     });
     // SAFETY: socket takes no pointers.
     let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
@@ -368,13 +378,25 @@ fn httpd_start(port: i32, dpi: f32, gothic: bool) -> i32 {
 }
 
 /// Keeps the server up for owner (HTTPD_SHARE or HTTPD_LIVE), starting it on 0.0.0.0:port if no
-/// owner had it: 0, or -1 when it could not start. gothic: the pages use the Gothic style's fonts.
+/// owner had it: 0, or -1 when it could not start. gothic: the pages use the Gothic style's fonts (else
+/// Classic's: the font in use as it starts, font_family).
 pub fn httpd_acquire(owner: u32, port: i32, dpi: f32, gothic: bool) -> i32 {
     if with(|s| s.listen) < 0 && httpd_start(port, dpi, gothic) != 0 {
         return -1;
     }
     with(|s| s.owners |= owner);
     0
+}
+
+/// The style changed while the server may be up (Live view keeps it up across screens): the pages
+/// take gothic (as httpd_acquire's) and Classic's font in use now (font_family). The pages are made
+/// for each request, so the next one is in the new style; a page already open keeps its own until
+/// it loads again.
+pub fn httpd_restyle(gothic: bool) {
+    with(|s| {
+        s.gothic = gothic;
+        s.font = font_family();
+    });
 }
 
 /// owner is done with it: the server stops once no owner is left (its downloads and connections
@@ -402,8 +424,9 @@ pub fn httpd_live_keys_load(path: &str) {
 pub fn httpd_live_key_pop() -> Option<LiveKey> {
     with(|s| s.live_keys.pop(now_ms()))
 }
-pub fn httpd_live_key_action(key: &LiveKey) -> i32 {
-    with(|s| shortcuts_lookup(&s.live_keys.map, false, key.code, key.mods))
+/// The action of a key from Live view's browser, pressed in place (app_place).
+pub fn httpd_live_key_action(key: &LiveKey, place: u8) -> i32 {
+    with(|s| shortcuts_lookup_at(&s.live_keys.map, false, key.code, key.mods, place))
 }
 pub fn httpd_live_key_held(key: &LiveKey) -> bool {
     live_on() && owners() & HTTPD_LIVE != 0 && with(|s| s.live_keys.is_held(key, now_ms()))
@@ -655,16 +678,11 @@ fn download_pages(done: i32, total: i32, d: Option<usize>) {
     shared(d).pages.store(done as u32, SeqCst);
 }
 
-// The answer to g_cur. cache: a Cache-Control value, None for no-store (everything but the
-// fonts); extra: more header lines, each ending in \r\n, or None.
-fn respond_bytes(
-    code: i32,
-    ctype: &str,
-    data: &[u8],
-    download_name: Option<&[u8]>,
-    cache: Option<&str>,
-    extra: Option<&str>,
-) {
+// The head of an answer: the status line and headers, up to and with the blank line. len: the body's
+// length for Content-Length (None: no such line, the connection's close ends the body, as in HTTP/1.0).
+// cache: a Cache-Control value, None for no-store (everything but the fonts); extra: more header
+// lines, each ending in \r\n, or None.
+fn response_head(code: i32, ctype: &str, len: Option<usize>, download_name: Option<&[u8]>, cache: Option<&str>, extra: Option<&str>) -> Buf {
     let reason = if code == 200 {
         "OK"
     } else if code == 404 {
@@ -690,17 +708,11 @@ fn respond_bytes(
     };
     // (the C appends to g_cur->out, empty at this point: the connection answers once)
     let mut o = with(|s| std::mem::take(&mut s.cl[s.cur].out));
-    buf_printf!(
-        &mut o,
-        "HTTP/1.0 %d %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\nConnection: close\r\n\
-         Cache-Control: %s\r\n%s",
-        code,
-        reason,
-        ctype,
-        data.len(),
-        cache.unwrap_or("no-store"),
-        extra.unwrap_or("")
-    );
+    buf_printf!(&mut o, "HTTP/1.0 %d %s\r\nContent-Type: %s\r\n", code, reason, ctype);
+    if let Some(len) = len {
+        buf_printf!(&mut o, "Content-Length: %zu\r\n", len);
+    }
+    buf_printf!(&mut o, "Connection: close\r\nCache-Control: %s\r\n%s", cache.unwrap_or("no-store"), extra.unwrap_or(""));
     if let Some(name) = download_name {
         let mut ascii: Vec<u8> = Vec::new(); // char ascii[STORE_NAME_LEN + 8]
         for &p in cbytes(name) {
@@ -716,6 +728,19 @@ fn respond_bytes(
         buf_printf!(&mut o, "\r\n");
     }
     buf_printf!(&mut o, "\r\n");
+    o
+}
+
+// The answer to g_cur.
+fn respond_bytes(
+    code: i32,
+    ctype: &str,
+    data: &[u8],
+    download_name: Option<&[u8]>,
+    cache: Option<&str>,
+    extra: Option<&str>,
+) {
+    let mut o = response_head(code, ctype, Some(data.len()), download_name, cache, extra);
     if with(|s| s.child_response) {
         // The fork owns a blocking socket. Send directly from the export buffer instead
         // of copying the whole PDF/ZIP into a second, equally large response buffer.
@@ -747,6 +772,124 @@ fn respond_bytes(
 
 fn respond(code: i32, ctype: &str, body: &Buf, download_name: Option<&[u8]>) {
     respond_bytes(code, ctype, &body.data, download_name, None, None);
+}
+
+/// The connection of a download as a Sink, in the child that owns it: what the export makes goes out as
+/// it comes, the byte count (sent) kept for the progress the parent answers.
+struct SocketSink {
+    d: Option<usize>,
+    total: usize,
+}
+impl Sink for SocketSink {
+    fn put(&mut self, b: &[u8]) -> bool {
+        if !child_send(b, None) {
+            return false;
+        }
+        self.total += b.len();
+        if let Some(d) = self.d {
+            shared(d).sent.store(self.total as u32, SeqCst);
+        }
+        true
+    }
+}
+
+/// A file only this child holds, for a download to be made into before it is sent (so its length is
+/// known): made in the cache's folder and unlinked at once, so a kill leaves nothing behind.
+fn spool_create() -> Option<FileSink> {
+    let dir = pdf_cache_root();
+    // (never in a cache reached through a planted link: the spool is written as root)
+    if !no_link_below(&store_root(), &dir) || mkdir_p(&dir) != 0 {
+        return None;
+    }
+    let path = format!("{dir}/share-{}.spool", std::process::id());
+    let f = FileSink::create_spool(&path);
+    let _ = std::fs::remove_file(&path);
+    f
+}
+
+/// The connection of a download made a second time (no room for a spool): it takes exactly the length the
+/// first making counted and said in Content-Length, and fails past it; the caller checks it got all of it.
+struct ExactSink<'a> {
+    to: &'a mut dyn Sink,
+    left: u64,
+}
+impl Sink for ExactSink<'_> {
+    fn put(&mut self, b: &[u8]) -> bool {
+        if b.len() as u64 > self.left {
+            return false; // (the file changed between the makings: never more than the length said)
+        }
+        self.left -= b.len() as u64;
+        self.to.put(b)
+    }
+}
+
+/// Answers with a file made by `make` into the sink it is given, without ever holding it whole in
+/// memory: the child makes it into a spool file (one page of the PDF, one entry of the zip in memory
+/// at a time) and sends that with its length; with no room for a spool it makes the file twice, a
+/// first time to count it and a second time into the connection, which must give exactly that many
+/// bytes (a notebook saved between the two makings fails the download, never answers it with another
+/// length). A file past 4 GiB fails: its length is not said on the 32-bit Kindle. Anywhere but a render
+/// child (the fork failed: the export runs in-process) it is made into a Buf and answered as every
+/// answer is. `make` is told whether this is the first making of the file (the one that reports the
+/// pages made).
+fn respond_made(ctype: &str, name: Option<&[u8]>, make: &mut dyn FnMut(&mut dyn Sink, bool) -> i32) {
+    if !with(|s| s.child_response) {
+        let mut b = Buf::default();
+        let rc = make(&mut BufSink(&mut b), true);
+        if rc == 0 {
+            respond(200, ctype, &b, name);
+        } else {
+            respond_text(500, tr("export failed"));
+        }
+        buf_free(&mut b);
+        return;
+    }
+    let d = with(|s| s.cl[s.cur].download);
+    let head_only = with(|s| s.child_head);
+    let mut spool: Option<FileSink> = None;
+    let mut len: Option<u64> = None;
+    let mut told = false; // whether a making has told the progress
+    if let Some(mut sp) = spool_create() {
+        told = true;
+        let rc = make(&mut sp, true);
+        if rc == 0 && !sp.failed() {
+            len = Some(sp.len());
+            spool = Some(sp);
+        } else if !sp.failed() {
+            return respond_text(500, tr("export failed")); // (the export itself failed, not the disk)
+        }
+    }
+    if len.is_none() {
+        // (no room for the spool: counted, then made again into the connection)
+        let mut c = CountSink::default();
+        if make(&mut c, !told) != 0 {
+            return respond_text(500, tr("export failed"));
+        }
+        len = Some(c.0);
+    }
+    let len = len.unwrap_or(0);
+    if len > u32::MAX as u64 {
+        return respond_text(500, tr("export failed")); // (Content-Length and the progress count in 32 bits)
+    }
+    let head = response_head(200, ctype, Some(len as usize), name, None, None);
+    if let Some(d) = d {
+        shared(d).bytes.store(len as u32, SeqCst);
+        shared(d).state.store(DL_SENDING, SeqCst);
+    }
+    let mut ok = !head.err && child_send(&head.data, None);
+    if ok && !head_only {
+        let mut sock = SocketSink { d, total: 0 };
+        ok = match spool {
+            Some(sp) => sp.send_all(&mut sock),
+            None => {
+                let mut exact = ExactSink { to: &mut sock, left: len };
+                make(&mut exact, false) == 0 && exact.left == 0
+            }
+        };
+    }
+    if let Some(d) = d {
+        shared(d).state.store(if ok { DL_DONE } else { DL_FAILED }, SeqCst);
+    }
 }
 
 /// export_safe_name on bytes, as the C has it (export.rs's takes text, and drops the cut character a
@@ -811,7 +954,9 @@ fn bat_svg(b: &mut Buf) {
 
 // The pages are dark (the Kindle's own pictures in them stay as the Kindle draws them: thumbnails,
 // pages, Live view's screen), in the colors of :root, which web/live.css and web/studio.css use too.
-// The pages wear the Kindle's style. Classic is Terminess throughout. Gothic sets titles in
+// The pages wear the Kindle's style. Classic is its font throughout, Terminess or the one picked in
+// Settings > Font, with the browser's own sans-serif, serif or monospace after it (a command line in the
+// studio stays in Terminess, 'Grimoire Mono', whatever the font: web/studio.css). Gothic sets titles in
 // Jacquard 24 and text in Jersey 10, pixel faces whose outlines sit on a grid of design pixels
 // (30 and 75 font units): sized so one design pixel is a whole number of device pixels (--px
 // for text, --pxs for small print, --tp/--tp1 for titles, set from the screen's pixel ratio)
@@ -832,10 +977,8 @@ const K_CSS_COMMON: &str = concat!(
     ".bat{width:calc(var(--bp,2px)*43);height:calc(var(--bp,2px)*14);fill:currentColor;shape-rendering:crispEdges;",
     "flex:none}h1.brand{display:flex;align-items:center;gap:.35em}"
 );
-const K_CSS_CLASSIC: &str = concat!(
-    "body{font-family:'Grimoire Text','Terminess Nerd Font',ui-monospace,Menlo,monospace;font-size:16px}",
-    "h1{font-size:28px}h2{font-size:20px}h1,h2,.name,.big,b,strong{font-weight:bold}.meta{font-size:13px}"
-);
+const K_CSS_CLASSIC: &str =
+    "h1{font-size:28px}h2{font-size:20px}h1,h2,.name,.big,b,strong{font-weight:bold}.meta{font-size:13px}";
 const K_CSS_GOTHIC: &str = concat!(
     ":root{--px:1.5px;--pxs:1px;--tp:1px;--tp1:1.5px;--bp:var(--tp1)}",
     "body{font-family:'Grimoire Text',ui-monospace,monospace;font-size:calc(var(--px)*18.6667);",
@@ -873,9 +1016,13 @@ fn page_head(b: &mut Buf, title: &[u8]) {
     let gothic = gothic();
     if gothic {
         buf_puts(b, K_JS_PIXELS);
+    }
+    // The fonts go out with their licenses (route_font): the style that loads them says where.
+    buf_puts(b, "<style>/* The fonts' licenses: /font/licenses.txt */");
+    if gothic {
         buf_printf!(
             b,
-            "<style>@font-face{font-family:'Grimoire Title';src:url(/font/jacquard24.ttf?v=%s) \
+            "@font-face{font-family:'Grimoire Title';src:url(/font/jacquard24.ttf?v=%s) \
              format('truetype');font-display:swap}@font-face{font-family:'Grimoire Text';\
              src:url(/font/jersey10.ttf?v=%s) format('truetype');font-display:swap}",
             GRIMOIRE_VERSION,
@@ -883,14 +1030,23 @@ fn page_head(b: &mut Buf, title: &[u8]) {
         );
         buf_puts(b, K_CSS_GOTHIC);
     } else {
+        let f = family();
         buf_printf!(
             b,
-            "<style>@font-face{font-family:'Grimoire Text';src:url(/font/terminess.ttf?v=%s) \
+            "@font-face{font-family:'Grimoire Text';src:url(/font/%s?v=%s) \
              format('truetype');font-weight:400;font-display:swap}@font-face{font-family:'Grimoire Text';\
-             src:url(/font/terminess-bold.ttf?v=%s) format('truetype');font-weight:700;font-display:swap}",
+             src:url(/font/%s?v=%s) format('truetype');font-weight:700;font-display:swap}\
+             @font-face{font-family:'Grimoire Mono';src:url(/font/terminess.ttf?v=%s) format('truetype');\
+             font-display:swap}",
+            f.web[0],
+            GRIMOIRE_VERSION,
+            f.web[1],
             GRIMOIRE_VERSION,
             GRIMOIRE_VERSION
         );
+        // (Terminess goes on as the font installed under its Nerd Fonts name, then the system's)
+        let fallback = if f.css_generic == "monospace" { "'Terminess Nerd Font',ui-monospace,Menlo,monospace" } else { f.css_generic };
+        buf_printf!(b, "body{font-family:'Grimoire Text',%s;font-size:16px}", fallback);
         buf_puts(b, K_CSS_CLASSIC);
     }
     buf_puts(b, K_CSS_COMMON);
@@ -898,18 +1054,24 @@ fn page_head(b: &mut Buf, title: &[u8]) {
 }
 
 // The fonts the pages use: the binary's own copies, cached by the browser for a year (the
-// version in the URL changes when they could).
+// version in the URL changes when they could): Gothic's two, and each Classic font's Regular and
+// Bold (Terminess's among them). Each goes with its license: licenses.txt beside
+// them holds the texts (Terminess's icons are under the Apache License 2.0, whose text must go
+// with every copy), and each font's answer names it as its license (a Link header, rel=license).
 fn route_font(name: &[u8]) {
-    let fonts: [(&[u8], &[u8]); 4] = [
-        (b"jacquard24.ttf", FONT_JACQUARD24),
-        (b"jersey10.ttf", FONT_JERSEY10),
-        (b"terminess.ttf", FONT_TERMINESS_REGULAR),
-        (b"terminess-bold.ttf", FONT_TERMINESS_BOLD),
-    ];
+    let mut fonts: Vec<(&[u8], &[u8])> = vec![(b"jacquard24.ttf", FONT_JACQUARD24), (b"jersey10.ttf", FONT_JERSEY10)];
+    for (i, f) in FONT_FAMILIES.iter().enumerate() {
+        fonts.push((f.web[0].as_bytes(), font_family_file(i, false)));
+        fonts.push((f.web[1].as_bytes(), font_family_file(i, true)));
+    }
     let name = cbytes(name);
+    if name == b"licenses.txt" {
+        return respond_bytes(200, "text/plain; charset=utf-8", FONT_LICENSES.as_bytes(), None, None, None);
+    }
     for (n, data) in fonts {
         if name == n {
-            return respond_bytes(200, "font/ttf", data, None, Some("public, max-age=31536000, immutable"), None);
+            let license = "Link: </font/licenses.txt>; rel=\"license\"\r\n";
+            return respond_bytes(200, "font/ttf", data, None, Some("public, max-age=31536000, immutable"), Some(license));
         }
     }
     // TRANSLATORS: a plain-text answer in the browser: an address the share server has nothing at.
@@ -979,7 +1141,7 @@ fn route_index() {
     let mut nbs: Vec<NotebookInfo> = Vec::new();
     let mut folders: Vec<String> = Vec::new();
     store_list(&mut nbs);
-    store_list_folders(&mut folders);
+    store_list_folders_from(&nbs, &mut folders);
     let n = nbs.len() as i32;
     let mut b = Buf::default();
     page_head(&mut b, b"Grimoire");
@@ -1160,13 +1322,16 @@ fn route_studio(nb: &NotebookInfo) {
     buf_printf!(&mut b, "};window.GRIMOIRE_L10N={");
     let pages = nb.npages() as i64;
     let mut n = 0;
-    i18n_walk(i18n_current(), &mut |e: &I18nEntry| {
+    let walked = i18n_walk(i18n_current(), &mut |e: &I18nEntry| {
         if e.ctx.as_bytes() != b"studio" {
             return;
         }
         let s = match e.id_plural {
             Some(plural) => i18n_getnc("studio", e.id, plural, pages),
-            None => e.str,
+            // (a word without a translation is still the studio's own, unless it names the device and
+            // the device has another name: i18n.rs, the device's name)
+            None if e.str.is_empty() => Some(i18n_named(e.id)).filter(|named| *named != e.id).unwrap_or(""),
+            None => i18n_named(e.str),
         };
         if s.is_empty() {
             return;
@@ -1179,6 +1344,26 @@ fn route_studio(nb: &NotebookInfo) {
         buf_printf!(&mut b, ":");
         json_str(&mut b, s.as_bytes());
     });
+    if walked < 0 {
+        // English has no catalog and the studio keeps its own words. The ones that name the device
+        // go to it all the same where the device has another name, read from any catalog's list.
+        i18n_walk_first(&mut |e: &I18nEntry| {
+            if e.ctx.as_bytes() != b"studio" || e.id_plural.is_some() {
+                return;
+            }
+            let named = i18n_named(e.id);
+            if named == e.id {
+                return;
+            }
+            if n > 0 {
+                buf_printf!(&mut b, ",");
+            }
+            n += 1;
+            json_str(&mut b, e.id.as_bytes());
+            buf_printf!(&mut b, ":");
+            json_str(&mut b, named.as_bytes());
+        });
+    }
     buf_printf!(&mut b, "};</script><style>");
     buf_append(&mut b, WEB_STUDIO_CSS);
     buf_printf!(&mut b, "</style><script>");
@@ -1192,7 +1377,7 @@ fn route_list_json() {
     let mut nbs: Vec<NotebookInfo> = Vec::new();
     let mut folders: Vec<String> = Vec::new();
     store_list(&mut nbs);
-    store_list_folders(&mut folders);
+    store_list_folders_from(&nbs, &mut folders);
     let mut b = Buf::default();
     buf_printf!(&mut b, "{\"device\":\"Grimoire\",\"version\":");
     json_str(&mut b, GRIMOIRE_VERSION.as_bytes());
@@ -1732,14 +1917,7 @@ fn route(path_in: &[u8]) {
         return;
     }
     if path == b"/all.zip" {
-        let mut b = Buf::default();
-        let rc = export_folder_zip("", dpi(), &mut b);
-        if rc == 0 {
-            respond(200, "application/zip", &b, Some(b"Grimoire.zip"));
-        } else {
-            respond_text(500, tr("export failed"));
-        }
-        buf_free(&mut b);
+        respond_made("application/zip", Some(b"Grimoire.zip"), &mut |sink, _| export_folder_zip_to("", dpi(), sink));
         return;
     }
     if path.starts_with(b"/folder/") {
@@ -1754,18 +1932,12 @@ fn route(path_in: &[u8]) {
         if l - 4 >= STORE_NAME_LEN {
             return respond_text(404, tr("not found")); // longer than any folder
         }
-        let mut b = Buf::default();
         let mut fname = safe_name(folder, STORE_NAME_LEN);
         fname.extend_from_slice(b".zip");
         fname.truncate(STORE_NAME_LEN + 8 - 1);
         // (the folders there are are text: one that is not matches none)
         let folder = String::from_utf8_lossy(folder).into_owned();
-        if export_folder_zip(&folder, dpi(), &mut b) == 0 {
-            respond(200, "application/zip", &b, Some(&fname));
-        } else {
-            respond_text(500, tr("export failed"));
-        }
-        buf_free(&mut b);
+        respond_made("application/zip", Some(&fname), &mut |sink, _| export_folder_zip_to(&folder, dpi(), sink));
         return;
     }
     if !path.starts_with(b"/nb/") {
@@ -1795,23 +1967,15 @@ fn route(path_in: &[u8]) {
     } else if rest == b".pdf" {
         fname = [&safe[..], b".pdf"].concat();
         let d = with(|s| s.cl[s.cur].download);
-        if export_notebook_pdf_progress(nb, dpi, &mut b, Some(&mut |done: i32, total: i32| download_pages(done, total, d))) == 0 {
-            respond(200, "application/pdf", &b, Some(&fname));
-        } else {
-            respond_text(500, tr("export failed"));
-        }
+        // (the page count is told by the first making of the file: a second one, when there was no room for
+        // a spool, would count it over)
+        respond_made("application/pdf", Some(&fname), &mut |sink, first| {
+            let mut told = |done: i32, total: i32| download_pages(done, total, d);
+            export_notebook_pdf_to(nb, dpi, sink, PdfCacheMode::Read, if first { Some(&mut told) } else { None })
+        });
     } else if rest == b".zip" {
-        let mut z = zip_begin(&mut b);
-        let mut rc = export_notebook_zip(nb, dpi, &mut z, "");
-        if zip_end(&mut z) != 0 {
-            rc = -1;
-        }
         fname = [&safe[..], b".zip"].concat();
-        if rc == 0 {
-            respond(200, "application/zip", &b, Some(&fname));
-        } else {
-            respond_text(500, tr("export failed"));
-        }
+        respond_made("application/zip", Some(&fname), &mut |sink, _| export_notebook_zip_to(nb, dpi, sink));
     } else if rest == b"/thumb.png" {
         let mut t = Canvas::default();
         if store_load_thumb(nb.id.as_str(), &mut t) == 0 {
@@ -1973,6 +2137,7 @@ fn serve_in_child(c: usize, method: &[u8], path: &[u8]) -> ! {
     if unsafe { libc::nice(5) } < 0 {
         // best effort
     }
+    child_caps_apply(SHARE_CHILD_MARGIN); // (oom_score_adj 500 and RLIMIT_AS, childcaps.rs)
     #[cfg(feature = "sim")]
     {
         use std::os::unix::ffi::OsStrExt;
@@ -2131,6 +2296,7 @@ fn start_renders() {
         // may allocate (PORTING.md, The process model).
         let pid = unsafe { libc::fork() };
         if pid == 0 {
+            crate::pdfimport::lock_close_in_child(); // (the import lock is the UI's: DESIGN.md 3.9)
             serve_in_child(next, &method, &path);
         }
         if pid > 0 {
@@ -2450,6 +2616,26 @@ pub fn net_ipv4_list(out: &mut [NetAddr]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A download made a second time (no room for a spool) takes exactly the length the first making said:
+    // more is refused, and less is seen by the caller (the 2.1.0-beta.2 fix round, the notebook PDF's lows).
+    #[test]
+    fn a_second_making_gives_exactly_the_length_said() {
+        let mut got = Buf::default();
+        let mut to = BufSink(&mut got);
+        let mut exact = ExactSink { to: &mut to, left: 10 };
+        assert!(exact.put(b"0123"));
+        assert!(!exact.put(b"4567890"), "past the length said: refused");
+        assert!(exact.put(b"456789"));
+        assert_eq!(exact.left, 0);
+        assert!(!exact.put(b"x"));
+        assert_eq!(got.data, b"0123456789");
+        let mut got = Buf::default();
+        let mut to = BufSink(&mut got);
+        let mut short = ExactSink { to: &mut to, left: 10 };
+        assert!(short.put(b"0123"));
+        assert_eq!(short.left, 6, "a shorter second making is seen: the answer fails");
+    }
 
     fn esc(s: &[u8]) -> String {
         let mut b = Buf::default();

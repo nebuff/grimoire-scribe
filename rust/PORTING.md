@@ -14,7 +14,7 @@ one is a cross-group event (see "Interface changes").
 Homebrew's rustc shadows rustup's on the owner's Mac. Put rustup's toolchain first:
 
 ```
-export PATH=~/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH   # rustc 1.97.1
+export PATH="${RUST_BIN:?set RUST_BIN first: ../README.md, Building from source}:$PATH"   # rustup's 1.97.1, as make runs it
 cd rust
 cargo build                                    # host: the library, grimoire-export, mkicon, mklogo
 cargo build --features sim                     # adds grimoire-headless, the scripted runner
@@ -52,9 +52,14 @@ The C tree builds into `build/c` under `c-headless`, `c-test`, `c-tools`, `c-kin
 binaries (`BUILD=build/c`). Never run a GUI binary as a check, and never touch the device from a
 check.
 
-The unit tests read `GRIMOIRE_TEST_TMP` as the C's do (test_store writes to its `../out`): a bare
-`cargo test` without it fails test_store's export checks in both languages. Run them through
-`make test`, or set it to a writable directory whose parent is writable too.
+The unit tests read `GRIMOIRE_TEST_TMP` as the C's do (test_store writes to its `../out`); `make test`
+sets it to `build/test/tmp`, which each half (`test-host`, `test-sim`) empties before it starts, as
+`make c-test` empties `build/c/test/tmp`: the tests name their folders there by process id, and a
+process id comes round again (issue #85). So no two test runs at once in one worktree: give a second
+its own `BUILD`. Without it `tl_tmp()` is a `grimoire-test` folder in the system's
+temporary directory (the C's `/tmp` put `../out` at `/out`), and `.cargo/config.toml` sets
+`RUST_TEST_THREADS=1`, so a plain `cargo test` here runs one test at a time and passes, as
+`cargo test --features sim` does.
 
 ## Variants
 
@@ -65,6 +70,7 @@ The C build's `-D` switches are cargo features:
 | `GRIMOIRE_KINDLE` | `--features kindle` (armv7 Linux only) | display_fbink, input_evdev, light_kindle |
 | `GRIMOIRE_SIM` (headless) | `--features sim` | sim_sdl (the headless runner) |
 | neither (host tools, unit tests) | no feature | platform_none |
+| none: Rust only | `--features external-platform` | another crate's (not with `kindle` or `sim`) |
 
 `#ifdef GRIMOIRE_SIM` becomes `#[cfg(feature = "sim")]`, `#ifdef GRIMOIRE_KINDLE` becomes
 `#[cfg(feature = "kindle")]`. display.rs, input.rs and light.rs hold their headers' types and
@@ -72,6 +78,56 @@ documentation, and forward every function to the build's platform module (`platf
 the platform's signatures are checked against the header. Unlike the C's host build, every module
 compiles in every build (platform_none.rs answers for the missing platform), so `cargo build` on
 the host type-checks the whole app.
+
+The platform is one interface, `platform::Platform` (platform.rs): the functions display.rs, input.rs
+and light.rs forward, under their own names. Each in-tree platform is a unit type (`Kindle`, `Sim`,
+`NoPlatform`) whose methods call its modules' functions one for one, and the forwarders call the
+build's own type, so the calls are resolved at compile time and inlined as before. A new platform
+function is added in four places: the forwarder with its documentation, the trait, and the platform
+modules (a method with a default body in the trait where most platforms have nothing to do).
+
+`external-platform` is the build for a platform kept outside this crate. That crate depends on this
+one with the feature on, implements `Platform` on a type of its own, and from its own binary:
+
+1. calls `platform::register(&ITS_PLATFORM)` (a `&'static` reference; once);
+2. sets `GRIMOIRE_ROOT` to the data directory (and, when that directory is on a file system without
+   advisory locks, `GRIMOIRE_LOCKS` to a folder that has them: `util::lock_file_path`);
+3. calls `mainloop::main(args)` on the thread that stays the app's only thread, and exits with
+   what it returns.
+
+A worker (`<binary> --work ...`, sandbox.rs) is a fresh exec of that binary: its `main` hands `--work`
+to `mainloop::main` before it starts a thread or opens anything, as the in-tree binaries do. On Linux
+the worker's filter lets it wait and wake only on private futexes and map nothing executable, which one
+thread of Rust and a C library never needs more than; a platform's start-up code must not need more
+there.
+
+The rules of this file hold for it as they do for the in-tree platforms: the platform's methods are
+called from that one thread and from the forked children; `input_poll` is the loop's one place to
+wait and returns early when the descriptor given to `input_watch_fd` is readable; `display_present`
+gets the whole screen's canvas and the rect to show. Until a platform is registered the build
+behaves as the host build does (no panel: `display_open` fails). The in-tree platform modules are
+not compiled in this build, light_kindle among them. tests/test_platform_external.rs runs the app
+from start to exit on a recording stand-in:
+`cargo test --features external-platform --test test_platform_external -- --test-threads=1`.
+
+A platform also says which of the device's services Grimoire looks after itself there
+(`sys_services`, light.rs: the Wi-Fi sheet, the Pair sheet, Updates, the KOReader sheet, Calibrate).
+The Kindle and the simulator answer all of them. Settings leaves out the row or button of each one
+a platform says no to; the simulator's `GRIMOIRE_SIM_NO_SERVICES` (docs/SIM.md) is that answer for
+the scenarios.
+
+And it says what the device is called (`sys_device_name`). The English and the translations say
+Kindle; on a platform with another name every looked-up text has that name in its place, "Kindle
+Scribe" as a whole (i18n.rs, the device's name). No string changes for it. The simulator's
+`GRIMOIRE_SIM_DEVICE_NAME` is that name for the scenarios.
+
+A platform reads its own system files (under /proc or /sys, a locale file) with
+`util::read_system_file`, which follows links as any read does. `util::read_file` is for the data
+folder: since 2.1.1 it takes a plain file at the name itself (a link there reads as a file that is
+not there) and never waits, with `util::read_file_max` for the small text files (docs/DESIGN.md,
+On-disk layout). The data folder and the folders on the way to a file may sit behind links, as
+before. Platform code kept outside this crate that calls `util::read_file` on a system file compiles
+as it did and reads differently: such a call becomes `util::read_system_file`.
 
 ## The map
 
@@ -106,13 +162,66 @@ keys `status_on`, `status_size` and `status_corner` (docs/FORMAT.md), the action
 `status.*` probes, and `editor_page_in_front` and `editor_control_at` (it shows on the notebook page only).
 The C tree has none of these; `make c-check` cannot run tests/scenarios/y_status_*.qs.
 
+`backlinks.rs` (the backlinks cache, root/backlinks.ini, 2.0.0-beta.2) is Rust only too, with what reaches
+it: `nav_load_links`, `nav_target_state` and the call to `backlinks_note_saved` at the end of a successful
+`nav_save_links` in nav.rs (src/nav.c has none of them: the C tree never writes backlinks.ini, and a
+notebook it changes is read again at the next check by stamp), the Links bar's Linked from rows and the
+Graph's anchors.
+
+The Graph of all notebooks (2.0.0-beta.2, docs/beta2/GRAPH-ALL.md) is Rust only too: `libindex.rs` (the
+library index, root/graph-index.ini) and the calls that keep it (`libindex_note_info` after a successful
+notebook.ini write in store.rs, `libindex_note_gone` in `store_delete`, `libindex_note_names` in `nav_save`,
+`libindex_note_links` in `nav_save_links`), graph.rs's `GraphNode.key`, `book`, `number` and `broken`, the
+`GraphBook` input, `graph_build_all`, the islands and `place_new_components`, graph-all.ini, bgjob's
+`BgKind::GraphLayoutAll`, mapview's Notebook chip and scopes, the picker's `start_notebook`, and the runner's
+`map-node <notebook id>:<page id>` form. The C tree's Graph stays one notebook's; a notebook it changes is
+read again at the next check by its three stamps.
+
 Live view's version 3 (2.0.0-beta.5) is Rust only too: the pen viewers' own reader of the raw
 digitizer (`input_raw_pen`, `live_set_raw_map`, `live_set_capture`, `live_set_blocked`, the
 `live_raw_*` functions), samples known by the kernel's microseconds (`InEvent.k_us`), the editor's
 panel and the clock's corner as layers (`live_layer`, `editor_live_panel`,
 `editor_live_under_panel`, `status_live`), and the runner's stand-in nodes
 (`GRIMOIRE_SIM_RAWPEN`, `GRIMOIRE_SIM_RAWPEN_MAIN`, `GRIMOIRE_SIM_STALL_MS`; docs/SIM.md). The C
-tree streams version 2: `make c-check` cannot run tests/live_check.sh.
+tree streams version 2: `make c-check` cannot run tests/live_check.sh. The toast's layer
+(2.0.0-beta.2: `LIVE_LAYER_TOAST`, its gray and alpha (`live_layer_bpp`, `live_layer_drawn`,
+`live_matte`) and its smaller buffer, `frame_layout`, `live_layer_now`, app.rs's `live_toast_sync`,
+ui.rs's `ui_toast_max_h`, the runner's `live.toast` and `live.toast.stale`) is Rust only as well.
+
+The Terminess diet's two additions (2.0.0-beta.2, assets/README.md) are Rust only too:
+`koreader_fonts_refresh` in koreader.rs and its call in mainloop.rs's `run` after the first frame
+(Grimoire's copy in KOReader's fonts/Grimoire follows the binary's fonts; src/koreader.c writes it
+only when the Terminess patch is toggled), and httpd.rs's `/font/licenses.txt` (assets.rs's
+`FONT_LICENSES`), with the `Link: rel="license"` header on each font's answer and the comment in
+the pages' style that names it (src/httpd.c serves the fonts alone). Only the Rust tests hold them
+(test_koreader.rs, test_scenarios.rs, test_httpd.rs), so `make c-check` runs as before.
+
+So is the Terminess patch's upgrade at the start (2.0.0-beta.2, the owner's "JS" battery report):
+`koreader_patch_refresh` in koreader.rs and its call in mainloop.rs's `run` right after
+`koreader_fonts_refresh`, and `KOREADER_TERMINESS_EARLIER`, the earlier copies `copy_owned` and it
+know (src/koreader.c knows only the first, `legacy/2-terminess-ui-font.lua`, and replaces it only when
+the patch is toggled). test_koreader.rs and test_scenarios.rs hold them.
+
+Classic's fonts (2.1, docs/DESIGN.md, Text) are Rust only: font.rs's `FONT_FAMILIES` and the files past
+`TTF_JP` (assets.rs's `FONT_ATKINSON_*`, `FONT_NOTO_SANS_*`, `FONT_LITERATA_*`; the Makefile's FONTS_CLASSIC,
+which build/gen/fonts.c leaves out), `FaceMap.fallback`, `font_set_family`, `font_family`,
+`font_with_family`, `font_family_find` and `font_family_file`; the Settings key `font` (store.rs, with
+`settings_kept`); library.rs's Font chip and `Modal::Font`; the icon `IconKind::Font`; httpd.rs's pages and
+fonts for the family and `httpd_restyle` (the style and font changed while the server runs); the probes `font`, `settings.font`, `settings.kept.KEY` and `library.font.pick`; and
+the l10n runner's `classic-<font>` styles and tests/l10n/fonts.qs. The C tree draws Classic in Terminess and
+keeps a `font=` line as one it does not know; `make c-check` runs as before.
+
+Your own fonts (2.1.0-beta.2, docs/DESIGN.md, Your own fonts) are Rust only: `fontcheck.rs` (the safe face:
+skrifa's outlines under the caps, drawn by `stbtt_Rasterize`, which ffi_stb.rs declares with `stbtt_vertex`
+and `stbtt__bitmap`; the font worker, `WorkKind::Font`; the writer's `check_font`; the verdict file),
+`userfonts.rs` (grimoire/fonts, its cache, `BgKind::FontCheck`, the load, the crash guard), font.rs's custom
+face slots (`OwnFont`, `font_set_own`, `font_own`, `font_set_sample`, `font_with_own`, `font_own_bytes`,
+`font_own_drawn`, `font_look`) and its cache's byte cap, the Settings keys `font=file:...` and `font_bold`,
+library.rs's Built in and Your fonts sections, childcaps.rs's margin for the job, sandbox.rs's `s1::FONT_*`
+numbers, the probes `font.guard`, `font.own.*` and `library.font.*`, the font hooks (docs/SIM.md), the
+fixtures of rust/tests/fontfix and the l10n runner's fonts-own runs. skrifa is a direct dependency, pinned to
+the version hayro brings. The C tree draws Classic in Terminess and keeps `font=file:...` as a line it does
+not know.
 
 ### Not ported
 

@@ -1,11 +1,21 @@
 //! keyboard.h: on-screen keyboard modal for naming notebooks and folders.
 //! QWERTY + numbers row, shift, space, backspace, Cancel / Done, - ' and . beside the space bar, and
-//! a key each to a page of symbols and a page of accented letters (and back). Pen or finger taps. The text is UTF-8: a key types a whole character and
+//! a key each to a page of symbols and a page of accented letters (and back). Shift tapped once gives
+//! the next letter's capital, twice caps on, a third time off (KbShift). Pen or finger taps. The text is UTF-8: a key types a whole character and
 //! backspace takes a whole character away. In Japanese the accents key is a kana key: a flick
 //! keypad, twelve keys in three columns, where a tap types the row's first kana and a swipe left,
 //! up, right or down the rest of the row (a mobile phone's kana pad), with ー beside it, one
 //! modifier that cycles the kana typed last (゛小: か to が, は to ば to ぱ, つ to づ to っ), カ for
 //! katakana and 、 for 、。？！.
+//! Delete held down deletes again and again (keyboard_repeat), on every page with a delete key.
+//! The text has a caret (Keyboard.caret): a key types there and delete takes the character before it. The
+//! text line holds three keys at its right end on every page but the count pad's: the edit key, then ◀ and ▶,
+//! which move the caret a character (held, again and again, as delete does). A tap on the text itself puts
+//! the caret there and a drag across it selects (Keyboard.anchor is the selection's other end); typing
+//! replaces a selection and delete takes it. The edit key opens the edit page: Select all, Cut, Copy and
+//! Paste, and Start and End for the caret. What Cut and Copy take is the keyboard's own clipboard, apart
+//! from the lasso's ink, kept until Grimoire closes (keyboard_clipboard). A hardware keyboard's arrows,
+//! Home and End, and Ctrl or Cmd with A, C, X and V do the same (keyboard_key_input, KbInput).
 
 use crate::prelude::*;
 
@@ -19,6 +29,9 @@ pub enum KbResult {
     Changed = 1,  // KB_CHANGED
     Done = 2,  // KB_DONE
     Cancel = 3,  // KB_CANCEL
+    /// the caret or the selection moved (field_dirty set): the text is as it was, so a screen that
+    /// follows the text (Find's rows) has nothing to do
+    Moved = 4,
 }
 
 /// Key codes: a character key's code is its Unicode code point as typed without shift; the
@@ -38,16 +51,71 @@ pub const KB_KEY_FLICK: u32 = 16;
 pub const KB_KEY_BKSP: u32 = 8;
 pub const KB_KEY_DONE: u32 = 13;
 pub const KB_KEY_CANCEL: u32 = 27;
+/// The count pad's (page 4) - and +: the count one less, one more.
+pub const KB_KEY_DEC: u32 = 14;
+pub const KB_KEY_INC: u32 = 15;
+/// The text line's keys (every page but the count pad's): the edit key (the edit page, and from it back) and
+/// ◀ and ▶, the caret a character left and right.
+pub const KB_KEY_EDIT: u32 = 6;
+pub const KB_KEY_LEFT: u32 = 9;
+pub const KB_KEY_RIGHT: u32 = 10;
+/// The edit page's keys: Select all, Cut, Copy, Paste, and the caret to the text's start and to its end.
+pub const KB_KEY_SELECT_ALL: u32 = 11;
+pub const KB_KEY_CUT: u32 = 12;
+pub const KB_KEY_COPY: u32 = 28;
+pub const KB_KEY_PASTE: u32 = 29;
+pub const KB_KEY_START: u32 = 30;
+pub const KB_KEY_END: u32 = 31;
+/// The edit page (the text line's edit key opens it from any page but the count pad's).
+pub const EDIT_PAGE: i32 = 6;
+
+/// The shift key's three states, a tap each in this order and round again (the owner, 2026-11-05: "next
+/// toggle shift in typing toggles off shift for next char then shift on which makes longer caps strings
+/// possible"). The letter keys show their capitals in both on-states.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum KbShift {
+    /// small letters
+    #[default]
+    Off,
+    /// the next letter a capital, then off; a key with no capital (a digit, a symbol, the space bar)
+    /// leaves it on, waiting for a letter. Drawn as the pressed key.
+    Once,
+    /// caps on: every letter a capital until shift is tapped again or the keyboard closes; digits,
+    /// symbols, the space bar, delete and the page keys leave it on. Drawn as the pressed key with a bar
+    /// under its label.
+    Caps,
+}
+
+/// Delete held down (the owner, 2026-11-05: "hold del long enough in keyboards to quick delete"): the
+/// touch-down deletes one, as a tap does, and a contact still on the key this long after it deletes again
+/// ("low ish delay but not too low"). 400 ms is twice a slow tap's contact (about 200 ms: a tap stays one
+/// delete, however deliberate) and shorter than the 500 to 660 ms desktop systems wait by default, a pause
+/// that on the Kindle reads as nothing happening.
+pub const KB_HOLD_MS: u32 = 400;
+/// Then one more every 65 ms, about 15 a second, until the lift or a slide off the key ("repeat rate high so
+/// it feels snappy", "not too high"): twice as fast as anyone taps, about half the 25 to 30 a second of
+/// desktop keyboards, which empty a name faster than the eye can stop them. The same rate all the way: no
+/// speeding up to words.
+pub const KB_REPEAT_MS: u32 = 65;
+/// The most characters one repeat deletes. A repeat waits while the last fast refresh is still on the panel
+/// (keyboard_repeat), rather than send another to queue behind it in the driver, and then deletes those that
+/// came due meanwhile together, one refresh for them all. A fast (DU) refresh lasts 188 ms on the Scribe at
+/// room temperature, three repeats (docs/INK-PERFORMANCE.md), so there the rate holds; colder the panel is
+/// slower, and the repeat slows to its pace instead of jumping further.
+pub const KB_REPEAT_BATCH: u32 = 3;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Keyboard {
     pub open: bool,
+    /// a password: its text is drawn masked, never copied, and wiped when the keyboard closes
+    pub secret: bool,
     pub title: FixedStr<64>,
     pub text: FixedStr<KB_TEXT_MAX>,
-    pub shift: bool,
+    /// the shift key's state (keyboard_open starts every keyboard with it off)
+    pub shift: KbShift,
     /// the kana page in katakana (カ toggles it): the pad types カ キ ク, not か き く
     pub kata: bool,
-    /// 0 letters, 1 accents, 2 number pad, 3 symbols
+    /// 0 letters, 1 accents, 2 number pad, 3 symbols, 4 count pad (keyboard_open_count), 5 kana
     pub page: i32,
     /// where it was last drawn (whole modal)
     pub area: Rect,
@@ -68,6 +136,33 @@ pub struct Keyboard {
     /// otherwise the modal's top y on the screen, for a keyboard that must keep clear of something low on
     /// the page (a link's area being given a target)
     pub dock_y: i32,
+    /// The count pad's (page 4): the most it takes (a digit or + past it leaves the count there, which the
+    /// pad shows), and its Done's label for a count (Done disabled at 0)
+    pub count_max: i32,
+    pub count_label: Option<fn(i32) -> String>,
+    /// set with field_dirty on the count pad: its Done, whose label shows the count (refreshed on its own)
+    pub also_dirty: Rect,
+    /// The count pad's count is still the 1 it opened with (the owner: "1 will be the default"): drawn as any
+    /// count is but with no caret after it, and the first digit typed replaces it rather than following it.
+    pub count_fresh: bool,
+    /// Delete held down: when it deletes next (keyboard_repeat), 0 while it is not held. The touch-down's delete
+    /// sets it when text is left; the lift, a slide off the key, the text gone, the keyboard closing and
+    /// keyboard_holds_end clear it.
+    pub repeat_at: u32,
+    /// keyboard_holds_end's count when the hold began: once it has moved on, the hold is over
+    pub repeat_gen: u32,
+    /// Where typing and delete act: a byte offset into text at a character's first byte, or its end
+    /// (keyboard_open puts it at the end).
+    pub caret: usize,
+    /// The selection's other end (a byte offset as caret is): the caret's own when nothing is selected.
+    pub anchor: usize,
+    /// Where the text line's shown text starts, a byte offset (as last drawn: keyboard_draw keeps the caret in
+    /// view, and a tap on the text finds its character by it).
+    pub scroll: usize,
+    /// The page the edit page was opened from: its abc key, and the edit key, go back there.
+    pub prev_page: i32,
+    /// A contact that went down on the text itself: it put the caret there, and its moves select from there.
+    pub field_drag: bool,
 }
 
 // keyboard.c: on-screen keyboard modal. Layout is computed from the area it was drawn in,
@@ -84,7 +179,7 @@ struct Key {
     code: u32,
 }
 
-const MAX_KEYS: usize = 48;
+const MAX_KEYS: usize = 56;
 
 const KEY_SPACE: u32 = ' ' as u32;
 
@@ -270,19 +365,19 @@ fn flick_dir(x0: f32, y0: f32, x: f32, y: f32) -> i32 {
     }
 }
 
-/// Replaces the last character of the text with f(that character): the kana page's modifier takes
-/// it to its next form. No character, or one with no such form, leaves the text as it is.
+/// Replaces the character before the caret with f(that character): the kana page's modifier takes it to its
+/// next form (the kana typed last, where the caret follows the typing). A selection is let go first, the caret
+/// where it was. No character, or one with no such form, leaves the text as it is.
 fn change_last(kb: &mut Keyboard, f: fn(u32) -> u32) {
+    norm(kb);
+    kb.anchor = kb.caret;
     let b = kb.text.as_bytes();
-    let mut start = b.len();
-    while start > 0 && (b[start - 1] & 0xC0) == 0x80 {
-        start -= 1;
-    }
-    if start == 0 {
+    let end = kb.caret;
+    if end == 0 {
         return;
     }
-    let start = start - 1;
-    let Some((_, cp)) = utf8_get(&b[start..]) else {
+    let start = prev_char(b, end);
+    let Some((_, cp)) = utf8_get(&b[start..end]) else {
         return;
     };
     let ch = f(cp);
@@ -291,12 +386,194 @@ fn change_last(kb: &mut Keyboard, f: fn(u32) -> u32) {
     }
     let mut enc = [0u8; 4];
     let n = utf8_put(ch, &mut enc);
-    if start + n < KB_TEXT_MAX {
+    if b.len() - (end - start) + n < KB_TEXT_MAX {
         let mut buf = [0u8; KB_TEXT_MAX];
         buf[..start].copy_from_slice(&b[..start]);
         buf[start..start + n].copy_from_slice(&enc[..n]);
-        kb.text.set_bytes(&buf[..start + n]);
+        let tail = b.len() - end;
+        buf[start + n..start + n + tail].copy_from_slice(&b[end..]);
+        kb.text.set_bytes(&buf[..start + n + tail]);
+        kb.caret = start + n;
+        kb.anchor = kb.caret;
     }
+}
+
+// ---- the caret and the selection ----
+
+// Where the character before off starts (off > 0, at a character's first byte or the end).
+fn prev_char(s: &[u8], off: usize) -> usize {
+    let mut i = off.min(s.len());
+    while i > 0 {
+        i -= 1;
+        if (s[i] & 0xC0) != 0x80 {
+            break;
+        }
+    }
+    i
+}
+
+// Off moved back to the first byte of the character it is in (the end stays the end).
+fn char_start(s: &[u8], off: usize) -> usize {
+    let mut i = off.min(s.len());
+    while i > 0 && i < s.len() && (s[i] & 0xC0) == 0x80 {
+        i -= 1;
+    }
+    i
+}
+
+// The caret and the anchor inside the text and on characters' first bytes, whatever the text became.
+fn norm(kb: &mut Keyboard) {
+    let b = kb.text.as_bytes();
+    kb.caret = char_start(b, kb.caret);
+    kb.anchor = char_start(b, kb.anchor);
+}
+
+/// The selection as byte offsets, start before end; empty (start == end, the caret) when nothing is selected.
+pub fn keyboard_selection(kb: &Keyboard) -> (usize, usize) {
+    let len = kb.text.len();
+    let (a, c) = (kb.anchor.min(len), kb.caret.min(len));
+    (a.min(c), a.max(c))
+}
+
+fn has_selection(kb: &Keyboard) -> bool {
+    let (s, e) = keyboard_selection(kb);
+    s < e
+}
+
+// The selection (or the caret, with none) replaced by ins when the result fits, the caret after it and nothing
+// selected; false, and the text as it was, when it would not fit.
+fn replace_selection(kb: &mut Keyboard, ins: &[u8]) -> bool {
+    norm(kb);
+    let (s, e) = keyboard_selection(kb);
+    let b = kb.text.as_bytes();
+    let n = b.len() - (e - s) + ins.len();
+    if n >= KB_TEXT_MAX {
+        return false;
+    }
+    let mut buf = [0u8; KB_TEXT_MAX];
+    buf[..s].copy_from_slice(&b[..s]);
+    buf[s..s + ins.len()].copy_from_slice(ins);
+    buf[s + ins.len()..n].copy_from_slice(&b[e..]);
+    kb.text.set_bytes(&buf[..n]);
+    kb.caret = s + ins.len();
+    kb.anchor = kb.caret;
+    true
+}
+
+// The caret to `to`: with `extend` the anchor stays (the selection grows or shrinks), else nothing is
+// selected. True when the caret or the selection moved.
+fn caret_to(kb: &mut Keyboard, to: usize, extend: bool) -> bool {
+    let before = (kb.caret, kb.anchor);
+    kb.caret = to;
+    if !extend {
+        kb.anchor = to;
+    }
+    (kb.caret, kb.anchor) != before
+}
+
+// ◀ (back) and ▶: with a selection and no extend, the caret to its start or its end and nothing selected;
+// else a character back or on, the anchor staying with extend.
+fn caret_step(kb: &mut Keyboard, back: bool, extend: bool) -> bool {
+    norm(kb);
+    let (s, e) = keyboard_selection(kb);
+    if !extend && s < e {
+        return caret_to(kb, if back { s } else { e }, false);
+    }
+    let b = kb.text.as_bytes();
+    let to = if back {
+        if kb.caret == 0 { 0 } else { prev_char(b, kb.caret) }
+    } else if kb.caret >= b.len() {
+        b.len()
+    } else {
+        utf8_next(b, kb.caret)
+    };
+    caret_to(kb, to, extend)
+}
+
+thread_local! {
+    /// The keyboard's clipboard (Cut and Copy, keyboard_clipboard): typed text, never the lasso's ink, kept until
+    /// Grimoire closes.
+    static G_CLIP: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+/// What the keyboard's Cut or Copy took last (empty before the first): Paste types it. It is the typed text's
+/// clipboard alone (the lasso's ink has its own) and lasts until Grimoire closes.
+pub fn keyboard_clipboard() -> String {
+    G_CLIP.with(|c| c.borrow().clone())
+}
+
+// Cut (cut) or Copy: the selection to the clipboard, and with cut out of the text. False with nothing selected.
+fn copy_selection(kb: &mut Keyboard, cut: bool) -> bool {
+    norm(kb);
+    let (s, e) = keyboard_selection(kb);
+    if s >= e {
+        return false;
+    }
+    let taken = String::from_utf8_lossy(&kb.text.as_bytes()[s..e]).into_owned();
+    G_CLIP.with(|c| *c.borrow_mut() = taken);
+    if cut {
+        replace_selection(kb, b"");
+    }
+    true
+}
+
+// Paste: the clipboard in place of the selection (or at the caret), as much of it as fits, cut between
+// characters, with control characters left out, as keyboard_open keeps a name; on a number pad (the page or the
+// one the edit page came from) its digits alone. False with nothing to type.
+fn paste(kb: &mut Keyboard) -> bool {
+    let digits = kb.page == 2 || (kb.page == EDIT_PAGE && kb.prev_page == 2);
+    let clip = keyboard_clipboard();
+    let mut ins = Vec::new();
+    for ch in clip.chars() {
+        let cp = ch as u32;
+        if cp < 32 || (0x7F..0xA0).contains(&cp) || (digits && !ch.is_ascii_digit()) {
+            continue;
+        }
+        let mut enc = [0u8; 4];
+        ins.extend_from_slice(ch.encode_utf8(&mut enc).as_bytes());
+    }
+    if ins.is_empty() {
+        return false;
+    }
+    norm(kb);
+    let (s, e) = keyboard_selection(kb);
+    let room = KB_TEXT_MAX - 1 - (kb.text.len() - (e - s));
+    let mut n = ins.len().min(room);
+    while n > 0 && n < ins.len() && (ins[n] & 0xC0) == 0x80 {
+        n -= 1;
+    }
+    if n == 0 && s == e {
+        return false; // (full: nothing typed, nothing taken)
+    }
+    replace_selection(kb, &ins[..n])
+}
+
+/// The text with the caret drawn in as `|` and a selection in `[` `]` (`ab|cd`, `a[bc|]d`): the headless
+/// runner's `library.caret` and `editor.caret` (docs/SIM.md).
+pub fn keyboard_caret_probe(kb: &Keyboard) -> String {
+    if kb.secret {
+        return String::new(); // (a password never reaches a probe, a log or a scenario)
+    }
+    let b = kb.text.as_bytes();
+    let (s, e) = keyboard_selection(kb);
+    let c = kb.caret.min(b.len());
+    let mut out = String::new();
+    for i in 0..=b.len() {
+        if s < e && i == s {
+            out.push('[');
+        }
+        if i == c {
+            out.push('|');
+        }
+        if s < e && i == e {
+            out.push(']');
+        }
+        if i < b.len() && (b[i] & 0xC0) != 0x80 {
+            let end = if i + 1 >= b.len() { b.len() } else { utf8_next(b, i) };
+            out.push_str(std::str::from_utf8(&b[i..end]).unwrap_or(""));
+        }
+    }
+    out
 }
 
 fn row_len(row: &[u16; 11]) -> usize {
@@ -446,9 +723,20 @@ pub fn keyboard_modal_rect_docked(screen: Rect, dock_y: i32) -> Rect {
 }
 
 fn modal_rect(screen: Rect, dock_y: i32) -> Rect {
-    let h = ui_px(170.0) + 5 * ui_px(150.0) + ui_px(60.0);
+    modal_rect_page(screen, dock_y, 0)
+}
+
+// The count pad (page 4) has a row more than the others: its - and +.
+fn modal_rect_page(screen: Rect, dock_y: i32, page: i32) -> Rect {
+    let h = ui_px(170.0) + 5 * ui_px(150.0) + ui_px(60.0) + if page == 4 { ui_px(170.0) } else { 0 };
     let y = if dock_y > 0 { screen.y + dock_y } else { screen.y + screen.h - h - ui_px(20.0) };
     Rect { x: screen.x + ui_px(20.0), y, w: screen.w - ui_px(40.0), h }
+}
+
+/// Where keyboard_draw puts this keyboard on this screen (its page and dock: the count pad is a row taller),
+/// for a caller that composes the screen under it before it is drawn.
+pub fn keyboard_area(kb: &Keyboard, screen: Rect) -> Rect {
+    modal_rect_page(screen, kb.dock_y, kb.page)
 }
 
 /// Docks an open keyboard: top_y 0 keeps it at the bottom; otherwise the modal's top is at top_y (a caller
@@ -458,12 +746,207 @@ pub fn keyboard_set_dock(kb: &mut Keyboard, top_y: i32) {
     kb.dock_y = top_y.max(0);
 }
 
-fn field_rect(area: Rect) -> Rect {
+// The text line's row, its keys included: what a change of the text or the caret refreshes (field_dirty).
+fn line_rect(area: Rect) -> Rect {
     Rect { x: area.x + ui_px(30.0), y: area.y + ui_px(30.0), w: area.w - ui_px(60.0), h: ui_px(120.0) }
 }
 
+// The text line's three keys, the edit key, ◀ and ▶, at the row's right end, each a letter key's width (a tenth
+// of the row, as on the letters page): the keys the count pad (page 4) does not have.
+fn line_keys(area: Rect) -> [Key; 3] {
+    let row = line_rect(area);
+    let gap = ui_px(10.0);
+    let kw = (row.w - 9 * gap) / 10;
+    let right = row.x + row.w - kw;
+    let key = |x: i32, code: u32| Key { r: Rect { x, y: row.y, w: kw, h: row.h }, code };
+    [key(right - 2 * (kw + gap), KB_KEY_EDIT), key(right - (kw + gap), KB_KEY_LEFT), key(right, KB_KEY_RIGHT)]
+}
+
+// The text box on the text line: the whole row on the count pad, left of the line's keys on every other page.
+fn field_rect(area: Rect, page: i32) -> Rect {
+    let row = line_rect(area);
+    if page == 4 {
+        return row;
+    }
+    let first = line_keys(area)[0].r;
+    Rect { w: first.x - ui_px(10.0) - row.x, ..row }
+}
+
+/// The text box of a keyboard drawn in area (its text line left of the line's keys, inside the count pad's
+/// whole line too): a hardware key's input taps its middle to reach the keyboard's owner (app_type_text).
+pub fn keyboard_field_rect(area: Rect) -> Rect {
+    field_rect(area, 0)
+}
+
+/// What a hardware key does to an open on-screen keyboard (app_type_text): Esc is its Cancel; the arrows, Home and
+/// End move the caret (with Shift held, the selection's end: `true`), and Ctrl or Cmd with A, C, X and V are
+/// the edit page's Select all, Copy, Cut and Paste (keyboard_key_input).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KbInput {
+    Cancel,
+    Left(bool),
+    Right(bool),
+    Home(bool),
+    End(bool),
+    SelectAll,
+    Copy,
+    Cut,
+    Paste,
+}
+
+/// What a hardware keyboard's key (Linux evdev code) with these modifiers (KEYMOD_* bits) does on an open text
+/// keyboard: Left and Right (105, 106) a character, Home and End (102, 107) to the start and the end, each
+/// selecting with Shift held; Ctrl or Cmd (Meta) with A, C, X or V (30, 46, 45, 47) Select all, Copy, Cut and
+/// Paste. None for every other key, which goes on as it did (Esc is the keyboard's Cancel by its shortcut).
+pub fn keyboard_key_input(code: i32, mods: u32) -> Option<KbInput> {
+    let shift = mods & KEYMOD_SHIFT as u32 != 0;
+    let cmd = mods & (KEYMOD_CTRL | KEYMOD_META) as u32 != 0 && mods & KEYMOD_ALT as u32 == 0;
+    Some(match code {
+        105 => KbInput::Left(shift),
+        106 => KbInput::Right(shift),
+        102 => KbInput::Home(shift),
+        107 => KbInput::End(shift),
+        30 if cmd => KbInput::SelectAll,
+        46 if cmd => KbInput::Copy,
+        45 if cmd => KbInput::Cut,
+        47 if cmd => KbInput::Paste,
+        _ => return None,
+    })
+}
+
+// Backspace: the selection, or else the whole character before the caret (back over its continuation bytes to
+// its first byte).
+fn backspace(kb: &mut Keyboard) {
+    norm(kb);
+    if !has_selection(kb) {
+        if kb.caret == 0 {
+            return;
+        }
+        kb.anchor = prev_char(kb.text.as_bytes(), kb.caret);
+    }
+    replace_selection(kb, b"");
+}
+
+// Whether delete, ◀ or ▶ held down has anything more to do: delete a selection or a character before the caret,
+// ◀ a selection or a character before it, ▶ a selection or one after it.
+fn can_repeat(kb: &Keyboard, code: u32) -> bool {
+    let len = kb.text.len();
+    let caret = kb.caret.min(len);
+    has_selection(kb)
+        || match code {
+            KB_KEY_BKSP | KB_KEY_LEFT => caret > 0,
+            KB_KEY_RIGHT => caret < len,
+            _ => false,
+        }
+}
+
+/// A hardware key on an open on-screen keyboard: the result a tap on the same key would give (Cancel closes it;
+/// the count pad's Cancel as keyboard_press does it), with *dirty as keyboard_pointer sets it.
+pub fn keyboard_input(kb: &mut Keyboard, input: &KbInput, dirty: &mut Rect) -> KbResult {
+    *dirty = RECT_EMPTY;
+    if !kb.open {
+        return KbResult::None;
+    }
+    kb.field_dirty = RECT_EMPTY;
+    kb.also_dirty = RECT_EMPTY;
+    let code = match *input {
+        KbInput::Cancel if kb.page == 4 => return keyboard_press(kb, KB_KEY_CANCEL, dirty),
+        KbInput::Cancel => {
+            keyboard_close(kb);
+            *dirty = kb.area;
+            return KbResult::Cancel;
+        }
+        // (the count pad has no caret to move and nothing to select: its keys are digits)
+        _ if kb.page == 4 => return KbResult::None,
+        KbInput::Left(extend) | KbInput::Right(extend) => {
+            let moved = caret_step(kb, matches!(input, KbInput::Left(_)), extend);
+            return moved_result(kb, moved);
+        }
+        KbInput::Home(extend) | KbInput::End(extend) => {
+            norm(kb);
+            let to = if matches!(input, KbInput::Home(_)) { 0 } else { kb.text.len() };
+            let moved = caret_to(kb, to, extend);
+            return moved_result(kb, moved);
+        }
+        KbInput::SelectAll => KB_KEY_SELECT_ALL,
+        KbInput::Copy => KB_KEY_COPY,
+        KbInput::Cut => KB_KEY_CUT,
+        KbInput::Paste => KB_KEY_PASTE,
+    };
+    keyboard_press(kb, code, dirty)
+}
+
+// A caret or selection that moved: the text line to refresh, and Moved; None when nothing moved.
+fn moved_result(kb: &mut Keyboard, moved: bool) -> KbResult {
+    if !moved {
+        return KbResult::None;
+    }
+    kb.field_dirty = line_rect(kb.area);
+    KbResult::Moved
+}
+
+/// The kana pad's page (Japanese): 4 is the count pad's (keyboard_open_count), so the kana pad is 5.
+pub const KANA_PAGE: i32 = 5;
+
+// Every key of the page: the page's own (layout_page), then on every page but the count pad's the text line's
+// edit key, ◀ and ▶.
 fn layout(area: Rect, page: i32, keys: &mut [Key; MAX_KEYS]) -> usize {
-    if page == 2 {
+    let mut n = layout_page(area, page, keys);
+    if page != 4 {
+        for k in line_keys(area) {
+            keys[n] = k;
+            n += 1;
+        }
+    }
+    n
+}
+
+fn layout_page(area: Rect, page: i32, keys: &mut [Key; MAX_KEYS]) -> usize {
+    if page == EDIT_PAGE {
+        // The edit page: Select all across the page, then Cut, Copy and Paste, then Start and End, in the four
+        // rows' height above the bottom row; the bottom row is cancel, the way back (abc), space, delete and done,
+        // Cancel and Done where they are on every page.
+        let mut n = 0;
+        let kh = ui_px(150.0);
+        let gap = ui_px(10.0);
+        let top = area.y + ui_px(170.0);
+        let inner_x = area.x + ui_px(30.0);
+        let inner_w = area.w - ui_px(60.0);
+        let rh = (4 * kh + 3 * gap - 2 * gap) / 3;
+        let rows: [&[u32]; 3] = [&[KB_KEY_SELECT_ALL], &[KB_KEY_CUT, KB_KEY_COPY, KB_KEY_PASTE], &[KB_KEY_START, KB_KEY_END]];
+        for (r, codes) in rows.iter().enumerate() {
+            let cnt = codes.len() as i32;
+            let w = (inner_w - (cnt - 1) * gap) / cnt;
+            for (i, &code) in codes.iter().enumerate() {
+                let x = inner_x + i as i32 * (w + gap);
+                // (the last takes what the division left, so the row ends where the others do)
+                let w = if i as i32 == cnt - 1 { inner_x + inner_w - x } else { w };
+                keys[n] = Key { r: Rect { x, y: top + r as i32 * (rh + gap), w, h: rh }, code };
+                n += 1;
+            }
+        }
+        let sk = (inner_w - 9 * gap) / 10;
+        let wide = sk + sk / 2;
+        let y = top + 4 * (kh + gap);
+        keys[n] = Key { r: Rect { x: inner_x, y, w: wide, h: kh }, code: KB_KEY_CANCEL };
+        n += 1;
+        let x = inner_x + wide + gap;
+        keys[n] = Key { r: Rect { x, y, w: sk, h: kh }, code: KB_KEY_PAGE };
+        n += 1;
+        let x = x + sk + gap;
+        let done_x = inner_x + inner_w - wide;
+        // (delete as wide as Done: its word is the letters page's, which a tenth of the row is too narrow for in
+        // Spanish, "borrar")
+        let bx = done_x - wide - gap;
+        keys[n] = Key { r: Rect { x, y, w: bx - gap - x, h: kh }, code: KEY_SPACE };
+        n += 1;
+        keys[n] = Key { r: Rect { x: bx, y, w: wide, h: kh }, code: KB_KEY_BKSP };
+        n += 1;
+        keys[n] = Key { r: Rect { x: done_x, y, w: wide, h: kh }, code: KB_KEY_DONE };
+        n += 1;
+        return n;
+    }
+    if page == 2 || page == 4 {
         let mut n = 0;
         let gap = ui_px(16.0);
         let h = ui_px(150.0);
@@ -481,11 +964,20 @@ fn layout(area: Rect, page: i32, keys: &mut [Key; MAX_KEYS]) -> usize {
         n += 1;
         keys[n] = Key { r: Rect { x: x + 2 * (w + gap), y, w, h }, code: KB_KEY_BKSP };
         n += 1;
+        if page == 4 {
+            // The count pad: - and + under the digits, each half the row.
+            y += h + gap;
+            let half = (area.w - ui_px(60.0) - gap) / 2;
+            keys[n] = Key { r: Rect { x, y, w: half, h }, code: KB_KEY_DEC };
+            n += 1;
+            keys[n] = Key { r: Rect { x: x + half + gap, y, w: area.w - ui_px(60.0) - half - gap, h }, code: KB_KEY_INC };
+            n += 1;
+        }
         keys[n] = Key { r: Rect { x, y: y + h + gap, w: area.w - ui_px(60.0), h }, code: KB_KEY_DONE };
         n += 1;
         return n;
     }
-    if page == 4 {
+    if page == KANA_PAGE {
         // The kana pad: three columns of four keys, あ か さ / た な は / ま や ら / わ ゛小 ー,
         // then cancel, カ, 、, abc, space, delete and done.
         let mut n = 0;
@@ -599,14 +1091,58 @@ fn layout(area: Rect, page: i32, keys: &mut [Key; MAX_KEYS]) -> usize {
 pub fn keyboard_open(kb: &mut Keyboard, title: &str, initial: &[u8]) {
     *kb = Keyboard::default();
     kb.open = true;
+    kb.secret = false;
     kb.pressed_key = -1;
     kb.flick = 0;
     copy_text(&mut kb.title, title.as_bytes());
     copy_text(&mut kb.text, initial);
+    kb.caret = kb.text.len(); // (after the name: typing goes on from its end, as it always has)
+    kb.anchor = kb.caret;
+}
+
+/// The count pad (page 4): the number pad's digits, Cancel and del, then a row with - and + (the count
+/// one less, down to 1, or one more), and Done, whose label `label` gives for the count (disabled at 0).
+/// The text is the count in digits (empty for 0); a digit or + never takes it past `max`: it stays at
+/// `max`, which the pad shows (no toast: the owner, 2026-11-04). It opens at 1 (`count_fresh`, drawn plain
+/// with no caret), so Done (or Enter) at once adds one; the first digit typed replaces that 1, del
+/// clears it, and - and + count from it.
+pub fn keyboard_open_count(kb: &mut Keyboard, title: &str, max: i32, label: fn(i32) -> String) {
+    let max = max.max(0);
+    keyboard_open(kb, title, if max >= 1 { b"1" } else { b"" });
+    kb.page = 4;
+    kb.count_max = max;
+    kb.count_label = Some(label);
+    kb.count_fresh = max >= 1;
+}
+
+/// The count pad's count: its digits as a number (0 for none).
+pub fn keyboard_count(kb: &Keyboard) -> i32 {
+    kb.text.as_str().bytes().filter(u8::is_ascii_digit).fold(0i32, |v, d| v.saturating_mul(10).saturating_add((d - b'0') as i32))
+}
+
+fn set_count(kb: &mut Keyboard, n: i32) {
+    let n = if n > kb.count_max { kb.count_max } else { n.max(0) };
+    let digits = if n > 0 { n.to_string() } else { String::new() };
+    kb.text.set_bytes(digits.as_bytes());
+    kb.caret = kb.text.len(); // (the count's caret is always after it)
+    kb.anchor = kb.caret;
 }
 
 pub fn keyboard_close(kb: &mut Keyboard) {
+    if kb.secret {
+        kb.text.clear();
+        kb.caret = 0;
+        kb.anchor = 0;
+    }
+    kb.secret = false;
     kb.open = false;
+    kb.repeat_at = 0;
+}
+
+/// A password keyboard: the same keys, with the text masked, and no copy, cut or paste.
+pub fn keyboard_open_secret(kb: &mut Keyboard, title: &str) {
+    keyboard_open(kb, title, b"");
+    kb.secret = true;
 }
 
 // What a key shows: a name for the named keys, else its character as it would type now (in
@@ -618,6 +1154,8 @@ fn key_label<'a>(kb: &Keyboard, code: u32, ch: &'a mut [u8; 8]) -> &'a str {
         KB_KEY_SHIFT => c_("key", "shift"),
         KB_KEY_BKSP => c_("key", "del"),
         KB_KEY_DONE => tr("Done"),
+        KB_KEY_DEC => "\u{2212}", // minus sign
+        KB_KEY_INC => "+",
         KB_KEY_CANCEL => tr("Cancel"),
         // TRANSLATORS: the kana page's named keys, in bold at 44 px: ゛小 (one tenth of the
         // modal wide), カ, 、, the space bar, and あ, the letters page's way to the kana page (as
@@ -631,6 +1169,24 @@ fn key_label<'a>(kb: &Keyboard, code: u32, ch: &'a mut [u8; 8]) -> &'a str {
                 "\u{30AB}" // カ: katakana
             }
         }
+        // TRANSLATORS: the edit page's keys (the text line's edit key opens it), in bold at 44 px: Select all
+        // selects the whole text (a key as wide as the keyboard, 1760 px), Cut, Copy and Paste (each a third,
+        // 580 px) take the selected text to the keyboard's clipboard or type what it holds, Start and End (each
+        // half, 875 px) put the caret at the text's start and at its end.
+        KB_KEY_SELECT_ALL => c_("key", "Select all"),
+        KB_KEY_CUT => c_("key", "Cut"),
+        KB_KEY_COPY => c_("key", "Copy"),
+        KB_KEY_PASTE => c_("key", "Paste"),
+        KB_KEY_START => c_("key", "Start"),
+        KB_KEY_END => c_("key", "End"),
+        // (the text line's keys are icons: line_icon)
+        KB_KEY_EDIT | KB_KEY_LEFT | KB_KEY_RIGHT => "",
+        // The edit page's way back: to the page it was opened from.
+        KB_KEY_PAGE if kb.page == EDIT_PAGE => match kb.prev_page {
+            KANA_PAGE => "\u{3042}", // あ
+            2 => "123",
+            _ => "abc",
+        },
         // The page keys: each to its page, and on it back to the letters.
         KB_KEY_PAGE => {
             if kb.page == 0 {
@@ -663,11 +1219,94 @@ fn key_label<'a>(kb: &Keyboard, code: u32, ch: &'a mut [u8; 8]) -> &'a str {
                 code
             };
             let mut enc = [0u8; 4];
-            let n = utf8_put(if kb.shift { keyboard_upper(code) } else { code }, &mut enc);
+            let n = utf8_put(if kb.shift != KbShift::Off { keyboard_upper(code) } else { code }, &mut enc);
             ch[..n].copy_from_slice(&enc[..n]);
             ch[n] = 0;
             std::str::from_utf8(&ch[..n]).unwrap_or("")
         }
+    }
+}
+
+// Where the text goes on the text line, after the title, and its face and size: the count pad's count in bold,
+// at the size of the title beside it (at ui_title_size it was large and intrusive, the owner's Scribe feedback of
+// 2026-11-04), any other text in the regular face a little larger. keyboard_draw and a tap on the text
+// (caret_at_x) both lay it out by this.
+fn text_line(kb: &Keyboard) -> (Rect, FontFace, f32) {
+    let f = field_rect(kb.area, kb.page);
+    let ts = ui_text_size();
+    let title = kb.title.as_str();
+    let tw = if !title.is_empty() { font_measure(FontFace::Bold, ts, title) + ui_px(30.0) } else { 0 };
+    let tr = Rect { x: f.x + ui_px(24.0) + tw, y: f.y, w: f.w - ui_px(48.0) - tw, h: f.h };
+    let (face, size) = if kb.page == 4 { (FontFace::Bold, ts) } else { (FontFace::Regular, ts * 1.1) };
+    (tr, face, size)
+}
+
+// The last character boundary from `at` whose text from `at` fits in room: how much of the text the line shows.
+fn shown_end(text: &str, at: usize, face: FontFace, size: f32, room: i32) -> usize {
+    let b = text.as_bytes();
+    let mut end = at;
+    while end < b.len() {
+        let next = utf8_next(b, end);
+        if font_measure(face, size, &text[at..next]) > room {
+            break;
+        }
+        end = next;
+    }
+    end
+}
+
+// Where the shown text starts so the caret is in view: from where it started last time, or from the caret if that
+// went before it; later, a character at a time, until the text up to the caret fits; then earlier while the rest of
+// the text, all of it, still fits (so the line is never emptier than it need be). With the caret at the end it is
+// the text's longest tail that fits, what the line has always shown.
+fn text_scroll(kb: &Keyboard, face: FontFace, size: f32, room: i32) -> usize {
+    let text = kb.text.as_str();
+    let b = text.as_bytes();
+    let caret = kb.caret.min(b.len());
+    let mut at = char_start(b, kb.scroll.min(caret));
+    while at < caret && font_measure(face, size, &text[at..caret]) > room {
+        at = utf8_next(b, at);
+    }
+    while at > 0 {
+        let back = prev_char(b, at);
+        if font_measure(face, size, &text[back..]) > room {
+            break;
+        }
+        at = back;
+    }
+    at
+}
+
+// The caret's place for a contact at x on the text line: the character boundary of the shown text (as last drawn)
+// nearest to x, so a tap left of the text is its first shown character's and one right of it the end.
+fn caret_at_x(kb: &Keyboard, x: f32) -> usize {
+    let (tr, face, size) = text_line(kb);
+    let text = kb.text.as_str();
+    let b = text.as_bytes();
+    let at = char_start(b, kb.scroll.min(b.len()));
+    let end = shown_end(text, at, face, size, tr.w - ui_px(20.0));
+    let (mut best, mut best_d) = (at, f32::MAX);
+    let mut off = at;
+    loop {
+        let d = (tr.x as f32 + font_measure(face, size, &text[at..off]) as f32 - x).abs();
+        if d < best_d {
+            (best, best_d) = (off, d);
+        }
+        if off >= end {
+            break;
+        }
+        off = utf8_next(b, off);
+    }
+    best
+}
+
+// The text line's keys draw icons: the edit key the copy icon, ◀ and ▶ chevrons.
+fn line_icon(code: u32) -> IconKind {
+    match code {
+        KB_KEY_EDIT => IconKind::Copy,
+        KB_KEY_LEFT => IconKind::Prev,
+        KB_KEY_RIGHT => IconKind::Next,
+        _ => IconKind::None,
     }
 }
 
@@ -688,36 +1327,80 @@ pub fn keyboard_draws_take() -> u32 {
 /// Returns the rect it covered (to invalidate).
 pub fn keyboard_draw(kb: &mut Keyboard, c: &mut Canvas, screen: Rect) -> Rect {
     G_DRAWS.with(|g| g.set(g.get().wrapping_add(1)));
-    let area = modal_rect(screen, kb.dock_y);
+    let area = modal_rect_page(screen, kb.dock_y, kb.page);
     kb.area = area;
     ui_frame(c, area, ui_px(24.0), 255, true, 0);
     ui_frame(c, area, ui_px(24.0), 0, false, ui_px(6.0));
-    let f = field_rect(area);
+    let f = field_rect(area, kb.page);
     ui_frame(c, f, ui_px(12.0), 255, true, 0);
     ui_frame(c, f, ui_px(12.0), 0, false, ui_px(3.0));
     let ts = ui_text_size();
     let title = kb.title.as_str();
-    let tw = if !title.is_empty() { font_measure(FontFace::Bold, ts, title) + ui_px(30.0) } else { 0 };
-    if tw != 0 {
-        font_draw_left(c, FontFace::Bold, ts, Rect { x: f.x + ui_px(24.0), y: f.y, w: tw, h: f.h }, title, 0);
+    let (tr, face, size) = text_line(kb);
+    if !title.is_empty() {
+        font_draw_left(c, FontFace::Bold, ts, Rect { x: f.x + ui_px(24.0), y: f.y, w: tr.x - f.x - ui_px(24.0), h: f.h }, title, 0);
     }
-    // Show the tail of long text so the caret stays visible.
-    let tr = Rect { x: f.x + ui_px(24.0) + tw, y: f.y, w: f.w - ui_px(48.0) - tw, h: f.h };
-    let text = kb.text.as_str();
-    let mut at = 0;
-    while at < text.len() && font_measure(FontFace::Regular, ts * 1.1, &text[at..]) > tr.w - ui_px(20.0) {
-        at = utf8_next(text.as_bytes(), at);
+    // The text from kb.scroll, as much as fits: the caret always in view (text_scroll), and with it at the end, as
+    // it is while a name is typed, the text's tail, as it always was. A password is drawn as stars, one for each
+    // character, and its selection and its bytes never reach the screen.
+    let room = tr.w - ui_px(20.0);
+    let masked;
+    let (text, at, end) = if kb.secret {
+        masked = "*".repeat(kb.text.as_str().chars().count());
+        (masked.as_str(), 0, masked.len())
+    } else {
+        norm(kb);
+        kb.scroll = text_scroll(kb, face, size, room);
+        let text = kb.text.as_str();
+        let at = kb.scroll;
+        (text, at, shown_end(text, at, face, size, room))
+    };
+    font_draw_left(c, face, size, tr, &text[at..end], 0);
+    let x_of = |off: usize| tr.x + font_measure(face, size, &text[at..off.clamp(at, end)]);
+    let (s0, s1) = if kb.secret { (0, 0) } else { keyboard_selection(kb) };
+    let (v0, v1) = (s0.clamp(at, end), s1.clamp(at, end));
+    if s0 < s1 {
+        // A selection: white on a black box, as the line's height the caret takes (no caret beside it).
+        if v0 < v1 {
+            let (x0, x1) = (x_of(v0), x_of(v1));
+            canvas_fill(c, Rect { x: x0 - ui_px(2.0), y: f.y + ui_px(20.0), w: x1 - x0 + ui_px(3.0), h: f.h - ui_px(40.0) }, 0);
+            let part = &text[v0..v1];
+            font_draw_left(c, face, size, Rect { x: x0, y: tr.y, w: font_measure(face, size, part) + ui_px(4.0), h: tr.h }, part, 255);
+        }
+    } else if !(kb.page == 4 && kb.count_fresh) {
+        // The count pad's opening 1 (count_fresh) is plain black text like any count, with no caret after it: the
+        // first digit typed replaces it rather than following it. (It was a white 1 in a black box, as selected
+        // text is drawn, which read as a 0 on the Scribe: the owner, 2026-11-04, "Batch page adding starts the
+        // counter at 0 - and is displayed at a large, intrusive amount".)
+        // After the text, the caret as it always was, 4 px on; between two characters a thinner one in the space
+        // before the second (a character's advance ends a few pixels past its ink), so it never cuts a letter.
+        let bar = if kb.caret.min(kb.text.len()) >= end {
+            Rect { x: x_of(kb.caret) + ui_px(4.0), y: f.y + ui_px(24.0), w: ui_px(5.0), h: f.h - ui_px(48.0) }
+        } else {
+            Rect { x: x_of(kb.caret) - ui_px(3.0), y: f.y + ui_px(24.0), w: ui_px(3.0), h: f.h - ui_px(48.0) }
+        };
+        canvas_fill(c, bar, 0);
     }
-    let shown = &text[at..];
-    let w = font_measure(FontFace::Regular, ts * 1.1, shown);
-    font_draw_left(c, FontFace::Regular, ts * 1.1, tr, shown, 0);
-    canvas_fill(c, Rect { x: tr.x + w + ui_px(4.0), y: f.y + ui_px(24.0), w: ui_px(5.0), h: f.h - ui_px(48.0) }, 0);
     let mut keys = [Key::default(); MAX_KEYS];
     let n = layout(area, kb.page, &mut keys);
     for (i, key) in keys.iter().enumerate().take(n) {
         let mut ch = [0u8; 8];
-        let lab = key_label(kb, key.code, &mut ch);
-        let st = if i as i32 == kb.pressed_key || (key.code == KB_KEY_SHIFT && kb.shift) {
+        let counted;
+        let lab = match kb.count_label {
+            Some(f) if kb.page == 4 && key.code == KB_KEY_DONE => {
+                counted = f(keyboard_count(kb));
+                counted.as_str()
+            }
+            _ => key_label(kb, key.code, &mut ch),
+        };
+        if count_done_off(kb, key.code) {
+            ui_button(c, key.r, IconKind::None, lab, ButtonStyle::Disabled);
+            continue;
+        }
+        let st = if i as i32 == kb.pressed_key
+            || (key.code == KB_KEY_SHIFT && kb.shift != KbShift::Off)
+            || (key.code == KB_KEY_EDIT && kb.page == EDIT_PAGE)
+        {
             ButtonStyle::Selected
         } else if key.code == KB_KEY_DONE {
             ButtonStyle::Primary
@@ -726,10 +1409,37 @@ pub fn keyboard_draw(kb: &mut Keyboard, c: &mut Canvas, screen: Rect) -> Rect {
         };
         ui_frame(c, key.r, ui_px(12.0), if st == ButtonStyle::Selected { 0 } else { 255 }, true, 0);
         ui_frame(c, key.r, ui_px(12.0), 0, false, if st == ButtonStyle::Primary { ui_px(6.0) } else { ui_px(3.0) });
+        let fg = if st == ButtonStyle::Selected { 255 } else { 0 };
+        let icon = line_icon(key.code);
+        if icon != IconKind::None {
+            ui_icon(c, icon, rect_inflate(key.r, -ui_px(16.0)), fg);
+            continue;
+        }
         let ks = if utf8_count(lab) > 1 { ui_text_size() } else { ui_title_size() };
-        font_draw_centered(c, FontFace::Bold, ks, key.r, lab, if st == ButtonStyle::Selected { 255 } else { 0 });
+        font_draw_centered(c, FontFace::Bold, ks, key.r, lab, fg);
+        if key.code == KB_KEY_SHIFT && kb.shift == KbShift::Caps {
+            caps_bar(c, key.r, ks, lab);
+        }
     }
     area
+}
+
+// Caps on's cue: a white bar under the shift key's white label on the pressed key's black, as wide as the
+// label. Shift for the next letter is the pressed key alone, so the two read apart at a glance, in both
+// themes and sideways, with no word of their own to translate.
+fn caps_bar(c: &mut Canvas, r: Rect, size: f32, lab: &str) {
+    let w = font_measure(FontFace::Bold, size, lab).min(r.w - ui_px(40.0)).max(1);
+    let (asc, desc) = (font_ascent(FontFace::Bold, size), font_descent(FontFace::Bold, size));
+    // (the label's bottom, where font_draw_centered sets it)
+    let bottom = r.y + (r.h - (asc + desc)) / 2 + asc + desc;
+    let h = ui_px(12.0);
+    let y = (bottom + ui_px(6.0)).min(r.y + r.h - ui_px(12.0) - h);
+    canvas_fill(c, Rect { x: r.x + (r.w - w) / 2, y, w, h }, 255);
+}
+
+// The count pad's Done at a count of 0: drawn disabled, and it does nothing.
+fn count_done_off(kb: &Keyboard, code: u32) -> bool {
+    kb.page == 4 && code == KB_KEY_DONE && keyboard_count(kb) < 1
 }
 
 fn key_at(kb: &Keyboard, x: f32, y: f32) -> i32 {
@@ -743,23 +1453,28 @@ fn key_at(kb: &Keyboard, x: f32, y: f32) -> i32 {
     -1
 }
 
-// Appends the key's character (its capital while shift is on) if it fits; shift is one-shot.
+// Types the key's character (its capital while shift is on) at the caret, in place of a selection, if it fits
+// (a character that does not fit is not typed). Shift for the next letter lets go once it gave a capital (every
+// letter key's label changes back: the keyboard's refresh); caps on stays.
 fn type_key(kb: &mut Keyboard, code: u32, dirty: &mut Rect) {
-    let ch = if kb.shift { keyboard_upper(code) } else { code };
+    let ch = if kb.shift != KbShift::Off { keyboard_upper(code) } else { code };
     let mut enc = [0u8; 4];
-    let len = kb.text.len();
     let n = utf8_put(ch, &mut enc);
-    if len + n < KB_TEXT_MAX {
-        // a character that does not fit is not typed
-        let mut buf = [0u8; KB_TEXT_MAX];
-        buf[..len].copy_from_slice(kb.text.as_bytes());
-        buf[len..len + n].copy_from_slice(&enc[..n]);
-        kb.text.set_bytes(&buf[..len + n]);
-    }
-    if kb.shift && ch != code {
-        kb.shift = false;
+    replace_selection(kb, &enc[..n]);
+    if kb.shift == KbShift::Once && ch != code {
+        kb.shift = KbShift::Off;
         *dirty = kb.area;
     }
+}
+
+// Whether shift shows on the page's other keys: a key whose character has a capital shows it while shift is
+// on (key_label). The letters and accents pages have them; the symbols page has none (its digits and signs
+// have no capitals), so a shift tap there changes the shift key alone. (The named keys' codes are below 32,
+// the kana pad's flick keys among them; neither changes with shift.)
+fn shift_shows_on_keys(kb: &Keyboard) -> bool {
+    let mut keys = [Key::default(); MAX_KEYS];
+    let n = layout(kb.area, kb.page, &mut keys);
+    keys.iter().take(n).any(|k| k.code >= 32 && keyboard_upper(k.code) != k.code)
 }
 
 /// Where the key with this code is on the page showing now (as last drawn); false if that page
@@ -778,7 +1493,9 @@ pub fn keyboard_key_rect(kb: &Keyboard, code: u32, r: &mut Rect) -> bool {
 
 /// Pointer events only (pen or touch, already unified by the caller as down/move/up).
 /// *dirty receives the rect needing redraw (may be empty). Characters and backspace type on
-/// touch-down (no waiting for the lift); Shift, the page keys, Cancel and Done act on release.
+/// touch-down (no waiting for the lift); Shift, the page keys, Cancel and Done act on release. Delete's
+/// touch-down also starts its hold (Keyboard.repeat_at), which a move off the key or the lift ends; the
+/// repeats themselves are keyboard_repeat's, at the samples and the ticks after.
 /// phase: 0 down, 1 move, 2 up.
 pub fn keyboard_pointer(kb: &mut Keyboard, phase: i32, x: f32, y: f32, t: u32, dirty: &mut Rect) -> KbResult {
     *dirty = RECT_EMPTY;
@@ -786,13 +1503,38 @@ pub fn keyboard_pointer(kb: &mut Keyboard, phase: i32, x: f32, y: f32, t: u32, d
         return KbResult::None;
     }
     kb.field_dirty = RECT_EMPTY;
+    kb.also_dirty = RECT_EMPTY;
     let mut keys = [Key::default(); MAX_KEYS];
     let n = layout(kb.area, kb.page, &mut keys) as i32;
+    if phase != 1 {
+        kb.repeat_at = 0; // (a new contact, or the lift: no hold goes on)
+    }
+    if phase != 0 && kb.field_drag {
+        // A contact on the text itself: its moves select from where it went down to where it is now, and the lift
+        // leaves the selection (or, for a tap, the caret) where it ended.
+        if phase == 2 {
+            kb.field_drag = false;
+            if x < 0.0 || y < 0.0 {
+                return KbResult::None; // (the off-screen cancel a second finger or the pen sends: as it was)
+            }
+        }
+        let to = caret_at_x(kb, x);
+        let moved = caret_to(kb, to, true);
+        return moved_result(kb, moved);
+    }
     if phase == 0 {
         press_begin(&mut kb.press, x, y, t);
         kb.pressed_key = key_at(kb, x, y);
         kb.typed = false;
+        kb.field_drag = false;
         if kb.pressed_key < 0 {
+            // On the text: the caret there, at the touch-down, and nothing selected (a drag from here selects).
+            if kb.page != 4 && rect_contains(field_rect(kb.area, kb.page), x as i32, y as i32) {
+                kb.field_drag = true;
+                let to = caret_at_x(kb, x);
+                let moved = caret_to(kb, to, false);
+                return moved_result(kb, moved);
+            }
             return KbResult::None;
         }
         *dirty = keys[kb.pressed_key as usize].r;
@@ -808,6 +1550,8 @@ pub fn keyboard_pointer(kb: &mut Keyboard, phase: i32, x: f32, y: f32, t: u32, d
             || c == KB_KEY_CANCEL
             || c == KB_KEY_KANA_MOD
             || c == KB_KEY_KATA
+            || c == KB_KEY_EDIT
+            || is_edit_key(c)
             || is_flick(c)
         {
             return KbResult::None;
@@ -815,6 +1559,9 @@ pub fn keyboard_pointer(kb: &mut Keyboard, phase: i32, x: f32, y: f32, t: u32, d
         kb.typed = true; // type now: the lift only releases the key
     } else if phase == 1 {
         press_move(&mut kb.press, x, y);
+        if kb.repeat_at != 0 && key_at(kb, x, y) != kb.pressed_key {
+            kb.repeat_at = 0; // (slid off delete: the hold is over, and coming back does not start it again)
+        }
         // A swipe on a kana key shows the kana it would type there, once for each way it turns.
         let k = kb.pressed_key;
         if k >= 0 && k < n && is_flick(keys[k as usize].code) {
@@ -841,7 +1588,7 @@ pub fn keyboard_pointer(kb: &mut Keyboard, phase: i32, x: f32, y: f32, t: u32, d
             kb.flick = 0;
             *dirty = keys[k as usize].r;
             type_key(kb, kana, dirty);
-            kb.field_dirty = field_rect(kb.area);
+            kb.field_dirty = line_rect(kb.area);
             return KbResult::Changed;
         }
         *dirty = keys[k as usize].r;
@@ -856,32 +1603,151 @@ pub fn keyboard_pointer(kb: &mut Keyboard, phase: i32, x: f32, y: f32, t: u32, d
     if k < 0 || k >= n {
         return KbResult::None;
     }
-    let mut len = kb.text.len();
-    match keys[k as usize].code {
+    let code = keys[k as usize].code;
+    let r = keyboard_press(kb, code, dirty);
+    // ◀ and ▶ are on the text line, which their move refreshes, pressed key and all: no refresh of their own over it.
+    if !rect_is_empty(kb.field_dirty) && rect_contains_rect(kb.field_dirty, *dirty) {
+        *dirty = RECT_EMPTY;
+    }
+    if phase == 0 && matches!(code, KB_KEY_BKSP | KB_KEY_LEFT | KB_KEY_RIGHT) && kb.open && can_repeat(kb, code) {
+        // Held, it deletes (or moves the caret) again (keyboard_repeat): not with nothing left to delete before the
+        // caret, or no further to go, so a hold on an empty field, or on the count pad's opening 1 (which this
+        // delete cleared), or on ◀ at the text's start, does nothing more.
+        kb.repeat_at = t.wrapping_add(KB_HOLD_MS).max(1);
+        kb.repeat_gen = G_HOLDS.with(|g| g.get());
+    }
+    r
+}
+
+// The edit page's own keys, which act at the lift (as the page keys, Cancel and Done do).
+fn is_edit_key(code: u32) -> bool {
+    matches!(code, KB_KEY_SELECT_ALL | KB_KEY_CUT | KB_KEY_COPY | KB_KEY_PASTE | KB_KEY_START | KB_KEY_END)
+}
+
+/// What a key of the page showing does, as keyboard_pointer does it for a tap on that key (a keyboard's
+/// key typed, or a test's): `code` a character or a KB_KEY_* code. *dirty and field_dirty as there; on
+/// the count pad also_dirty is its Done when the count changed.
+pub fn keyboard_press(kb: &mut Keyboard, code: u32, dirty: &mut Rect) -> KbResult {
+    kb.field_dirty = RECT_EMPTY;
+    kb.also_dirty = RECT_EMPTY;
+    if !kb.open || count_done_off(kb, code) {
+        return KbResult::None;
+    }
+    // A password is typed and deleted; it is never selected, copied, cut or pasted.
+    if kb.secret
+        && matches!(
+            code,
+            KB_KEY_EDIT | KB_KEY_SELECT_ALL | KB_KEY_CUT | KB_KEY_COPY | KB_KEY_PASTE | KB_KEY_START | KB_KEY_END
+        )
+    {
+        return KbResult::None;
+    }
+    if kb.page == 4 && code != KB_KEY_CANCEL && code != KB_KEY_DONE {
+        // The count pad: digits, del, - and + change the count; it stays a number from 0 to count_max. While
+        // the count is the 1 it opened with (count_fresh), a digit replaces it and del clears it.
+        let n = keyboard_count(kb);
+        let fresh = kb.count_fresh;
+        let to = match code {
+            KB_KEY_DEC => if n > 1 { n - 1 } else { n },
+            KB_KEY_INC => n.saturating_add(1),
+            KB_KEY_BKSP if fresh => 0,
+            KB_KEY_BKSP => n / 10,
+            c if (b'0' as u32..=b'9' as u32).contains(&c) && fresh => (c - b'0' as u32) as i32,
+            c if (b'0' as u32..=b'9' as u32).contains(&c) => n.saturating_mul(10).saturating_add((c - b'0' as u32) as i32),
+            _ => return KbResult::None,
+        };
+        kb.count_fresh = false;
+        set_count(kb, to);
+        if keyboard_count(kb) == n && !fresh {
+            return KbResult::None; // (as it was: nothing to draw)
+        }
+        let mut r = RECT_EMPTY;
+        if keyboard_key_rect(kb, KB_KEY_DONE, &mut r) {
+            kb.also_dirty = r;
+        }
+        kb.field_dirty = line_rect(kb.area);
+        return KbResult::Changed;
+    }
+    match code {
         KB_KEY_CANCEL => {
-            kb.open = false;
+            keyboard_close(kb);
             *dirty = kb.area;
             return KbResult::Cancel;
         }
         KB_KEY_DONE => {
-            kb.open = false;
+            kb.open = false; // (the caller takes a secret's text, then wipes it)
             *dirty = kb.area;
             return KbResult::Done;
         }
         KB_KEY_SHIFT => {
-            kb.shift = !kb.shift;
+            // Off, the next letter, caps on, off again (KbShift). Off to the next letter and caps on to off
+            // change every letter key's label (capitals while shift is on): the keyboard's refresh, as
+            // before. The next letter to caps on changes the shift key alone (its bar): its own refresh, and
+            // so does every tap on a page with no letter keys (the symbols page: no label there changes case).
+            kb.shift = match kb.shift {
+                KbShift::Off => KbShift::Once,
+                KbShift::Once => KbShift::Caps,
+                KbShift::Caps => KbShift::Off,
+            };
+            let only_key = kb.shift == KbShift::Caps || !shift_shows_on_keys(kb);
+            let mut r = RECT_EMPTY;
+            *dirty = if only_key && keyboard_key_rect(kb, KB_KEY_SHIFT, &mut r) { r } else { kb.area };
+            return KbResult::Changed;
+        }
+        // The edit key: the edit page, and on it back to the page it came from, as its abc key goes.
+        KB_KEY_EDIT | KB_KEY_PAGE if kb.page == EDIT_PAGE => {
+            kb.page = kb.prev_page;
             *dirty = kb.area;
             return KbResult::Changed;
+        }
+        KB_KEY_EDIT => {
+            kb.prev_page = kb.page;
+            kb.page = EDIT_PAGE;
+            *dirty = kb.area;
+            return KbResult::Changed;
+        }
+        KB_KEY_LEFT | KB_KEY_RIGHT => {
+            let moved = caret_step(kb, code == KB_KEY_LEFT, false);
+            return moved_result(kb, moved);
+        }
+        KB_KEY_START | KB_KEY_END => {
+            norm(kb);
+            let to = if code == KB_KEY_START { 0 } else { kb.text.len() };
+            let moved = caret_to(kb, to, false);
+            return moved_result(kb, moved);
+        }
+        KB_KEY_SELECT_ALL => {
+            let len = kb.text.len();
+            let moved = len > 0 && (kb.anchor, kb.caret) != (0, len);
+            if moved {
+                (kb.anchor, kb.caret) = (0, len);
+            }
+            return moved_result(kb, moved);
+        }
+        // (Copy changes nothing on the screen: the selection stays, as it is everywhere)
+        KB_KEY_COPY => {
+            copy_selection(kb, false);
+            return KbResult::None;
+        }
+        KB_KEY_CUT => {
+            if !copy_selection(kb, true) {
+                return KbResult::None;
+            }
+        }
+        KB_KEY_PASTE => {
+            if !paste(kb) {
+                return KbResult::None;
+            }
         }
         KB_KEY_PAGE | KB_KEY_SYMBOLS | KB_KEY_KANA => {
             // abc is the way back from the accents and kana pages; áé goes to the accents page
             // (the symbols page's page key goes there too).
-            kb.page = match keys[k as usize].code {
+            kb.page = match code {
                 KB_KEY_PAGE => {
-                    if kb.page == 1 || kb.page == 4 { 0 } else { 1 }
+                    if kb.page == 1 || kb.page == KANA_PAGE { 0 } else { 1 }
                 }
                 KB_KEY_KANA => {
-                    if kb.page == 4 { 0 } else { 4 }
+                    if kb.page == KANA_PAGE { 0 } else { KANA_PAGE }
                 }
                 _ => {
                     if kb.page == 3 { 0 } else { 3 }
@@ -896,27 +1762,108 @@ pub fn keyboard_pointer(kb: &mut Keyboard, phase: i32, x: f32, y: f32, t: u32, d
             *dirty = kb.area;
             return KbResult::Changed;
         }
-        KB_KEY_BKSP => {
-            // A whole character: back over its continuation bytes to its first byte.
-            let b = kb.text.as_bytes();
-            while len > 1 && (b[len - 1] & 0xC0) == 0x80 {
-                len -= 1;
-            }
-            if len != 0 {
-                let mut buf = [0u8; KB_TEXT_MAX];
-                buf[..len - 1].copy_from_slice(&b[..len - 1]);
-                kb.text.set_bytes(&buf[..len - 1]);
-            }
-        }
+        KB_KEY_BKSP => backspace(kb),
         code => type_key(kb, code, dirty),
     }
-    kb.field_dirty = field_rect(kb.area);
+    kb.field_dirty = line_rect(kb.area);
     KbResult::Changed
+}
+
+thread_local! {
+    /// keyboard_holds_end
+    static G_HOLDS: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Every keyboard's held delete lets go, wherever that keyboard is: at sleep and at a switch to another screen,
+/// after which the lift may never reach it (asleep, a lift is dropped; on another screen, it goes there), and
+/// its hold would go on deleting once its screen was back.
+pub fn keyboard_holds_end() {
+    G_HOLDS.with(|g| g.set(g.get().wrapping_add(1)));
+}
+
+// The code of the key pressed now, on the page showing (as last drawn).
+fn pressed_code(kb: &Keyboard) -> Option<u32> {
+    let mut keys = [Key::default(); MAX_KEYS];
+    let n = layout(kb.area, kb.page, &mut keys);
+    (kb.pressed_key >= 0 && (kb.pressed_key as usize) < n).then(|| keys[kb.pressed_key as usize].code)
+}
+
+/// Delete held down (or ◀ or ▶, the same way), at `now` (a sample of the contact on it, or the screen's tick): once
+/// its next repeat is due, the delete a tap makes (the caret's move), with every repeat that came due since up to
+/// KB_REPEAT_BATCH (a tick or a sample late,
+/// or the panel busy); the next is due KB_REPEAT_MS after the last that came due, so the rate holds and those
+/// past the batch are skipped, never saved up. `panel_busy`: the last fast refresh may still be on the panel
+/// (display_fast_busy). The repeat then waits, so its refresh never queues behind another, and the text shown
+/// is never more than that one refresh behind the text, at the lift too, after which nothing more is deleted.
+/// Changed when it deleted (Moved when it moved the caret), with field_dirty (and on the count pad also_dirty) as
+/// keyboard_press sets them; None otherwise, both empty. The hold ends once nothing is left to delete before the
+/// caret (no further for the caret to go), and when the keyboard has closed, the key pressed is not delete, ◀ or ▶,
+/// or keyboard_holds_end came since it began.
+pub fn keyboard_repeat(kb: &mut Keyboard, now: u32, panel_busy: bool) -> KbResult {
+    kb.field_dirty = RECT_EMPTY;
+    kb.also_dirty = RECT_EMPTY;
+    if kb.repeat_at == 0 {
+        return KbResult::None;
+    }
+    let code = pressed_code(kb).unwrap_or(0);
+    if !kb.open
+        || kb.repeat_gen != G_HOLDS.with(|g| g.get())
+        || !matches!(code, KB_KEY_BKSP | KB_KEY_LEFT | KB_KEY_RIGHT)
+        || !can_repeat(kb, code)
+    {
+        kb.repeat_at = 0;
+        return KbResult::None;
+    }
+    let late = now.wrapping_sub(kb.repeat_at);
+    if (late as i32) < 0 || panel_busy {
+        return KbResult::None;
+    }
+    let due = 1 + late / KB_REPEAT_MS;
+    let (mut field, mut also, mut key) = (RECT_EMPTY, RECT_EMPTY, RECT_EMPTY);
+    let mut r = KbResult::None;
+    for _ in 0..due.min(KB_REPEAT_BATCH) {
+        match keyboard_press(kb, code, &mut key) {
+            KbResult::Changed => r = KbResult::Changed,
+            KbResult::Moved if r == KbResult::None => r = KbResult::Moved,
+            _ => {}
+        }
+        field = rect_union(field, kb.field_dirty);
+        also = rect_union(also, kb.also_dirty);
+        if !can_repeat(kb, code) {
+            break;
+        }
+    }
+    kb.field_dirty = field;
+    kb.also_dirty = also;
+    kb.repeat_at = if !can_repeat(kb, code) { 0 } else { kb.repeat_at.wrapping_add(due * KB_REPEAT_MS).max(1) };
+    r
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Every named key's code is its own: the kana pad's ゛小 and the count pad's minus once both took 5,
+    // so the kana key showed a minus sign.
+    #[test]
+    fn named_key_codes_are_distinct() {
+        let src = include_str!("keyboard.rs");
+        let mut seen: Vec<(String, String)> = Vec::new();
+        for line in src.lines() {
+            let Some(rest) = line.strip_prefix("pub const KB_KEY_") else { continue };
+            let Some((name, value)) = rest.split_once(": u32 = ") else { continue };
+            let v = value.trim_end_matches(';').trim().to_string();
+            if let Some((_, other)) = seen.iter().find(|(w, _)| *w == v) {
+                panic!("KB_KEY_{name} and KB_KEY_{other} are both {v}");
+            }
+            seen.push((v, name.to_string()));
+        }
+        let flick: Vec<u32> = (KB_KEY_FLICK..KB_KEY_FLICK + 11).collect();
+        for c in [KB_KEY_SHIFT, KB_KEY_PAGE, KB_KEY_SYMBOLS, KB_KEY_KANA, KB_KEY_KANA_MOD, KB_KEY_KATA, KB_KEY_BKSP, KB_KEY_DONE, KB_KEY_CANCEL, KB_KEY_DEC, KB_KEY_INC] {
+            assert!(!flick.contains(&c), "a named key inside the flick keys: {c}");
+            assert!(c < 32, "a named key code that a typed character can take: {c}");
+        }
+    }
 
     fn opened(initial: &[u8]) -> Keyboard {
         let mut kb = Keyboard::default();
@@ -943,7 +1890,7 @@ mod tests {
     #[test]
     fn opening_keeps_valid_characters_only() {
         let kb = opened(b"Hi");
-        assert!(kb.open && kb.pressed_key == -1 && kb.page == 0 && !kb.shift);
+        assert!(kb.open && kb.pressed_key == -1 && kb.page == 0 && kb.shift == KbShift::Off);
         assert_eq!((kb.title.as_str(), kb.text.as_str()), ("Title \u{e9}", "Hi"));
         assert_eq!(opened("caf\u{e9} \u{20ac} \u{1f600}".as_bytes()).text.as_str(), "caf\u{e9} \u{20ac} \u{1f600}");
         // Control characters (C0, DEL, C1) and broken UTF-8 are dropped; the no-break space stays.
@@ -987,6 +1934,16 @@ mod tests {
     }
 
     #[test]
+    fn a_hardware_key_cancels_an_open_keyboard() {
+        let mut d = RECT_EMPTY;
+        let mut kb = opened(b"ab");
+        kb.area = Rect { x: 0, y: 1000, w: 1800, h: 1200 };
+        assert_eq!(keyboard_input(&mut kb, &KbInput::Cancel, &mut d), KbResult::Cancel);
+        assert!(!kb.open && d == kb.area);
+        assert_eq!(keyboard_input(&mut kb, &KbInput::Cancel, &mut d), KbResult::None);
+    }
+
+    #[test]
     fn utf8_helpers() {
         assert_eq!(utf8_get(b"a"), Some((1, 0x61)));
         assert_eq!(utf8_get("\u{20ac}".as_bytes()), Some((3, 0x20AC)));
@@ -998,5 +1955,1050 @@ mod tests {
         assert_eq!(&buf, "\u{1f600}".as_bytes());
         assert_eq!(utf8_next("a\u{e9}b".as_bytes(), 1), 3);
         assert_eq!(utf8_count("a\u{e9}\u{20ac}"), 3);
+    }
+
+    // Delete held down (2.0.0-beta.2, the owner, 2026-11-05: "hold del long enough in keyboards to quick
+    // delete"). A keyboard on the Scribe's upright screen with `text`, on `page`, laid out as drawn, and the
+    // middle of its delete key.
+    fn on_page(text: &[u8], page: i32) -> (Keyboard, f32, f32) {
+        let mut kb = opened(text);
+        kb.page = page;
+        kb.area = keyboard_area(&kb, Rect { x: 0, y: 0, w: 1860, h: 2480 });
+        let mut r = RECT_EMPTY;
+        assert!(keyboard_key_rect(&kb, KB_KEY_BKSP, &mut r), "page {page} has a delete key");
+        (kb, (r.x + r.w / 2) as f32, (r.y + r.h / 2) as f32)
+    }
+
+    // The pointer on the keyboard at time t (phase 0 down, 1 move, 2 up).
+    fn at(kb: &mut Keyboard, phase: i32, x: f32, y: f32, t: u32) -> KbResult {
+        let mut d = RECT_EMPTY;
+        keyboard_pointer(kb, phase, x, y, t, &mut d)
+    }
+
+    /// A tap on delete deletes one character, at the touch-down, and nothing after its lift. The hold starts
+    /// at the touch-down, KB_HOLD_MS ahead, and the lift ends it.
+    #[test]
+    fn a_tap_on_delete_deletes_one() {
+        let (mut kb, x, y) = on_page(b"abcdef", 0);
+        assert_eq!(at(&mut kb, 0, x, y, 1000), KbResult::Changed);
+        assert_eq!((kb.text.as_str(), kb.repeat_at), ("abcde", 1000 + KB_HOLD_MS));
+        assert!(!rect_is_empty(kb.field_dirty));
+        assert_eq!(at(&mut kb, 2, x, y, 1120), KbResult::None);
+        assert_eq!(kb.repeat_at, 0, "the lift ends the hold");
+        assert_eq!(keyboard_repeat(&mut kb, 1000 + KB_HOLD_MS, false), KbResult::None);
+        assert_eq!(keyboard_repeat(&mut kb, 5000, false), KbResult::None);
+        assert_eq!(kb.text.as_str(), "abcde");
+    }
+
+    /// Held for H ms, with a tick every millisecond (or a sample: keyboard_repeat is the same) until the lift,
+    /// delete takes 1 character for H under KB_HOLD_MS, and 1 + 1 + (H - KB_HOLD_MS) / KB_REPEAT_MS from it on:
+    /// the touch-down's, one at KB_HOLD_MS, and one every KB_REPEAT_MS after (a repeat due at the lift's own
+    /// moment counts, as its tick comes first). The same across the clock's wrap.
+    #[test]
+    fn a_hold_deletes_again_after_the_delay_then_at_the_rate() {
+        assert_eq!((KB_HOLD_MS, KB_REPEAT_MS), (400, 65), "the owner's \"low ish\" delay and \"snappy\" rate");
+        let text = [b'x'; 60];
+        for t0 in [1000u32, u32::MAX - 200] {
+            for held in [0u32, 100, 399, 400, 401, 464, 465, 529, 530, 1000, 2000] {
+                let (mut kb, x, y) = on_page(&text, 0);
+                at(&mut kb, 0, x, y, t0);
+                for dt in 1..=held {
+                    keyboard_repeat(&mut kb, t0.wrapping_add(dt), false);
+                }
+                at(&mut kb, 2, x, y, t0.wrapping_add(held));
+                let want = 1 + if held >= KB_HOLD_MS { 1 + (held - KB_HOLD_MS) / KB_REPEAT_MS } else { 0 };
+                assert_eq!(60 - kb.text.len() as u32, want, "held {held} ms from {t0}");
+                assert_eq!(kb.repeat_at, 0);
+            }
+        }
+        // 2 s: 1 + 1 + 24, about 15 a second after the first 0.4 s.
+        let (mut kb, x, y) = on_page(&text, 0);
+        at(&mut kb, 0, x, y, 1000);
+        for t in (1010..=3000).step_by(10) {
+            keyboard_repeat(&mut kb, t, false);
+        }
+        assert_eq!(kb.text.len(), 60 - 26);
+    }
+
+    /// A repeat comes when it is due, at the tick or sample after (the main loop goes round every 30 ms or
+    /// sooner), each one a change to draw on its own; one found late deletes those that came due since together,
+    /// three at most, and the next is due on the schedule, never sooner (the ones past three are skipped).
+    #[test]
+    fn a_late_repeat_catches_up_a_batch_at_most() {
+        let (mut kb, x, y) = on_page(b"0123456789abcdefghij", 0);
+        at(&mut kb, 0, x, y, 1000);
+        assert_eq!(keyboard_repeat(&mut kb, 1399, false), KbResult::None);
+        assert!(rect_is_empty(kb.field_dirty));
+        assert_eq!(keyboard_repeat(&mut kb, 1425, false), KbResult::Changed, "a tick 25 ms late");
+        assert!(!rect_is_empty(kb.field_dirty), "the text line to refresh");
+        assert_eq!((kb.text.len(), kb.repeat_at), (18, 1465));
+        assert_eq!(keyboard_repeat(&mut kb, 1464, false), KbResult::None);
+        // Found 5 repeats late: three of them, and the next due after now, on the 65 ms schedule.
+        assert_eq!(keyboard_repeat(&mut kb, 1465 + 4 * KB_REPEAT_MS + 10, false), KbResult::Changed);
+        assert_eq!((kb.text.len(), kb.repeat_at), (15, 1465 + 5 * KB_REPEAT_MS));
+        assert_eq!(KB_REPEAT_BATCH, 3);
+    }
+
+    /// While the last fast refresh is still on the panel a due repeat waits (nothing deleted, nothing to draw,
+    /// so no refresh queues behind it); once it ends, the repeats that came due meanwhile go together, three at
+    /// most, one refresh. The lift during the wait deletes nothing more: the text shown is the text.
+    #[test]
+    fn a_repeat_waits_for_the_panel() {
+        let (mut kb, x, y) = on_page(b"0123456789abcdefghij", 0);
+        at(&mut kb, 0, x, y, 1000);
+        assert_eq!(keyboard_repeat(&mut kb, 1400, false), KbResult::Changed);
+        for t in [1465, 1500, 1530, 1580] {
+            assert_eq!(keyboard_repeat(&mut kb, t, true), KbResult::None, "busy at {t}");
+            assert!(rect_is_empty(kb.field_dirty));
+        }
+        assert_eq!(kb.text.len(), 18);
+        // Free at 1600: 1465, 1530 and 1595 came due, one change.
+        assert_eq!(keyboard_repeat(&mut kb, 1600, false), KbResult::Changed);
+        assert_eq!((kb.text.len(), kb.repeat_at), (15, 1660));
+        assert_eq!(keyboard_repeat(&mut kb, 1700, true), KbResult::None);
+        at(&mut kb, 2, x, y, 1720);
+        assert_eq!(keyboard_repeat(&mut kb, 1800, false), KbResult::None);
+        assert_eq!(kb.text.len(), 15, "nothing after the lift");
+    }
+
+    /// A slide off delete ends the hold (back on, it does not start again); the finger rolling on the key does
+    /// not. Any other key held types once, as before, and never repeats.
+    #[test]
+    fn sliding_off_delete_ends_the_hold() {
+        let (mut kb, x, y) = on_page(b"0123456789", 0);
+        at(&mut kb, 0, x, y, 1000);
+        at(&mut kb, 1, x + 3.0, y - 2.0, 1200);
+        assert_eq!(kb.repeat_at, 1400, "still on the key");
+        let mut m = RECT_EMPTY;
+        assert!(keyboard_key_rect(&kb, 'm' as u32, &mut m));
+        at(&mut kb, 1, (m.x + m.w / 2) as f32, (m.y + m.h / 2) as f32, 1300);
+        assert_eq!(kb.repeat_at, 0, "slid off");
+        at(&mut kb, 1, x, y, 1350);
+        assert_eq!(keyboard_repeat(&mut kb, 1500, false), KbResult::None);
+        at(&mut kb, 2, x, y, 1600);
+        assert_eq!(kb.text.as_str(), "012345678");
+        // An m held: typed once, no hold.
+        at(&mut kb, 0, (m.x + m.w / 2) as f32, (m.y + m.h / 2) as f32, 2000);
+        assert_eq!((kb.text.as_str(), kb.repeat_at), ("012345678m", 0));
+        assert_eq!(keyboard_repeat(&mut kb, 3000, false), KbResult::None);
+        at(&mut kb, 2, (m.x + m.w / 2) as f32, (m.y + m.h / 2) as f32, 3000);
+        assert_eq!(kb.text.as_str(), "012345678m");
+    }
+
+    /// The hold ends when nothing is left to delete: no repeat, nothing to draw, however long it is held. A hold
+    /// on an empty field never starts.
+    #[test]
+    fn the_hold_ends_with_the_text() {
+        let (mut kb, x, y) = on_page("a\u{e9}\u{20ac}".as_bytes(), 0);
+        at(&mut kb, 0, x, y, 1000);
+        assert_eq!(keyboard_repeat(&mut kb, 1400, false), KbResult::Changed);
+        assert_eq!(kb.text.as_str(), "a", "whole characters");
+        assert_eq!(keyboard_repeat(&mut kb, 1465, false), KbResult::Changed);
+        assert_eq!((kb.text.as_str(), kb.repeat_at), ("", 0), "empty: the hold is over");
+        for t in [1530, 2000, 9000] {
+            assert_eq!(keyboard_repeat(&mut kb, t, false), KbResult::None);
+            assert!(rect_is_empty(kb.field_dirty));
+        }
+        // Held on the empty field: no hold at all.
+        at(&mut kb, 2, x, y, 9100);
+        at(&mut kb, 0, x, y, 10000);
+        assert_eq!(kb.repeat_at, 0);
+        assert_eq!(keyboard_repeat(&mut kb, 11000, false), KbResult::None);
+        // And the last character deleted at the touch-down: none either.
+        let (mut kb, x, y) = on_page(b"z", 0);
+        at(&mut kb, 0, x, y, 1000);
+        assert_eq!((kb.text.as_str(), kb.repeat_at), ("", 0));
+    }
+
+    /// The keyboard closing (keyboard_close, or Done and Cancel, which close it themselves), a new contact (a
+    /// second finger's key, a hardware key's touch on the text line), and keyboard_holds_end (sleep, another
+    /// screen) each end the hold.
+    #[test]
+    fn closing_a_new_contact_and_sleep_end_the_hold() {
+        let text = b"0123456789";
+        let (mut kb, x, y) = on_page(text, 0);
+        at(&mut kb, 0, x, y, 1000);
+        keyboard_close(&mut kb);
+        assert_eq!(kb.repeat_at, 0);
+        let (mut kb, x, y) = on_page(text, 0);
+        at(&mut kb, 0, x, y, 1000);
+        kb.open = false; // (as Done and Cancel leave it)
+        assert_eq!(keyboard_repeat(&mut kb, 1400, false), KbResult::None);
+        assert_eq!(kb.repeat_at, 0);
+        let (mut kb, x, y) = on_page(text, 0);
+        at(&mut kb, 0, x, y, 1000);
+        let f = line_rect(kb.area);
+        at(&mut kb, 0, (f.x + f.w / 2) as f32, (f.y + f.h / 2) as f32, 1100);
+        assert_eq!(kb.repeat_at, 0, "a new contact");
+        let (mut kb, x, y) = on_page(text, 0);
+        at(&mut kb, 0, x, y, 1000);
+        keyboard_holds_end();
+        assert_eq!(keyboard_repeat(&mut kb, 1400, false), KbResult::None);
+        assert_eq!((kb.text.as_str(), kb.repeat_at), ("012345678", 0));
+        // A hold that began after it is not touched by it.
+        at(&mut kb, 2, x, y, 1500);
+        at(&mut kb, 0, x, y, 2000);
+        assert_eq!(keyboard_repeat(&mut kb, 2400, false), KbResult::Changed);
+        assert_eq!(kb.text.as_str(), "0123456");
+    }
+
+    /// Every page with a delete key holds it: the letters, accents and symbols pages, the number pad and the kana
+    /// pad (whose bottom row has one).
+    #[test]
+    fn every_keyboard_page_repeats_delete() {
+        for page in [0, 1, 3, 2, KANA_PAGE] {
+            let (mut kb, x, y) = on_page(b"1234", page);
+            at(&mut kb, 0, x, y, 1000);
+            assert_eq!(keyboard_repeat(&mut kb, 1400, false), KbResult::Changed, "page {page}");
+            assert_eq!(kb.text.as_str(), "12", "page {page}");
+        }
+    }
+
+    /// The count pad's del held deletes the digits typed, one by one, its Done (which shows the count) to
+    /// refresh with the count, and stops at 0. On the pad as it opens the touch-down clears the opening 1 (the
+    /// owner's ruling: del clears it) and there is nothing to hold.
+    #[test]
+    fn the_count_pads_del_repeats_down_to_nothing() {
+        let mut d = RECT_EMPTY;
+        let mut kb = Keyboard::default();
+        keyboard_open_count(&mut kb, "Pages to add", 999, label);
+        kb.area = keyboard_area(&kb, Rect { x: 0, y: 0, w: 1860, h: 2480 });
+        let mut r = RECT_EMPTY;
+        assert!(keyboard_key_rect(&kb, KB_KEY_BKSP, &mut r));
+        let (x, y) = ((r.x + r.w / 2) as f32, (r.y + r.h / 2) as f32);
+        at(&mut kb, 0, x, y, 1000);
+        assert_eq!((keyboard_count(&kb), kb.count_fresh, kb.repeat_at), (0, false, 0), "the opening 1 cleared, no hold");
+        assert_eq!(keyboard_repeat(&mut kb, 1400, false), KbResult::None);
+        at(&mut kb, 2, x, y, 1500);
+        for c in ['3', '4', '5'] {
+            keyboard_press(&mut kb, c as u32, &mut d);
+        }
+        assert_eq!(kb.text.as_str(), "345");
+        at(&mut kb, 0, x, y, 2000);
+        assert_eq!((kb.text.as_str(), kb.repeat_at), ("34", 2400));
+        assert_eq!(keyboard_repeat(&mut kb, 2400, false), KbResult::Changed);
+        assert!(!rect_is_empty(kb.field_dirty) && !rect_is_empty(kb.also_dirty), "the count line and Done");
+        assert_eq!(keyboard_repeat(&mut kb, 2465, false), KbResult::Changed);
+        assert_eq!((kb.text.as_str(), keyboard_count(&kb), kb.repeat_at), ("", 0, 0));
+        assert_eq!(keyboard_repeat(&mut kb, 3000, false), KbResult::None);
+        assert!(kb.open && !kb.count_fresh);
+    }
+
+    fn label(n: i32) -> String {
+        format!("Add {n}")
+    }
+
+    /// New page's count pad (2.0.0-beta.2): digits, del, - and + keep a count from 0 to its most, a count past
+    /// it stays at the most and says so, - stops at 1, and Done does nothing at 0.
+    #[test]
+    fn the_count_pad_keeps_its_count_in_bounds() {
+        let mut kb = Keyboard::default();
+        keyboard_open_count(&mut kb, "Pages to add", 25, label);
+        let mut c = Canvas::default();
+        canvas_init(&mut c, 600, 1600);
+        keyboard_draw(&mut kb, &mut c, Rect { x: 0, y: 0, w: 600, h: 1600 });
+        let mut d = RECT_EMPTY;
+        let mut press = |kb: &mut Keyboard, code: u32| keyboard_press(kb, code, &mut d);
+        // It opens at 1 (count_fresh); del clears that 1 (the count 0: Done off).
+        assert_eq!((kb.page, keyboard_count(&kb), kb.count_fresh), (4, 1, true));
+        assert_eq!(press(&mut kb, KB_KEY_BKSP), KbResult::Changed);
+        assert_eq!((keyboard_count(&kb), kb.count_fresh), (0, false));
+        assert_eq!(press(&mut kb, KB_KEY_DONE), KbResult::None, "Done is off at 0");
+        assert!(kb.open);
+        assert_eq!(press(&mut kb, KB_KEY_DEC), KbResult::None);
+        assert_eq!(press(&mut kb, '0' as u32), KbResult::None, "no leading zero");
+        assert_eq!(press(&mut kb, '1' as u32), KbResult::Changed);
+        assert!(!rect_is_empty(kb.field_dirty) && !rect_is_empty(kb.also_dirty), "the count line and Done");
+        assert_eq!(press(&mut kb, '2' as u32), KbResult::Changed);
+        assert_eq!(kb.text.as_str(), "12");
+        assert_eq!(press(&mut kb, '0' as u32), KbResult::Changed);
+        assert_eq!(kb.text.as_str(), "25", "120 is past 25: 25");
+        assert_eq!(press(&mut kb, KB_KEY_INC), KbResult::None);
+        assert_eq!(kb.text.as_str(), "25", "+ at 25 stays at 25");
+        assert_eq!(press(&mut kb, KB_KEY_BKSP), KbResult::Changed);
+        assert_eq!(kb.text.as_str(), "2");
+        assert_eq!(press(&mut kb, KB_KEY_DEC), KbResult::Changed);
+        assert_eq!(press(&mut kb, KB_KEY_DEC), KbResult::None, "- stops at 1");
+        assert_eq!(kb.text.as_str(), "1");
+        assert_eq!(press(&mut kb, KB_KEY_INC), KbResult::Changed);
+        assert_eq!(press(&mut kb, KB_KEY_DONE), KbResult::Done);
+        assert_eq!((keyboard_count(&kb), kb.open), (2, false));
+        // The pad has a row more than the number pad, and its Done is under - and +.
+        let (mut done, mut dec) = (RECT_EMPTY, RECT_EMPTY);
+        assert!(keyboard_key_rect(&kb, KB_KEY_DONE, &mut done) && keyboard_key_rect(&kb, KB_KEY_DEC, &mut dec));
+        assert!(done.y > dec.y + dec.h);
+        assert!(kb.area.y + kb.area.h <= 1600 && done.y + done.h <= kb.area.y + kb.area.h);
+    }
+
+    /// The count pad opens at 1 (the owner: "if enter is pressed or confirm via touch, 1 will be the default"): Done at once is 1; the first digit replaces the 1, the next ones follow it; - and +
+    /// count from it; a typed 1 is still a change to draw (its caret shows). A notebook with no
+    /// room opens it empty.
+    #[test]
+    fn the_count_pad_opens_at_one_and_the_first_digit_replaces_it() {
+        let mut d = RECT_EMPTY;
+        let mut kb = Keyboard::default();
+        keyboard_open_count(&mut kb, "Pages to add", 25, label);
+        assert_eq!((kb.text.as_str(), kb.count_fresh), ("1", true));
+        assert_eq!(keyboard_press(&mut kb, KB_KEY_DONE, &mut d), KbResult::Done);
+        assert_eq!(keyboard_count(&kb), 1, "Done at once adds one");
+        keyboard_open_count(&mut kb, "Pages to add", 25, label);
+        assert_eq!(keyboard_press(&mut kb, '7' as u32, &mut d), KbResult::Changed);
+        assert_eq!((kb.text.as_str(), kb.count_fresh), ("7", false), "7, not 17");
+        assert_eq!(keyboard_press(&mut kb, '2' as u32, &mut d), KbResult::Changed);
+        assert_eq!(kb.text.as_str(), "25", "72 is past 25: 25");
+        keyboard_open_count(&mut kb, "Pages to add", 25, label);
+        assert_eq!(keyboard_press(&mut kb, '1' as u32, &mut d), KbResult::Changed, "its caret shows");
+        assert_eq!((kb.text.as_str(), kb.count_fresh), ("1", false));
+        assert_eq!(keyboard_press(&mut kb, '2' as u32, &mut d), KbResult::Changed);
+        assert_eq!(kb.text.as_str(), "12");
+        keyboard_open_count(&mut kb, "Pages to add", 25, label);
+        assert_eq!(keyboard_press(&mut kb, KB_KEY_INC, &mut d), KbResult::Changed);
+        assert_eq!((kb.text.as_str(), kb.count_fresh), ("2", false), "+ from 1");
+        keyboard_open_count(&mut kb, "Pages to add", 25, label);
+        assert_eq!(keyboard_press(&mut kb, KB_KEY_DEC, &mut d), KbResult::Changed, "- stays at 1, its caret shows");
+        assert_eq!((kb.text.as_str(), kb.count_fresh), ("1", false));
+        assert_eq!(keyboard_press(&mut kb, KB_KEY_DEC, &mut d), KbResult::None);
+        keyboard_open_count(&mut kb, "Pages to add", 0, label);
+        assert_eq!((kb.text.as_str(), kb.count_fresh), ("", false), "no room: empty");
+    }
+
+    /// The count pad's opening 1 is plain black text, drawn as its title is (bold, at the title's size), with no
+    /// caret after it; a count typed has its caret (2.0.0-beta.2, the owner's Scribe feedback of 2026-11-04: the
+    /// white 1 in a black box, at the title size, "starts the counter at 0 - and is displayed at a large,
+    /// intrusive amount"). The pad is titled "1" here, so the title's glyph and the count's are the same.
+    #[test]
+    fn the_count_pads_opening_one_is_plain_text() {
+        assert_eq!(font_init(), 0);
+        let screen = Rect { x: 0, y: 0, w: 1000, h: 1600 };
+        let draw = |fresh: bool| {
+            let mut kb = Keyboard::default();
+            keyboard_open_count(&mut kb, "1", 25, label);
+            kb.count_fresh = fresh;
+            let mut c = Canvas::default();
+            assert_eq!(canvas_init(&mut c, screen.w, screen.h), 0);
+            keyboard_draw(&mut kb, &mut c, screen);
+            (c, line_rect(kb.area))
+        };
+        // The black pixels' bounds (x0, y0, x1, y1) inside r, and how many.
+        let ink = |c: &Canvas, r: Rect| {
+            let (mut b, mut n) = ((i32::MAX, i32::MAX, i32::MIN, i32::MIN), 0);
+            for y in r.y..r.y + r.h {
+                for x in r.x..r.x + r.w {
+                    if c.px[(y * c.stride + x) as usize] < 128 {
+                        b = (b.0.min(x), b.1.min(y), b.2.max(x), b.3.max(y));
+                        n += 1;
+                    }
+                }
+            }
+            (b, n)
+        };
+        let (fresh, f) = draw(true);
+        let (typed, _) = draw(false);
+        // inside the field's frame: the title from its left margin, the count after the title's width
+        let inner = Rect { x: f.x + ui_px(12.0), y: f.y + ui_px(12.0), w: f.w - ui_px(24.0), h: f.h - ui_px(24.0) };
+        let count_x = f.x + ui_px(24.0) + font_measure(FontFace::Bold, ui_text_size(), "1") + ui_px(30.0);
+        let title_r = Rect { w: count_x - inner.x, ..inner };
+        let count_r = Rect { x: count_x, w: inner.x + inner.w - count_x, ..inner };
+        let (tb, tn) = ink(&fresh, title_r);
+        let (cb, cn) = ink(&fresh, count_r);
+        assert!(tn > 0 && cn > 0, "the title and the count are drawn");
+        assert_eq!((cb.1, cb.3), (tb.1, tb.3), "the count's 1 as tall as the title's, on its line");
+        assert_eq!((cb.2 - cb.0, cn), (tb.2 - tb.0, tn), "the same glyph, black on white: no box, no caret");
+        // Typed, the same 1 and a caret after it, and nothing else differs.
+        let (yb, yn) = ink(&typed, count_r);
+        assert!(yn > cn && yb.0 == cb.0 && yb.2 > cb.2, "a typed count has its caret");
+        for y in count_r.y..count_r.y + count_r.h {
+            for x in count_r.x..=cb.2 {
+                let i = (y * fresh.stride + x) as usize;
+                assert_eq!(fresh.px[i], typed.px[i], "the 1 itself drawn the same at ({x}, {y})");
+            }
+        }
+    }
+
+    // A keyboard open on the letters page, drawn on this screen (its keys where keyboard_key_rect finds them).
+    fn drawn(screen: Rect) -> (Keyboard, Canvas) {
+        let mut kb = opened(b"");
+        let mut c = Canvas::default();
+        assert_eq!(canvas_init(&mut c, screen.w, screen.h), 0);
+        keyboard_draw(&mut kb, &mut c, screen);
+        (kb, c)
+    }
+
+    // A key typed (keyboard_press), which must change something: what it refreshes beyond the text line.
+    fn tap(kb: &mut Keyboard, code: u32) -> Rect {
+        let mut d = RECT_EMPTY;
+        assert_eq!(keyboard_press(kb, code, &mut d), KbResult::Changed, "key {code}");
+        d
+    }
+
+    fn type_str(kb: &mut Keyboard, s: &str) {
+        for ch in s.chars() {
+            tap(kb, ch as u32);
+        }
+    }
+
+    // The key with this code tapped as a finger does, down and up at its middle (keyboard_pointer): what the lift
+    // refreshes.
+    fn tap_at(kb: &mut Keyboard, code: u32) -> Rect {
+        let mut r = RECT_EMPTY;
+        assert!(keyboard_key_rect(kb, code, &mut r), "key {code} on the page");
+        let (x, y) = ((r.x + r.w / 2) as f32, (r.y + r.h / 2) as f32);
+        let mut d = RECT_EMPTY;
+        keyboard_pointer(kb, 0, x, y, 0, &mut d);
+        keyboard_pointer(kb, 2, x, y, 40, &mut d);
+        d
+    }
+
+    /// Shift tapped once gives the next letter its capital and lets go, as it always has; a key with no capital
+    /// (a digit, a symbol, the space bar) leaves it waiting for a letter.
+    #[test]
+    fn shift_once_gives_the_next_letter_only() {
+        let mut kb = opened(b"");
+        tap(&mut kb, KB_KEY_SHIFT);
+        assert_eq!(kb.shift, KbShift::Once);
+        type_str(&mut kb, "abc");
+        assert_eq!((kb.text.as_str(), kb.shift), ("Abc", KbShift::Off));
+        tap(&mut kb, KB_KEY_SHIFT);
+        type_str(&mut kb, "1- &");
+        assert_eq!((kb.text.as_str(), kb.shift), ("Abc1- &", KbShift::Once), "no capital yet: it waits for a letter");
+        type_str(&mut kb, "\u{e9}e");
+        assert_eq!((kb.text.as_str(), kb.shift), ("Abc1- &\u{c9}e", KbShift::Off));
+    }
+
+    /// Shift tapped twice is caps on (2.0.0-beta.2, the owner, 2026-11-05: "next toggle shift in typing toggles off
+    /// shift for next char then shift on which makes longer caps strings possible"): every letter a capital through
+    /// digits, the space bar, delete and the symbols and accents pages, until a third tap turns it off.
+    #[test]
+    fn shift_twice_is_caps_on_until_a_third_tap() {
+        let mut kb = opened(b"");
+        tap(&mut kb, KB_KEY_SHIFT);
+        tap(&mut kb, KB_KEY_SHIFT);
+        assert_eq!(kb.shift, KbShift::Caps);
+        type_str(&mut kb, "nasa 2026");
+        assert_eq!(kb.text.as_str(), "NASA 2026");
+        tap(&mut kb, KB_KEY_BKSP);
+        tap(&mut kb, KB_KEY_BKSP);
+        type_str(&mut kb, "x ");
+        assert_eq!(kb.text.as_str(), "NASA 20X ");
+        tap(&mut kb, KB_KEY_SYMBOLS);
+        assert_eq!(kb.page, 3);
+        type_str(&mut kb, "!&");
+        tap(&mut kb, KB_KEY_PAGE); // the symbols page's accents key
+        assert_eq!(kb.page, 1);
+        type_str(&mut kb, "\u{e9}\u{f1}\u{153}");
+        tap(&mut kb, KB_KEY_PAGE); // abc
+        assert_eq!(kb.page, 0);
+        type_str(&mut kb, "ab");
+        assert_eq!((kb.text.as_str(), kb.shift), ("NASA 20X !&\u{c9}\u{d1}\u{152}AB", KbShift::Caps));
+        tap(&mut kb, KB_KEY_SHIFT);
+        assert_eq!(kb.shift, KbShift::Off, "a third tap: off");
+        type_str(&mut kb, "cd");
+        assert!(kb.text.as_str().ends_with("ABcd"));
+        tap(&mut kb, KB_KEY_SHIFT);
+        assert_eq!(kb.shift, KbShift::Once, "and round again");
+    }
+
+    /// Caps on ends with the keyboard: closed by Done, Cancel or a hardware Esc, the next keyboard opens with shift
+    /// off (every keyboard_open starts there, as before).
+    #[test]
+    fn caps_on_ends_when_the_keyboard_closes() {
+        let mut d = RECT_EMPTY;
+        for close in [Some(KB_KEY_DONE), Some(KB_KEY_CANCEL), None] {
+            let mut kb = opened(b"x");
+            tap(&mut kb, KB_KEY_SHIFT);
+            tap(&mut kb, KB_KEY_SHIFT);
+            assert_eq!(kb.shift, KbShift::Caps);
+            match close {
+                Some(code) => assert_ne!(keyboard_press(&mut kb, code, &mut d), KbResult::Changed),
+                None => assert_eq!(keyboard_input(&mut kb, &KbInput::Cancel, &mut d), KbResult::Cancel),
+            }
+            assert!(!kb.open);
+            keyboard_open(&mut kb, "Name", b"");
+            assert_eq!(kb.shift, KbShift::Off);
+            type_str(&mut kb, "ab");
+            assert_eq!(kb.text.as_str(), "ab");
+        }
+    }
+
+    /// What a shift tap refreshes: off to once and caps on to off change every letter key's label (capitals while
+    /// shift is on), so the keyboard, as before; once to caps on changes only the shift key (its bar), so only it.
+    /// A letter typed with caps on refreshes what any letter does (its key, then the text line, keyboard_pointer);
+    /// the capital of shift once takes the letter keys back to small letters. On the symbols page no label changes
+    /// case, so each of the three taps refreshes the shift key alone.
+    #[test]
+    fn a_shift_tap_refreshes_only_what_it_changed() {
+        let (mut kb, _c) = drawn(Rect { x: 0, y: 0, w: 1860, h: 2480 });
+        let mut key = RECT_EMPTY;
+        assert!(keyboard_key_rect(&kb, KB_KEY_SHIFT, &mut key));
+        assert_eq!(tap_at(&mut kb, KB_KEY_SHIFT), kb.area, "off to once");
+        assert_eq!(tap_at(&mut kb, KB_KEY_SHIFT), key, "once to caps on: the shift key alone");
+        assert_eq!(kb.shift, KbShift::Caps);
+        assert_eq!(tap(&mut kb, 'a' as u32), RECT_EMPTY, "a letter with caps on: no more than any letter");
+        assert_eq!(tap_at(&mut kb, KB_KEY_SHIFT), kb.area, "caps on to off");
+        tap_at(&mut kb, KB_KEY_SHIFT);
+        assert_eq!(tap(&mut kb, '1' as u32), RECT_EMPTY, "a digit: shift once still waits");
+        assert_eq!(tap(&mut kb, 'b' as u32), kb.area, "shift once let go");
+        assert_eq!((kb.text.as_str(), kb.shift), ("A1B", KbShift::Off));
+        // The symbols page: no key's label there changes case, so every tap refreshes the shift key alone.
+        tap_at(&mut kb, KB_KEY_SYMBOLS);
+        assert_eq!(kb.page, 3);
+        assert!(keyboard_key_rect(&kb, KB_KEY_SHIFT, &mut key));
+        assert_eq!(tap_at(&mut kb, KB_KEY_SHIFT), key, "symbols page, off to once");
+        assert_eq!(tap_at(&mut kb, KB_KEY_SHIFT), key, "symbols page, once to caps on");
+        assert_eq!(tap_at(&mut kb, KB_KEY_SHIFT), key, "symbols page, caps on to off");
+        // The accents page's letters show their capitals: the keyboard again.
+        tap_at(&mut kb, KB_KEY_PAGE);
+        assert_eq!(kb.page, 1);
+        assert_eq!(tap_at(&mut kb, KB_KEY_SHIFT), kb.area, "accents page, off to once");
+    }
+
+    /// The two on-states read apart on the e-ink screen: shift once is the pressed key, as shift always was (black,
+    /// its label white); caps on is that key with a white bar under its label, as wide as the label. Nothing else on
+    /// the keyboard differs between the two (the letter keys show their capitals in both). Gothic and Classic,
+    /// upright and sideways.
+    #[test]
+    fn caps_on_draws_a_bar_under_the_shift_label() {
+        assert_eq!(font_init(), 0);
+        for th in [UiTheme::Gothic, UiTheme::Classic] {
+            ui_set_theme(th);
+            for screen in [Rect { x: 0, y: 0, w: 1860, h: 2480 }, Rect { x: 0, y: 0, w: 2480, h: 1860 }] {
+                let shot = |shift: KbShift, pressed: bool| {
+                    let (mut kb, mut c) = drawn(screen);
+                    let mut r = RECT_EMPTY;
+                    assert!(keyboard_key_rect(&kb, KB_KEY_SHIFT, &mut r));
+                    kb.shift = shift;
+                    if pressed {
+                        kb.pressed_key = key_at(&kb, (r.x + r.w / 2) as f32, (r.y + r.h / 2) as f32);
+                    }
+                    keyboard_draw(&mut kb, &mut c, screen);
+                    (c, r)
+                };
+                let (pressed, _) = shot(KbShift::Off, true);
+                let (once, r) = shot(KbShift::Once, false);
+                let (caps, _) = shot(KbShift::Caps, false);
+                let px = |c: &Canvas, x: i32, y: i32| c.px[(y * c.stride + x) as usize];
+                let inside = |x: i32, y: i32| rect_contains(r, x, y);
+                let (mut label_bottom, mut bar) = (i32::MIN, (i32::MAX, i32::MAX, i32::MIN, i32::MIN));
+                for y in 0..screen.h {
+                    for x in 0..screen.w {
+                        let (o, k) = (px(&once, x, y), px(&caps, x, y));
+                        if !inside(x, y) {
+                            assert_eq!(o, k, "{th:?} {}x{}: only the shift key differs, not ({x}, {y})", screen.w, screen.h);
+                            continue;
+                        }
+                        assert_eq!(o, px(&pressed, x, y), "{th:?}: shift once is the pressed key, at ({x}, {y})");
+                        if o > 128 && rect_contains(rect_inflate(r, -ui_px(16.0)), x, y) {
+                            label_bottom = label_bottom.max(y);
+                        }
+                        if o != k {
+                            assert_eq!((o, k), (0, 255), "{th:?}: caps on adds white to the black key, at ({x}, {y})");
+                            bar = (bar.0.min(x), bar.1.min(y), bar.2.max(x), bar.3.max(y));
+                        }
+                    }
+                }
+                let (bw, bh) = (bar.2 - bar.0 + 1, bar.3 - bar.1 + 1);
+                assert_eq!(bh, ui_px(12.0), "{th:?} {}x{}: a bar", screen.w, screen.h);
+                assert!(bw >= ui_px(60.0) && bw < r.w - ui_px(30.0), "{th:?}: as wide as the label, inside the key: {bw}");
+                assert!((bar.0 + bar.2 + 1 - (2 * r.x + r.w)).abs() <= 1, "{th:?}: centered under the label");
+                assert!(bar.1 > label_bottom && bar.3 < r.y + r.h - ui_px(10.0), "{th:?}: under the label, in the key");
+                let ink = (r.y..r.y + r.h).flat_map(|y| (r.x..r.x + r.w).map(move |x| (x, y))).filter(|&(x, y)| px(&caps, x, y) < 128).count();
+                assert!(ink * 2 > (r.w * r.h) as usize, "{th:?}: caps on is still the black key");
+            }
+        }
+        ui_set_theme(UiTheme::Gothic);
+    }
+
+    // ---- the caret, the selection and the clipboard (2.1.0-beta.2, issue #36) ----
+
+    // A keyboard with `text` laid out on the Scribe's upright screen, on `page`.
+    fn laid_out(text: &str, page: i32) -> Keyboard {
+        let mut kb = opened(text.as_bytes());
+        kb.page = page;
+        kb.area = keyboard_area(&kb, Rect { x: 0, y: 0, w: 1860, h: 2480 });
+        kb
+    }
+
+    fn press_code(kb: &mut Keyboard, code: u32) -> KbResult {
+        let mut d = RECT_EMPTY;
+        keyboard_press(kb, code, &mut d)
+    }
+
+    fn input(kb: &mut Keyboard, i: KbInput) -> KbResult {
+        let mut d = RECT_EMPTY;
+        keyboard_input(kb, &i, &mut d)
+    }
+
+    fn caret(kb: &Keyboard) -> String {
+        keyboard_caret_probe(kb)
+    }
+
+    /// ◀ and ▶ move the caret a whole character (an accent, a euro sign, an emoji: two, three and four bytes), never
+    /// past the ends; a key types at the caret and delete takes the character before it. Each move refreshes the text
+    /// line and says Moved (the text as it was); one that cannot move says None and refreshes nothing.
+    #[test]
+    fn typing_and_delete_act_at_the_caret() {
+        let mut kb = laid_out("a\u{e9}\u{20ac}\u{1f600}", 0);
+        assert_eq!(caret(&kb), "a\u{e9}\u{20ac}\u{1f600}|", "the caret opens after the name");
+        assert_eq!(press_code(&mut kb, KB_KEY_RIGHT), KbResult::None, "no further right");
+        assert!(rect_is_empty(kb.field_dirty));
+        assert_eq!(press_code(&mut kb, KB_KEY_LEFT), KbResult::Moved);
+        assert_eq!(kb.field_dirty, line_rect(kb.area), "the text line, keys and all, as a key's typing refreshes");
+        assert_eq!(caret(&kb), "a\u{e9}\u{20ac}|\u{1f600}");
+        press_code(&mut kb, KB_KEY_LEFT);
+        press_code(&mut kb, KB_KEY_LEFT);
+        assert_eq!(caret(&kb), "a|\u{e9}\u{20ac}\u{1f600}");
+        assert_eq!(press_code(&mut kb, 'b' as u32), KbResult::Changed);
+        assert_eq!(caret(&kb), "ab|\u{e9}\u{20ac}\u{1f600}");
+        press_code(&mut kb, KB_KEY_RIGHT);
+        assert_eq!(press_code(&mut kb, KB_KEY_BKSP), KbResult::Changed);
+        assert_eq!(caret(&kb), "ab|\u{20ac}\u{1f600}", "delete takes the character before the caret");
+        press_code(&mut kb, KB_KEY_START);
+        assert_eq!(caret(&kb), "|ab\u{20ac}\u{1f600}");
+        assert_eq!(press_code(&mut kb, KB_KEY_LEFT), KbResult::None, "no further left");
+        press_code(&mut kb, KB_KEY_BKSP);
+        assert_eq!(kb.text.as_str(), "ab\u{20ac}\u{1f600}", "nothing before the caret: nothing deleted");
+        press_code(&mut kb, KB_KEY_END);
+        assert_eq!(caret(&kb), "ab\u{20ac}\u{1f600}|");
+        // Shift once gives the capital at the caret too.
+        press_code(&mut kb, KB_KEY_START);
+        press_code(&mut kb, KB_KEY_SHIFT);
+        press_code(&mut kb, 'x' as u32);
+        assert_eq!(caret(&kb), "X|ab\u{20ac}\u{1f600}");
+        // A character that would not fit is not typed wherever the caret is, and the caret stays.
+        let mut full = laid_out(&"z".repeat(KB_TEXT_MAX - 1), 0);
+        press_code(&mut full, KB_KEY_LEFT);
+        press_code(&mut full, '\u{e9}' as u32);
+        assert_eq!((full.text.len(), full.caret), (KB_TEXT_MAX - 1, KB_TEXT_MAX - 2));
+    }
+
+    /// The kana pad's modifier changes the kana before the caret (the one typed last, wherever the caret is).
+    #[test]
+    fn the_kana_modifier_changes_the_kana_before_the_caret() {
+        let mut kb = laid_out("\u{304b}\u{3064}", KANA_PAGE); // かつ
+        press_code(&mut kb, KB_KEY_LEFT);
+        assert_eq!(press_code(&mut kb, KB_KEY_KANA_MOD), KbResult::Changed);
+        assert_eq!(caret(&kb), "\u{304c}|\u{3064}", "か to が, the つ after it as it was");
+        press_code(&mut kb, 0x3042); // あ (the pad's tap on its first key), typed at the caret
+        assert_eq!(caret(&kb), "\u{304c}\u{3042}|\u{3064}");
+    }
+
+    /// A selection: a hardware keyboard's Shift with the arrows, Home and End grows and shrinks it; the arrows alone
+    /// let it go at its start or end; a key replaces it; delete takes it; Select all takes the whole text.
+    #[test]
+    fn a_selection_is_replaced_by_typing_and_taken_by_delete() {
+        let mut kb = laid_out("hello", 0);
+        assert_eq!(input(&mut kb, KbInput::Left(true)), KbResult::Moved);
+        input(&mut kb, KbInput::Left(true));
+        assert_eq!(caret(&kb), "hel[|lo]");
+        assert_eq!(keyboard_selection(&kb), (3, 5));
+        input(&mut kb, KbInput::Right(true));
+        assert_eq!(caret(&kb), "hell[|o]", "back the other way: it shrinks");
+        input(&mut kb, KbInput::Home(true));
+        assert_eq!(caret(&kb), "[|hello]", "Shift with Home: to the start, the anchor where it was");
+        assert_eq!(input(&mut kb, KbInput::Left(false)), KbResult::Moved, "◀ lets it go, the caret where it is");
+        assert_eq!((caret(&kb).as_str(), input(&mut kb, KbInput::Left(false))), ("|hello", KbResult::None));
+        let mut kb = laid_out("hello", 0);
+        input(&mut kb, KbInput::Home(true));
+        assert_eq!(input(&mut kb, KbInput::Left(false)), KbResult::Moved);
+        assert_eq!(caret(&kb), "|hello", "◀ lets the selection go at its start");
+        input(&mut kb, KbInput::End(true));
+        assert_eq!(input(&mut kb, KbInput::Right(false)), KbResult::Moved);
+        assert_eq!(caret(&kb), "hello|", "▶ at its end");
+        // A key replaces the selection.
+        input(&mut kb, KbInput::Left(true));
+        input(&mut kb, KbInput::Left(true));
+        press_code(&mut kb, 'p' as u32);
+        assert_eq!(caret(&kb), "help|");
+        // Delete takes it whole.
+        assert_eq!(press_code(&mut kb, KB_KEY_SELECT_ALL), KbResult::Moved);
+        assert_eq!(caret(&kb), "[help|]");
+        assert_eq!(press_code(&mut kb, KB_KEY_SELECT_ALL), KbResult::None, "all of it is selected already");
+        assert_eq!(press_code(&mut kb, KB_KEY_BKSP), KbResult::Changed);
+        assert_eq!(caret(&kb), "|");
+        assert_eq!(press_code(&mut kb, KB_KEY_SELECT_ALL), KbResult::None, "nothing to select");
+        // The count pad has no caret to move: its keys are digits.
+        let mut pad = Keyboard::default();
+        keyboard_open_count(&mut pad, "Pages", 50, label);
+        pad.area = keyboard_area(&pad, Rect { x: 0, y: 0, w: 1860, h: 2480 });
+        assert_eq!(input(&mut pad, KbInput::Left(false)), KbResult::None);
+        assert_eq!(input(&mut pad, KbInput::SelectAll), KbResult::None);
+        assert_eq!(caret(&pad), "1|");
+    }
+
+    /// Cut and Copy take the selection to the keyboard's clipboard, which Paste types at the caret in place of a
+    /// selection, as much as fits and cut between characters, control characters left out; on a number pad its
+    /// digits alone. Copy changes nothing on the screen; with nothing selected Cut and Copy do nothing, and Paste
+    /// with nothing copied.
+    #[test]
+    fn cut_copy_and_paste_through_the_keyboards_own_clipboard() {
+        G_CLIP.with(|c| c.borrow_mut().clear());
+        let mut kb = laid_out("Notes 2026", 0);
+        assert_eq!(press_code(&mut kb, KB_KEY_PASTE), KbResult::None, "nothing copied yet");
+        assert_eq!(press_code(&mut kb, KB_KEY_COPY), KbResult::None);
+        assert_eq!(keyboard_clipboard(), "", "nothing selected: nothing copied");
+        assert_eq!(press_code(&mut kb, KB_KEY_CUT), KbResult::None);
+        input(&mut kb, KbInput::Home(false));
+        for _ in 0..5 {
+            input(&mut kb, KbInput::Right(true));
+        }
+        assert_eq!(press_code(&mut kb, KB_KEY_COPY), KbResult::None, "Copy draws nothing");
+        assert!(rect_is_empty(kb.field_dirty));
+        assert_eq!((keyboard_clipboard().as_str(), caret(&kb).as_str()), ("Notes", "[Notes|] 2026"), "the selection stays");
+        press_code(&mut kb, KB_KEY_END);
+        press_code(&mut kb, ' ' as u32);
+        assert_eq!(press_code(&mut kb, KB_KEY_PASTE), KbResult::Changed);
+        assert_eq!(caret(&kb), "Notes 2026 Notes|");
+        // Cut: out of the text, into the clipboard; Paste in place of a selection.
+        input(&mut kb, KbInput::Home(false));
+        for _ in 0..6 {
+            input(&mut kb, KbInput::Right(true));
+        }
+        assert_eq!(press_code(&mut kb, KB_KEY_CUT), KbResult::Changed);
+        assert_eq!((keyboard_clipboard().as_str(), caret(&kb).as_str()), ("Notes ", "|2026 Notes"));
+        input(&mut kb, KbInput::End(true));
+        press_code(&mut kb, KB_KEY_PASTE);
+        assert_eq!(caret(&kb), "Notes |");
+        // As much as fits, cut between characters: a field one byte short of full takes no two-byte é.
+        G_CLIP.with(|c| *c.borrow_mut() = "ab\u{e9}\u{e9}".to_string());
+        let mut nearly = laid_out(&"z".repeat(KB_TEXT_MAX - 4), 0);
+        assert_eq!(press_code(&mut nearly, KB_KEY_PASTE), KbResult::Changed);
+        assert_eq!(nearly.text.len(), KB_TEXT_MAX - 2, "a and b; no room for the é");
+        assert!(nearly.text.as_str().ends_with("zab"));
+        assert_eq!(press_code(&mut nearly, KB_KEY_PASTE), KbResult::Changed, "room for one byte: a");
+        assert_eq!(nearly.text.len(), KB_TEXT_MAX - 1);
+        assert_eq!(press_code(&mut nearly, KB_KEY_PASTE), KbResult::None, "full: nothing typed");
+        // Control characters are left out, as a name opened on the keyboard drops them.
+        G_CLIP.with(|c| *c.borrow_mut() = "a\tb\nc\u{7f}d".to_string());
+        let mut kb = laid_out("", 0);
+        press_code(&mut kb, KB_KEY_PASTE);
+        assert_eq!(kb.text.as_str(), "abcd");
+        // A number pad (Go to page) takes the digits alone, from its edit page too.
+        G_CLIP.with(|c| *c.borrow_mut() = "page 12 of 40".to_string());
+        let mut pad = laid_out("", 2);
+        press_code(&mut pad, KB_KEY_PASTE);
+        assert_eq!(pad.text.as_str(), "1240");
+        let mut pad = laid_out("", 2);
+        press_code(&mut pad, KB_KEY_EDIT);
+        assert_eq!((pad.page, pad.prev_page), (EDIT_PAGE, 2));
+        press_code(&mut pad, KB_KEY_PASTE);
+        assert_eq!(pad.text.as_str(), "1240");
+        G_CLIP.with(|c| c.borrow_mut().clear());
+    }
+
+    /// The edit key opens the edit page from every page but the count pad's (which has no such key), and both it
+    /// and the page's abc go back to the page it came from: the letters, the symbols, the kana pad, the number pad.
+    /// The edit page has Select all, Cut, Copy, Paste, Start and End, Cancel, space, delete and Done, and the text
+    /// line's keys; the edit key is drawn pressed while it shows.
+    #[test]
+    fn the_edit_key_opens_the_edit_page_and_goes_back() {
+        for from in [0, 1, 2, 3, KANA_PAGE] {
+            let mut kb = laid_out("x", from);
+            let mut d = RECT_EMPTY;
+            assert_eq!(keyboard_press(&mut kb, KB_KEY_EDIT, &mut d), KbResult::Changed);
+            assert_eq!((kb.page, d), (EDIT_PAGE, kb.area), "page {from}: the keyboard drawn again");
+            for code in [KB_KEY_SELECT_ALL, KB_KEY_CUT, KB_KEY_COPY, KB_KEY_PASTE, KB_KEY_START, KB_KEY_END, KB_KEY_CANCEL,
+                KB_KEY_PAGE, KEY_SPACE, KB_KEY_BKSP, KB_KEY_DONE, KB_KEY_EDIT, KB_KEY_LEFT, KB_KEY_RIGHT]
+            {
+                assert!(keyboard_key_rect(&kb, code, &mut RECT_EMPTY.clone()), "the edit page's key {code}");
+            }
+            let mut ch = [0u8; 8];
+            let back = key_label(&kb, KB_KEY_PAGE, &mut ch).to_string();
+            assert_eq!(back, match from { KANA_PAGE => "\u{3042}", 2 => "123", _ => "abc" });
+            press_code(&mut kb, if from == 3 { KB_KEY_EDIT } else { KB_KEY_PAGE });
+            assert_eq!(kb.page, from, "back to page {from}");
+            let mut r = RECT_EMPTY;
+            assert!(keyboard_key_rect(&kb, KB_KEY_LEFT, &mut r) && keyboard_key_rect(&kb, KB_KEY_EDIT, &mut r), "page {from}");
+        }
+        let mut pad = Keyboard::default();
+        keyboard_open_count(&mut pad, "Pages", 50, label);
+        pad.area = keyboard_area(&pad, Rect { x: 0, y: 0, w: 1860, h: 2480 });
+        let mut r = RECT_EMPTY;
+        assert!(!keyboard_key_rect(&pad, KB_KEY_EDIT, &mut r) && !keyboard_key_rect(&pad, KB_KEY_LEFT, &mut r));
+        assert_eq!(field_rect(pad.area, 4), line_rect(pad.area), "the count pad's line is all text");
+        assert_eq!(press_code(&mut pad, KB_KEY_EDIT), KbResult::None);
+    }
+
+    /// The text line's keys sit at its right end, a letter key's width each, in the text line's row: the edit key, ◀
+    /// and ▶; the text box ends a gap before them, and no key of any page overlaps another.
+    #[test]
+    fn the_text_lines_keys_fit_beside_the_text() {
+        for screen in [Rect { x: 0, y: 0, w: 1860, h: 2480 }, Rect { x: 0, y: 0, w: 2480, h: 1860 }] {
+            for page in [0, 1, 2, 3, KANA_PAGE, EDIT_PAGE] {
+                let mut kb = opened(b"");
+                kb.page = page;
+                kb.area = keyboard_area(&kb, screen);
+                let mut keys = [Key::default(); MAX_KEYS];
+                let n = layout(kb.area, page, &mut keys);
+                for i in 0..n {
+                    // (the number pad's Done reaches a few pixels past its frame, as it always has)
+                    if page == EDIT_PAGE || line_keys(kb.area).iter().any(|k| k.code == keys[i].code) {
+                        assert!(rect_contains_rect(kb.area, keys[i].r), "page {page}: key {} inside the keyboard", keys[i].code);
+                    }
+                    for j in i + 1..n {
+                        assert!(rect_is_empty(rect_intersect(keys[i].r, keys[j].r)), "page {page}: keys {} and {} overlap", keys[i].code, keys[j].code);
+                    }
+                }
+                let (mut q, mut e, mut l, mut r) = (RECT_EMPTY, RECT_EMPTY, RECT_EMPTY, RECT_EMPTY);
+                let letter = if page == 0 { keyboard_key_rect(&kb, 'q' as u32, &mut q) } else { false };
+                assert!(keyboard_key_rect(&kb, KB_KEY_EDIT, &mut e) && keyboard_key_rect(&kb, KB_KEY_LEFT, &mut l) && keyboard_key_rect(&kb, KB_KEY_RIGHT, &mut r));
+                let line = line_rect(kb.area);
+                assert_eq!(r.x + r.w, line.x + line.w, "▶ ends the line");
+                assert!(e.x < l.x && l.x < r.x && e.y == line.y && e.h == line.h && e.w == r.w);
+                if letter {
+                    assert_eq!(e.w, q.w, "a letter key's width");
+                }
+                let f = field_rect(kb.area, page);
+                assert_eq!((f.x, f.y, f.h, f.x + f.w + ui_px(10.0)), (line.x, line.y, line.h, e.x));
+                assert_eq!(keyboard_field_rect(kb.area), f);
+            }
+        }
+    }
+
+    /// ◀ and ▶ held down move the caret again as delete held does: after KB_HOLD_MS, then every KB_REPEAT_MS, each
+    /// Moved with the text line to refresh, until the caret can go no further; a hold at the end it moves toward
+    /// does not start. Delete held with the caret inside the text stops at the text's start, what is after the caret
+    /// kept.
+    #[test]
+    fn the_arrows_repeat_when_held() {
+        let mut kb = laid_out("abcdef", 0);
+        let mut r = RECT_EMPTY;
+        assert!(keyboard_key_rect(&kb, KB_KEY_LEFT, &mut r));
+        let (x, y) = ((r.x + r.w / 2) as f32, (r.y + r.h / 2) as f32);
+        let mut d = RECT_EMPTY;
+        assert_eq!(keyboard_pointer(&mut kb, 0, x, y, 1000, &mut d), KbResult::Moved);
+        assert_eq!(d, RECT_EMPTY, "the key is inside the text line, which its move refreshes: no refresh of its own");
+        assert_eq!((caret(&kb).as_str(), kb.repeat_at), ("abcde|f", 1000 + KB_HOLD_MS));
+        assert_eq!(keyboard_repeat(&mut kb, 1000 + KB_HOLD_MS - 1, false), KbResult::None);
+        assert_eq!(keyboard_repeat(&mut kb, 1000 + KB_HOLD_MS, false), KbResult::Moved);
+        assert_eq!((caret(&kb).as_str(), kb.field_dirty), ("abcd|ef", line_rect(kb.area)));
+        assert_eq!(keyboard_repeat(&mut kb, 1000 + KB_HOLD_MS + KB_REPEAT_MS, false), KbResult::Moved);
+        assert_eq!(caret(&kb), "abc|def");
+        // Late by more than a batch: KB_REPEAT_BATCH at once, and no further than the start.
+        assert_eq!(keyboard_repeat(&mut kb, 1000 + KB_HOLD_MS + 20 * KB_REPEAT_MS, false), KbResult::Moved);
+        assert_eq!(caret(&kb), "|abcdef");
+        assert_eq!(kb.repeat_at, 0, "at the start the hold is over");
+        assert_eq!(keyboard_pointer(&mut kb, 2, x, y, 4000, &mut d), KbResult::None);
+        // At the start, a hold on ◀ moves nothing and starts nothing; on ▶ it does.
+        assert_eq!(keyboard_pointer(&mut kb, 0, x, y, 5000, &mut d), KbResult::None);
+        assert_eq!(kb.repeat_at, 0);
+        keyboard_pointer(&mut kb, 2, x, y, 5050, &mut d);
+        assert!(keyboard_key_rect(&kb, KB_KEY_RIGHT, &mut r));
+        let (x, y) = ((r.x + r.w / 2) as f32, (r.y + r.h / 2) as f32);
+        keyboard_pointer(&mut kb, 0, x, y, 6000, &mut d);
+        assert_eq!((caret(&kb).as_str(), kb.repeat_at), ("a|bcdef", 6000 + KB_HOLD_MS));
+        assert_eq!(keyboard_repeat(&mut kb, 6000 + KB_HOLD_MS + KB_REPEAT_MS, false), KbResult::Moved);
+        assert_eq!(caret(&kb), "abc|def");
+        keyboard_pointer(&mut kb, 2, x, y, 6600, &mut d);
+        // Delete held with the caret inside the text: down to the start, and the hold ends there.
+        let (mut kb, bx, by) = on_page(b"abcdef", 0);
+        press_code(&mut kb, KB_KEY_LEFT);
+        press_code(&mut kb, KB_KEY_LEFT);
+        keyboard_pointer(&mut kb, 0, bx, by, 1000, &mut d);
+        assert_eq!(caret(&kb), "abc|ef");
+        assert_eq!(keyboard_repeat(&mut kb, 1000 + KB_HOLD_MS + 10 * KB_REPEAT_MS, false), KbResult::Changed);
+        assert_eq!((caret(&kb).as_str(), kb.repeat_at), ("|ef", 0));
+    }
+
+    /// A tap on the text puts the caret at the character boundary nearest to it (left of the text: its start; right
+    /// of it: its end), at the touch-down; a drag from there selects to where it is, and the lift leaves it. A tap
+    /// on the title or the line's blank end does the same; the count pad's line takes no taps. The caret and the
+    /// selection draw where they are: the bar between two characters, and a selection white on black.
+    #[test]
+    fn a_tap_on_the_text_puts_the_caret_there_and_a_drag_selects() {
+        assert_eq!(font_init(), 0);
+        for th in [UiTheme::Gothic, UiTheme::Classic] {
+            ui_set_theme(th);
+            let screen = Rect { x: 0, y: 0, w: 1860, h: 2480 };
+            let mut kb = opened(b"abcdef");
+            let mut c = Canvas::default();
+            assert_eq!(canvas_init(&mut c, screen.w, screen.h), 0);
+            keyboard_draw(&mut kb, &mut c, screen);
+            let (tr, face, size) = text_line(&kb);
+            let x_at = |n: usize| (tr.x + font_measure(face, size, &"abcdef"[..n])) as f32;
+            let y = (tr.y + tr.h / 2) as f32;
+            let mut d = RECT_EMPTY;
+            // Between c and d, a little off: there.
+            assert_eq!(keyboard_pointer(&mut kb, 0, x_at(3) + 2.0, y, 0, &mut d), KbResult::Moved);
+            assert_eq!(caret(&kb), "abc|def", "{th:?}");
+            assert_eq!(keyboard_pointer(&mut kb, 2, x_at(3) + 2.0, y, 40, &mut d), KbResult::None, "a tap: the lift moves nothing");
+            assert_eq!(caret(&kb), "abc|def");
+            // A drag from b|c to e|f selects bcde, and the lift keeps it.
+            keyboard_pointer(&mut kb, 0, x_at(1), y, 100, &mut d);
+            assert_eq!(keyboard_pointer(&mut kb, 1, x_at(3), y, 120, &mut d), KbResult::Moved);
+            assert_eq!(caret(&kb), "a[bc|]def");
+            keyboard_pointer(&mut kb, 1, x_at(5) - 3.0, y, 140, &mut d);
+            keyboard_pointer(&mut kb, 2, x_at(5) - 3.0, y, 160, &mut d);
+            assert_eq!(caret(&kb), "a[bcde|]f", "{th:?}");
+            assert!(!kb.field_drag);
+            // A drag a second finger takes over ends with the off-screen cancel: the selection as it last was.
+            keyboard_pointer(&mut kb, 0, x_at(2), y, 170, &mut d);
+            keyboard_pointer(&mut kb, 1, x_at(4), y, 180, &mut d);
+            assert_eq!(keyboard_pointer(&mut kb, 2, -10000.0, -10000.0, 190, &mut d), KbResult::None);
+            assert_eq!((caret(&kb).as_str(), kb.field_drag), ("ab[cd|]ef", false));
+            keyboard_pointer(&mut kb, 0, x_at(1), y, 195, &mut d);
+            keyboard_pointer(&mut kb, 1, x_at(5) - 3.0, y, 196, &mut d);
+            keyboard_pointer(&mut kb, 2, x_at(5) - 3.0, y, 197, &mut d);
+            // Drawn: the selection's box black with the letters white in it, the rest of the line as before.
+            keyboard_draw(&mut kb, &mut c, screen);
+            let px = |x: i32, y: i32| c.px[(y * c.stride + x) as usize];
+            let mid = tr.y + tr.h / 2;
+            assert_eq!(px(x_at(1) as i32 + 1, tr.y + ui_px(22.0)), 0, "{th:?}: the box at the selection's start");
+            assert_eq!(px(x_at(5) as i32 - 2, tr.y + ui_px(22.0)), 0, "{th:?}: and before its end");
+            assert!((x_at(1) as i32..x_at(5) as i32).any(|x| px(x, mid) == 255), "{th:?}: white letters in it");
+            assert_eq!(px(x_at(5) as i32 + ui_px(4.0), tr.y + ui_px(22.0)), 255, "{th:?}: after it, white");
+            // Left of the text (on the title): the start; right of it: the end.
+            keyboard_pointer(&mut kb, 0, (tr.x - ui_px(40.0)) as f32, y, 200, &mut d);
+            keyboard_pointer(&mut kb, 2, (tr.x - ui_px(40.0)) as f32, y, 240, &mut d);
+            assert_eq!(caret(&kb), "|abcdef");
+            keyboard_pointer(&mut kb, 0, (tr.x + tr.w - 10) as f32, y, 300, &mut d);
+            assert_eq!(caret(&kb), "abcdef|");
+            keyboard_pointer(&mut kb, 2, (tr.x + tr.w - 10) as f32, y, 340, &mut d);
+            // The caret between c and d is a bar in the space before d, none of d's own pixels.
+            press_code(&mut kb, KB_KEY_LEFT);
+            press_code(&mut kb, KB_KEY_LEFT);
+            press_code(&mut kb, KB_KEY_LEFT);
+            let mut plain = Canvas::default();
+            assert_eq!(canvas_init(&mut plain, screen.w, screen.h), 0);
+            let mut none = kb;
+            keyboard_draw(&mut kb, &mut c, screen);
+            none.caret = 0; // (the caret before a: the bar out of the way of c and d)
+            none.anchor = 0;
+            keyboard_draw(&mut none, &mut plain, screen);
+            let (bx0, bx1) = (x_at(3) as i32 - ui_px(3.0), x_at(3) as i32);
+            for yy in tr.y..tr.y + tr.h {
+                for xx in x_at(2) as i32..x_at(4) as i32 {
+                    let (a, b) = (c.px[(yy * c.stride + xx) as usize], plain.px[(yy * plain.stride + xx) as usize]);
+                    if a != b {
+                        assert!((bx0..bx1).contains(&xx) && a == 0, "{th:?}: only the bar differs, at ({xx}, {yy})");
+                    }
+                }
+            }
+            canvas_free(&mut c);
+            canvas_free(&mut plain);
+            // The count pad's line is all count: a tap there moves no caret.
+            let mut pad = Keyboard::default();
+            keyboard_open_count(&mut pad, "Pages", 50, label);
+            pad.area = keyboard_area(&pad, screen);
+            let f = field_rect(pad.area, 4);
+            assert_eq!(keyboard_pointer(&mut pad, 0, (f.x + 40) as f32, (f.y + f.h / 2) as f32, 0, &mut d), KbResult::None);
+            assert_eq!(caret(&pad), "1|");
+        }
+        ui_set_theme(UiTheme::Gothic);
+    }
+
+    /// The text line shows the caret wherever it is: with it at the end, the text's longest tail that fits (as it
+    /// always was); moved left past what shows, the text from the caret on; back right, the view stays until the
+    /// caret would leave it.
+    #[test]
+    fn the_text_line_keeps_the_caret_in_view() {
+        assert_eq!(font_init(), 0);
+        ui_set_theme(UiTheme::Gothic);
+        let screen = Rect { x: 0, y: 0, w: 1860, h: 2480 };
+        let long: String = (0..KB_TEXT_MAX - 1).map(|i| char::from(b'a' + (i % 26) as u8)).collect();
+        let mut kb = opened(long.as_bytes());
+        let mut c = Canvas::default();
+        assert_eq!(canvas_init(&mut c, screen.w, screen.h), 0);
+        keyboard_draw(&mut kb, &mut c, screen);
+        let (tr, face, size) = text_line(&kb);
+        let room = tr.w - ui_px(20.0);
+        assert!(kb.scroll > 0 && font_measure(face, size, &long[kb.scroll..]) <= room, "the tail");
+        assert!(font_measure(face, size, &long[kb.scroll - 1..]) > room, "the longest tail that fits");
+        let tail = kb.scroll;
+        // Left to the first character shown: the view stays; one more: it starts at the caret.
+        while kb.caret > tail {
+            press_code(&mut kb, KB_KEY_LEFT);
+            keyboard_draw(&mut kb, &mut c, screen);
+            assert_eq!(kb.scroll, tail);
+        }
+        press_code(&mut kb, KB_KEY_LEFT);
+        keyboard_draw(&mut kb, &mut c, screen);
+        assert_eq!(kb.scroll, tail - 1);
+        press_code(&mut kb, KB_KEY_START);
+        keyboard_draw(&mut kb, &mut c, screen);
+        assert_eq!(kb.scroll, 0);
+        // Right again: the view stays while the caret is in it, then moves on a character at a time.
+        let end = shown_end(&long, 0, face, size, room);
+        for _ in 0..end {
+            press_code(&mut kb, KB_KEY_RIGHT);
+            keyboard_draw(&mut kb, &mut c, screen);
+            assert_eq!(kb.scroll, 0);
+        }
+        press_code(&mut kb, KB_KEY_RIGHT);
+        keyboard_draw(&mut kb, &mut c, screen);
+        assert_eq!(kb.scroll, 1);
+        canvas_free(&mut c);
+    }
+
+    /// keyboard_key_input: a hardware keyboard's keys on a text keyboard. Left, Right, Home and End, with Shift
+    /// selecting; Ctrl or Cmd with A, C, X and V (not with Alt); nothing else, not the plain letters (which type
+    /// nothing in a field) and not Up, Down or Esc.
+    #[test]
+    fn hardware_keys_that_edit_text() {
+        let (ctrl, shift, alt, meta) = (KEYMOD_CTRL as u32, KEYMOD_SHIFT as u32, KEYMOD_ALT as u32, KEYMOD_META as u32);
+        assert_eq!(keyboard_key_input(105, 0), Some(KbInput::Left(false)));
+        assert_eq!(keyboard_key_input(106, shift), Some(KbInput::Right(true)));
+        assert_eq!(keyboard_key_input(102, 0), Some(KbInput::Home(false)));
+        assert_eq!(keyboard_key_input(107, shift | ctrl), Some(KbInput::End(true)));
+        for m in [ctrl, meta, ctrl | shift] {
+            assert_eq!(keyboard_key_input(30, m), Some(KbInput::SelectAll));
+            assert_eq!(keyboard_key_input(46, m), Some(KbInput::Copy));
+            assert_eq!(keyboard_key_input(45, m), Some(KbInput::Cut));
+            assert_eq!(keyboard_key_input(47, m), Some(KbInput::Paste));
+        }
+        for (code, m) in [(30, 0), (46, shift), (47, ctrl | alt), (103, 0), (108, 0), (1, 0), (28, 0), (14, 0)] {
+            assert_eq!(keyboard_key_input(code, m), None, "key {code} mods {m}");
+        }
+    }
+
+    /// A password keyboard shows stars, never exposes its text to a probe, and takes no edit or clipboard key; its
+    /// text is wiped when it closes.
+    #[test]
+    fn a_password_is_masked_and_never_copied() {
+        G_CLIP.with(|c| c.borrow_mut().clear());
+        let mut kb = Keyboard::default();
+        keyboard_open_secret(&mut kb, "Password");
+        kb.text.set("hunter2");
+        kb.caret = 7;
+        let mut d = RECT_EMPTY;
+        for code in [KB_KEY_EDIT, KB_KEY_SELECT_ALL, KB_KEY_COPY, KB_KEY_CUT, KB_KEY_PASTE] {
+            assert_eq!(keyboard_press(&mut kb, code, &mut d), KbResult::None, "key {code}");
+        }
+        assert_eq!(keyboard_clipboard(), "");
+        assert_eq!(keyboard_caret_probe(&kb), "");
+        assert_eq!(keyboard_press(&mut kb, KB_KEY_DONE, &mut d), KbResult::Done);
+        assert_eq!(kb.text.as_str(), "hunter2", "the caller takes it before wiping it");
+        keyboard_close(&mut kb);
+        assert!(kb.text.is_empty());
+        assert!(!kb.secret);
+    }
+
+    /// Every edit key's word, and the text line's icons, fit their keys in English and Spanish, upright and sideways,
+    /// in both styles (Japanese is a translator's to give: its English must fit too).
+    #[test]
+    fn the_edit_pages_words_fit() {
+        assert_eq!(font_init(), 0);
+        for lang in ["en", "es", "ja"] {
+            i18n_set(lang);
+            for th in [UiTheme::Gothic, UiTheme::Classic] {
+                ui_set_theme(th);
+                for screen in [Rect { x: 0, y: 0, w: 1860, h: 2480 }, Rect { x: 0, y: 0, w: 2480, h: 1860 }] {
+                    let mut kb = opened(b"");
+                    kb.prev_page = if lang == "ja" { KANA_PAGE } else { 0 };
+                    kb.page = EDIT_PAGE;
+                    kb.area = keyboard_area(&kb, screen);
+                    let mut keys = [Key::default(); MAX_KEYS];
+                    let n = layout(kb.area, EDIT_PAGE, &mut keys);
+                    for key in &keys[..n] {
+                        let mut ch = [0u8; 8];
+                        let lab = key_label(&kb, key.code, &mut ch);
+                        let ks = if utf8_count(lab) > 1 { ui_text_size() } else { ui_title_size() };
+                        let w = font_measure(FontFace::Bold, ks, lab);
+                        assert!(w <= key.r.w - ui_px(40.0), "{lang} {th:?} {}: \"{lab}\" is {w} px in a {} px key", screen.w, key.r.w);
+                    }
+                }
+            }
+        }
+        i18n_set("en");
+        ui_set_theme(UiTheme::Gothic);
     }
 }

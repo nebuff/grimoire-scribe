@@ -6,6 +6,7 @@
 //!   FAST -> DU   (in pen mode on MTK: the driver's path for handwriting, see below)
 //!   UI   -> GL16 (partial, no flash)
 //!   FULL -> GC16 + flash
+//!   CLEAN -> GC16 + flash of the rect alone (wipes DU's traces there, issue #11)
 //! "Fast mode" (no automatic REAGL promotion) is enabled for the session like KOReader does on
 //! the Scribe, so large partial refreshes keep the waveform we ask for.
 //!
@@ -101,7 +102,7 @@ struct State {
     // same conditions: the same pages, the same hand).
     g_ab: bool,
     g_strokes: u32,
-    g_count: [i32; 3],
+    g_count: [i32; 4],
     g_fail: i32,
     g_ok: i32,
     g_stats_at: u32,
@@ -146,6 +147,10 @@ struct State {
     /// Logical area pushed with DU (dithered) and not yet repainted in grayscale: the framebuffer
     /// there legitimately differs from the canvas, so the overwrite checks skip it.
     g_live_area: Rect,
+    /// A flashing GC16 (Clean or Full) was the last refresh and may still be on the panel: the next fast
+    /// refresh waits for it (a GC16 followed straight by a DU with no fence tears the first refresh:
+    /// FBInk's fbink_cmd.c beside the activity bar, and the lasso drag's first strips after a clean).
+    g_fence_gray: bool,
     /// display_skip_overlay
     g_overlay: Rect,
     /// display_skip_status
@@ -173,7 +178,7 @@ impl State {
             g_pen_busy_noted: false,
             g_ab: false,
             g_strokes: 0,
-            g_count: [0; 3],
+            g_count: [0; 4],
             g_fail: 0,
             g_ok: 0,
             g_stats_at: 0,
@@ -205,6 +210,7 @@ impl State {
             g_invert: false,
             g_live: false,
             g_live_area: RECT_EMPTY,
+            g_fence_gray: false,
             g_overlay: RECT_EMPTY,
             g_status: RECT_EMPTY,
         }
@@ -474,6 +480,26 @@ fn quiet_sent(marker: u32, gray: bool) {
     Q_CV.notify_one();
 }
 
+// Waits (bounded) until the standard updates the quiet thread took on have ended: the fence a fast refresh
+// needs after a flashing GC16. Only the quiet thread waits at the driver (a second waiter on one marker
+// sits out the driver's timeout), so this waits on its books. True when none is left (or none can be
+// waited for).
+fn quiet_wait_gray(max_ms: u32) -> bool {
+    let mut q = qlock();
+    if q.fd < 0 {
+        return true;
+    }
+    let t0 = now_ms();
+    while q.gray_n > 0 {
+        if now_ms().wrapping_sub(t0) >= max_ms {
+            return false;
+        }
+        let (nq, _) = Q_IDLE.wait_timeout(q, Duration::from_millis(2)).unwrap_or_else(|e| e.into_inner());
+        q = nq;
+    }
+    true
+}
+
 // No standard update can still be on the panel.
 fn quiet_now() -> bool {
     let q = qlock();
@@ -518,7 +544,7 @@ fn lat_reset(s: &mut State) {
 // follow it.
 fn panel_temp(out: &mut String, cap: usize) {
     csnprintf!(out, cap, "?");
-    let Some(data) = read_file("/proc/hwtcon/temp") else { return };
+    let Some(data) = read_system_file("/proc/hwtcon/temp") else { return };
     // fgets: the first line, newline included, at most cap - 1 bytes; nothing read leaves "?"
     let mut line = &data[..data.len().min(cap.saturating_sub(1))];
     if let Some(nl) = line.iter().position(|&b| b == b'\n') {
@@ -606,6 +632,7 @@ pub fn display_power_reset() {
         s.g_ink = LiveInk::default();
         s.g_frame_known = false;
         s.g_live_area = RECT_EMPTY;
+        s.g_fence_gray = false;
         s.last_fast_wait = false;
         if s.g_fd < 0 || !s.g_st.is_mtk {
             return;
@@ -908,6 +935,10 @@ pub fn display_open(w: &mut i32, h: &mut i32, dpi: &mut f32) -> i32 {
             if have_v { v.height } else { 0 },
             &mut from,
         );
+        // Seyes paper is drawn true to size at the panel's own density (paper_set_panel_ppi).
+        let panel = if have_v { fbcheck_panel_ppi(v.xres, v.yres, v.width, v.height) } else { 0.0 };
+        let k = crate::paper::paper_set_panel_ppi(panel, d);
+        qlog!("display: the panel is %.1f dpi by its size; Seyes paper drawn at x%.4f", panel as f64, k as f64);
         if from == DpiSource::PanelSize {
             qlog!(
                 concat!(
@@ -1026,10 +1057,11 @@ fn send_refresh(s: &mut State, r: Rect, mode: RefreshMode, wfm: i32, flashing: b
     if now_ms().wrapping_sub(s.g_stats_at) > 30000 {
         s.g_stats_at = now_ms();
         qlog!(
-            "display: refreshes so far: fast %d, ui %d, full %d, failed %d",
+            "display: refreshes so far: fast %d, ui %d, full %d, clean %d, failed %d",
             s.g_count[0],
             s.g_count[1],
             s.g_count[2],
+            s.g_count[3],
             s.g_fail
         );
     }
@@ -1048,6 +1080,16 @@ pub fn display_present(screen: &Canvas, r: Rect, mode: RefreshMode) {
         r = rect_intersect(r, Rect { x: 0, y: 0, w: screen.w, h: screen.h });
         if rect_is_empty(r) {
             return None;
+        }
+        // A fast refresh right after a flashing GC16 meets the tear FBInk documents (a GC16 + DU in
+        // quick succession with no fence): wait for the clean to end first, unless this frame is a
+        // stroke's own live ink, whose latency must never wait. One fast refresh fences the clean; the
+        // rest of its burst follows.
+        if mode == RefreshMode::Fast && s.g_fence_gray && !s.g_ink.on {
+            s.g_fence_gray = false;
+            if !quiet_wait_gray(600) {
+                qlog!("display: a clean still on the panel after 600 ms; the fast refresh follows unfenced");
+            }
         }
         // Pen mode only tolerates DU updates; anything else must leave it first (pen_leave: the only
         // wait, for the pen's last update, which grayscale settles find long done since they run after
@@ -1088,11 +1130,13 @@ pub fn display_present(screen: &Canvas, r: Rect, mode: RefreshMode) {
         } else if mode == RefreshMode::Full || rect_contains_rect(r, s.g_live_area) {
             s.g_live_area = RECT_EMPTY;
         }
-        let flashing = mode == RefreshMode::Full;
+        // (Clean: a flashing GC16 update of the rect alone, every pixel in it driven, as KOReader's
+        // "flashui" refreshes are; Full flashes the whole panel)
+        let flashing = mode == RefreshMode::Full || mode == RefreshMode::Clean;
         let wfm = match mode {
             RefreshMode::Fast => ffi::GRIM_WFM_DU,
             RefreshMode::Ui => ffi::GRIM_WFM_GL16,
-            RefreshMode::Full => ffi::GRIM_WFM_GC16,
+            RefreshMode::Full | RefreshMode::Clean => ffi::GRIM_WFM_GC16,
         };
         let whole_frame = rect_contains_rect(r, Rect { x: 0, y: 0, w: s.LW, h: s.LH });
         let mut r = if mode == RefreshMode::Full { Rect { x: 0, y: 0, w: s.PW, h: s.PH } } else { fb_rect(s, r) };
@@ -1102,6 +1146,9 @@ pub fn display_present(screen: &Canvas, r: Rect, mode: RefreshMode) {
         }
         let ret = send_refresh(s, r, mode, wfm, flashing);
         let marker = fbink_get_last_marker();
+        if ret >= 0 && (mode == RefreshMode::Clean || mode == RefreshMode::Full) {
+            s.g_fence_gray = true;
+        }
         if ret >= 0 {
             if s.g_pen_mode {
                 s.g_pen_marker = marker;
@@ -1379,3 +1426,24 @@ pub fn display_close() {
 }
 /// Last Fast frame needed the existing colour-panel driver wait; reads cached state only.
 pub fn display_last_fast_waiting() -> bool { with(|s| s.last_fast_wait) }
+
+/// With no word from the quiet thread, how long a refresh is taken to stay on the panel: the fast (DU)
+/// waveform's length down to 15 degrees (294 ms, docs/INK-PERFORMANCE.md).
+const FAST_BUSY_GUESS_MS: u32 = 300;
+
+/// display.rs display_fast_busy: the quiet thread's books when it follows the updates and took on the newest
+/// (its newest standard DU not yet ended); otherwise (no thread, or the newest went out in pen mode) whether
+/// anything was sent in the last FAST_BUSY_GUESS_MS. Never a wait, and no ioctl.
+pub fn display_fast_busy() -> bool {
+    let (fd, last) = with(|s| (s.g_fd, s.g_last_refresh));
+    if fd < 0 {
+        return false;
+    }
+    {
+        let q = qlock();
+        if q.on && q.fd >= 0 && fbink_get_last_marker() == q.handed {
+            return q.du_done != q.du_sent;
+        }
+    }
+    now_ms().wrapping_sub(last) < FAST_BUSY_GUESS_MS
+}

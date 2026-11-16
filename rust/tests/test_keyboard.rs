@@ -85,7 +85,7 @@ fn type_text(kb: &mut Keyboard, s: &str) -> bool {
         if !keyboard_key_rect(kb, key, &mut r) {
             return false;
         }
-        if key != cp && !kb.shift {
+        if key != cp && kb.shift == KbShift::Off {
             press(kb, KB_KEY_SHIFT);
         }
         press(kb, key);
@@ -133,8 +133,8 @@ fn types_musica_through_the_accents_page() {
     let mut kb = Keyboard::default();
     open_kb(&mut kb, b"");
     check!(kb.page == 0 && !keyboard_key_rect(&kb, 0xFA, &mut Rect::default()));
-    check!(press(&mut kb, KB_KEY_SHIFT) && kb.shift);
-    check!(press(&mut kb, 'm' as u32) && !kb.shift); // one-shot
+    check!(press(&mut kb, KB_KEY_SHIFT) && kb.shift == KbShift::Once);
+    check!(press(&mut kb, 'm' as u32) && kb.shift == KbShift::Off); // one-shot
     check!(press(&mut kb, KB_KEY_PAGE) && kb.page == 1);
     check!(!keyboard_key_rect(&kb, 'q' as u32, &mut Rect::default())); // the letters are on the other page
     check!(press(&mut kb, 0xFA)); // u acute
@@ -143,8 +143,8 @@ fn types_musica_through_the_accents_page() {
     check!(press(&mut kb, 0xFA) && kb.page == 1); // typing stays on the page
     check!(press(&mut kb, KB_KEY_PAGE) && kb.page == 0);
     check!(press(&mut kb, 's' as u32) && press(&mut kb, 'i' as u32) && press(&mut kb, 'c' as u32) && press(&mut kb, 'a' as u32) && press(&mut kb, ' ' as u32));
-    check!(press(&mut kb, KB_KEY_PAGE) && press(&mut kb, KB_KEY_SHIFT) && kb.shift);
-    check!(press(&mut kb, 0xF1) && !kb.shift); // n tilde, shifted: N tilde, and shift lets go
+    check!(press(&mut kb, KB_KEY_PAGE) && press(&mut kb, KB_KEY_SHIFT) && kb.shift == KbShift::Once);
+    check!(press(&mut kb, 0xF1) && kb.shift == KbShift::Off); // n tilde, shifted: N tilde, and shift lets go
     check!(text(&kb) == b"M\xc3\xbasica \xc3\x91");
     check!(press(&mut kb, KB_KEY_BKSP) && text(&kb) == b"M\xc3\xbasica ");
     check!(press(&mut kb, KB_KEY_BKSP) && text(&kb) == b"M\xc3\xbasica");
@@ -171,7 +171,7 @@ fn shift_gives_accented_capitals() {
     ];
     for (key, typed) in K {
         kb.text.clear();
-        if !kb.shift {
+        if kb.shift == KbShift::Off {
             press(&mut kb, KB_KEY_SHIFT);
         }
         let there = press(&mut kb, key);
@@ -181,7 +181,7 @@ fn shift_gives_accented_capitals() {
             want[1] = (0x80 | (typed & 0x3F)) as u8;
         }
         let end = want.iter().position(|&b| b == 0).unwrap_or(4);
-        let ok = there && text(&kb) == &want[..end] && kb.shift == (typed == key);
+        let ok = there && text(&kb) == &want[..end] && (kb.shift == KbShift::Once) == (typed == key);
         if !ok {
             eprintln!("  key U+{:04X} typed \"{}\"", key, kb.text);
         }
@@ -265,7 +265,8 @@ fn never_cut_inside_a_character() {
 // The tail of a long name steps whole characters, so the field never starts with a broken
 // one. In Gothic the field's text is all pixel-face glyphs, pure black on white; a broken
 // character would draw U+FFFD from Terminess, anti-aliased, with grays. Titles of every length
-// move where the cut falls. (47 oe overflow the field after any of these titles.)
+// move where the cut falls. (47 oe overflow the field after any of these titles.) The text box is the line left of
+// its keys (the edit key, the arrows), whose icons are Terminess's and gray at their edges.
 fn long_name_tail_is_whole_characters() {
     ui_set_theme(UiTheme::Gothic);
     let mut kb = Keyboard::default();
@@ -276,7 +277,7 @@ fn long_name_tail_is_whole_characters() {
         let title = &WORDS[..t];
         keyboard_open(&mut kb, title, many.as_bytes());
         draw(&mut kb);
-        let inside = rect_inflate(Rect { x: kb.area.x + 30, y: kb.area.y + 30, w: kb.area.w - 60, h: 120 }, -20); // inside its frame
+        let inside = rect_inflate(keyboard_field_rect(kb.area), -20); // inside its frame
         let mut grays = 0;
         G_C.with(|c| {
             let c = c.borrow();
@@ -355,7 +356,7 @@ fn symbols_page() {
     check!(text(&kb) == b"Joe's notes (2)!");
     press(&mut kb, KB_KEY_SHIFT);
     press(&mut kb, '&' as u32);
-    check!(text(&kb) == b"Joe's notes (2)!&" && kb.shift); // (no capital: shift waits for a letter)
+    check!(text(&kb) == b"Joe's notes (2)!&" && kb.shift == KbShift::Once); // (no capital: shift waits for a letter)
     open_kb(&mut kb, b"");
     let all = "1234567890!@#$%^&*()?,\":;_+=/~[]<>\u{20ac}\u{a3}\u{b0}-'. ";
     check!(type_text(&mut kb, all));
@@ -587,7 +588,7 @@ fn japanese_kana_page() {
     open_kb(&mut kb, b"");
     let mut r = Rect::default();
     check!(keyboard_key_rect(&kb, KB_KEY_KANA, &mut r) && !keyboard_key_rect(&kb, KB_KEY_PAGE, &mut r));
-    check!(press(&mut kb, KB_KEY_KANA) && kb.page == 4);
+    check!(press(&mut kb, KB_KEY_KANA) && kb.page == KANA_PAGE);
     check!(!keyboard_key_rect(&kb, 'a' as u32, &mut r)); // no Latin letters on the kana page
     check!(press(&mut kb, KB_KEY_FLICK) && kb.text.as_str() == "\u{3042}"); // あ: a tap
     check!(flick_key(&mut kb, KB_KEY_FLICK + 1, -80.0, 0.0) && kb.text.as_str() == "\u{3042}\u{304d}"); // か, left: き
@@ -664,6 +665,46 @@ fn setup() {
     ui_set_theme(UiTheme::Gothic);
 }
 
+// keyboard_area (the toolbar's count pad composes the page under it by it, before and after it draws): where
+// keyboard_draw puts the keyboard, the count pad's taller modal and a docked one included.
+fn keyboard_area_is_where_it_draws() {
+    for dock in [0, 150] {
+        let mut kb = Keyboard::default();
+        keyboard_open(&mut kb, "Name", b"");
+        keyboard_set_dock(&mut kb, dock);
+        let before = keyboard_area(&kb, K_SCREEN);
+        draw(&mut kb);
+        check!(kb.area == before);
+        keyboard_open_count(&mut kb, "Pages to add", 10, |n| n.to_string());
+        keyboard_set_dock(&mut kb, dock);
+        let pad = keyboard_area(&kb, K_SCREEN);
+        check!(pad.h == before.h + ui_px(170.0));
+        draw(&mut kb);
+        check!(kb.area == pad);
+        if dock == 0 {
+            check!(pad.y + pad.h == K_SCREEN.h - ui_px(20.0));
+        }
+        // (closed, it still says where it was: the caller composes that area as it closes)
+        keyboard_close(&mut kb);
+        check!(keyboard_area(&kb, K_SCREEN) == pad);
+    }
+}
+
+// count_pad_key: a hardware keyboard's keys on a count pad (the Pages view's and the toolbar's): the digits of
+// the top row and the keypad, Backspace, - and + (the keypad's too), Enter (both) and Esc; nothing else (Up and
+// Down no longer step it: 2.0.0-beta.2).
+fn count_pad_keys_from_a_keyboard() {
+    check!(count_pad_key(2) == Some('1' as u32) && count_pad_key(10) == Some('9' as u32) && count_pad_key(11) == Some('0' as u32));
+    check!(count_pad_key(79) == Some('1' as u32) && count_pad_key(75) == Some('4' as u32) && count_pad_key(73) == Some('9' as u32));
+    check!(count_pad_key(82) == Some('0' as u32));
+    check!(count_pad_key(14) == Some(KB_KEY_BKSP) && count_pad_key(28) == Some(KB_KEY_DONE) && count_pad_key(96) == Some(KB_KEY_DONE));
+    check!(count_pad_key(1) == Some(KB_KEY_CANCEL));
+    check!([12, 74].iter().all(|&c| count_pad_key(c) == Some(KB_KEY_DEC)));
+    check!([13, 78].iter().all(|&c| count_pad_key(c) == Some(KB_KEY_INC)));
+    // letters, Shift, Tab, the space bar, Up and Down are none of its keys
+    check!([16, 30, 42, 15, 57, 49, 103, 108].iter().all(|&c| count_pad_key(c).is_none()));
+}
+
 #[test]
 fn test_keyboard() {
     setup();
@@ -683,6 +724,8 @@ fn test_keyboard() {
     run!(kana_in_every_face);
     run!(typed_name_is_stored_whole);
     run!(modal_rect_takes_the_dock);
+    run!(keyboard_area_is_where_it_draws);
+    run!(count_pad_keys_from_a_keyboard);
     G_C.with(|c| canvas_free(&mut c.borrow_mut()));
     done();
 }
